@@ -1,0 +1,15 @@
+node_modules/
+coverage/
+.parley/
+.roundtable/
+
+# Local configuration and diagnostics may contain credentials or transcripts.
+.env
+.env.*
+!.env.example
+.npmrc
+*.log
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

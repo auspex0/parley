@@ -1,0 +1,2429 @@
+#!/usr/bin/env node
+/**
+ * Parley — one local chat room shared by you, Claude (Claude Code CLI)
+ * and Codex (OpenAI Codex CLI), served as a local web app.
+ *
+ * - Zero runtime dependencies. Node >= 20, built-in modules only.
+ * - Shells out to the official `claude` and `codex` CLIs under the user's own
+ *   logins. Never reads, stores or forwards credentials.
+ * - Binds to 127.0.0.1 only.
+ *
+ * Usage: node parley.mjs [--port N] [--root DIR] [--no-open]
+ */
+
+import { spawn, spawnSync } from "node:child_process";
+import http from "node:http";
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import crypto from "node:crypto";
+import { fileURLToPath } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const UI_FILE = path.join(__dirname, "ui", "index.html");
+// Keep the browser and backend on the same build. Previously the server read
+// index.html on every refresh, so an updated UI could expose controls that the
+// already-running Node process did not understand.
+const UI_HTML = fs.readFileSync(UI_FILE, "utf8");
+const RUNTIME_PROTOCOL = "1";
+const IS_WIN = process.platform === "win32";
+
+// ---------------------------------------------------------------- CLI args
+
+const argv = process.argv.slice(2);
+function argValue(flag) {
+  const i = argv.indexOf(flag);
+  return i >= 0 && argv[i + 1] ? argv[i + 1] : null;
+}
+if (argv.includes("--help") || argv.includes("-h")) {
+  console.log(`Parley — a shared chat room for you, Claude and Codex.
+
+Usage: parley [--port N] [--root DIR] [--no-open]
+
+  --port N     Port to serve the UI on (default 4141, auto-increments if busy)
+  --root DIR   Directory that holds room folders (default ~/.parley)
+  --no-open    Don't open the browser automatically`);
+  process.exit(0);
+}
+const portArg = argValue("--port");
+// `--port 0` asks the OS for any free port (handy for tests).
+const PORT_WANTED = portArg !== null && Number.isFinite(Number(portArg)) ? Number(portArg) : 4141;
+
+// Default data dir is ~/.parley; migrate rooms from the pre-rename ~/.roundtable.
+let defaultRoot = path.join(os.homedir(), ".parley");
+const legacyRoot = path.join(os.homedir(), ".roundtable");
+if (!argValue("--root") && !fs.existsSync(defaultRoot) && fs.existsSync(legacyRoot)) {
+  try { fs.renameSync(legacyRoot, defaultRoot); console.log("Migrated rooms: ~/.roundtable → ~/.parley"); }
+  catch { defaultRoot = legacyRoot; }
+}
+const ROOT = path.resolve(argValue("--root") || defaultRoot);
+const NO_OPEN = argv.includes("--no-open");
+
+// Blind or cross-origin browser requests to this port could spend subscriptions
+// and, in a linked work room, drive writes. A per-session token plus exact
+// Origin checks block that web attack surface. This is not an OS security
+// boundary against another process running as the same user: GET / is public.
+// The token lives in memory, so restarting the server invalidates it.
+const SESSION_TOKEN = crypto.randomBytes(24).toString("base64url");
+
+// ---------------------------------------------------------------- constants
+
+/**
+ * Providers — the kinds of agent that can sit at the table. A room seats
+ * exactly TWO, chosen at creation. The seat's key in room config IS the
+ * provider name, so existing rooms need no migration and @mentions match.
+ *
+ * ADDING A PROVIDER: implement a send(room, opts) adapter with the same
+ * contract as claudeSend/codexSend (return { text, sessionRef, usage? };
+ * read your seat config from room.cfg.agents.<yourname>), add it to the
+ * `adapters` map below the adapter definitions, and describe it here. The
+ * seat picker, settings, colors and routing pick it up automatically.
+ */
+const PROVIDERS = {
+  claude: {
+    label: "Claude", sub: "Claude Code CLI", desc: "Anthropic's coding agent",
+    avatar: "C", color: "#e8845c",
+    defaults: { command: "claude", model: null, effort: null, extraArgs: [], lurk: false, lurkStyle: "balanced", lurkPrompt: null, permissionMode: "auto" },
+    fields: ["command", "model", "effort", "permissionMode", "extraArgs"],
+    // Suggestions only — both fields are free text, so values newer than this
+    // build (models or effort levels) work without touching Parley. Claude
+    // Code keeps no local model list to read, so these are static; note that
+    // `ultracode` is accepted by the CLI even though --help omits it.
+    efforts: ["low", "medium", "high", "xhigh", "max", "ultracode"],
+    models: ["fable", "opus", "sonnet", "haiku"],
+    effortLabels: { xhigh: "Extra High", ultracode: "Ultracode (xhigh + workflow orchestration)" },
+  },
+  codex: {
+    label: "Codex", sub: "OpenAI Codex CLI", desc: "OpenAI's coding agent",
+    avatar: "X", color: "#2fd6a8",
+    defaults: { command: "codex", model: null, effort: null, sandbox: "read-only", extraArgs: [], lurk: false, lurkStyle: "balanced", lurkPrompt: null },
+    fields: ["command", "model", "effort", "sandbox", "extraArgs"],
+    // Fallbacks — discover() below prefers Codex's own models cache.
+    efforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+    models: ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+    // Codex's config values differ from the words its own menu shows; use its
+    // wording in the picker while still sending the value the CLI expects.
+    effortLabels: { low: "Light", xhigh: "Extra High" },
+    // Codex maintains ~/.codex/models_cache.json (slugs + the reasoning levels
+    // each model supports). Reading it beats hardcoding a list that goes stale
+    // the next time OpenAI ships a model.
+    discover() {
+      const file = path.join(os.homedir(), ".codex", "models_cache.json");
+      const cache = JSON.parse(fs.readFileSync(file, "utf8"));
+      const models = [], efforts = new Map();
+      for (const m of cache.models || []) {
+        if (m.visibility === "hide") continue; // internal entries the CLI hides
+        if (m.slug) models.push({ value: m.slug, label: m.display_name || m.slug, hint: m.description || "" });
+        for (const lvl of m.supported_reasoning_levels || []) {
+          if (lvl.effort && !efforts.has(lvl.effort)) efforts.set(lvl.effort, lvl.description || "");
+        }
+      }
+      return models.length ? { models, efforts: [...efforts].map(([value, hint]) => ({ value, hint })) } : null;
+    },
+  },
+};
+const DEFAULT_SEATS = ["claude", "codex"];
+const CLAUDE_PERMISSION_MODES = new Set(["auto", "plan", "acceptEdits", "bypassPermissions"]);
+
+function seatIds(room) { return Object.keys(room.cfg.agents); }
+function otherSeat(room, id) { return seatIds(room).find((s) => s !== id) || id; }
+function providerOf(id) { return PROVIDERS[id] || PROVIDERS[DEFAULT_SEATS[0]]; }
+// Effort names sort by depth, not alphabetically, however they arrive.
+const EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "ultracode"];
+const byDepth = (a, b) => {
+  const ia = EFFORT_ORDER.indexOf(a), ib = EFFORT_ORDER.indexOf(b);
+  return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+};
+
+// Suggestions reach the UI as { value, label, hint }: `value` is what the CLI
+// is given, `label` is what the provider's own interface calls it.
+const titleCase = (s) => String(s).charAt(0).toUpperCase() + String(s).slice(1);
+function normalizeChoices(list, labels) {
+  const seen = new Map();
+  for (const item of list || []) {
+    const value = typeof item === "string" ? item : item.value;
+    if (!value || seen.has(value)) continue;
+    const label = (labels && labels[value]) || (typeof item === "object" && item.label) || titleCase(value);
+    seen.set(value, { value, label, hint: (typeof item === "object" && item.hint) || "" });
+  }
+  return [...seen.values()];
+}
+
+let catalogCache = null;
+function providerCatalog() {
+  if (catalogCache) return catalogCache;
+  catalogCache = Object.fromEntries(Object.entries(PROVIDERS).map(([id, p]) => {
+    let found = null;
+    if (p.discover) { try { found = p.discover(); } catch { /* not installed / unreadable — use the fallbacks */ } }
+    const efforts = normalizeChoices([...(found && found.efforts || []), ...(p.efforts || [])], p.effortLabels)
+      .sort((a, b) => byDepth(a.value, b.value));
+    const models = normalizeChoices(found && found.models ? found.models : p.models, null);
+    return [id, { label: p.label, sub: p.sub, avatar: p.avatar, color: p.color, fields: p.fields, efforts, models }];
+  }));
+  return catalogCache;
+}
+// Drop config keys that aren't real seats (typos, junk from hand-edits).
+function pruneSeats(cfg) {
+  const keys = Object.keys(cfg.agents || {}).filter((k) => PROVIDERS[k]).slice(0, 2);
+  cfg.agents = keys.length === 2
+    ? Object.fromEntries(keys.map((k) => [k, cfg.agents[k]]))
+    : defaultConfig().agents;
+  return cfg;
+}
+
+function defaultConfig(seats = DEFAULT_SEATS) {
+  return {
+    defaultAgent: seats[0],
+    mode: "talk",     // "talk" (chat, conservative permissions) | "work" (agents may write/run in the workspace)
+    maxHops: 0,       // agent-to-agent follow-ups per user message (0 = no configured limit)
+    pairRounds: 0,    // review rounds per message in pair mode (0 = until the reviewer approves)
+    projectDir: null, // absolute path of a real project to work in (null = room's own sandbox workspace)
+    roomNote: null,   // standing instruction prepended to every prompt (set via Settings or /note)
+    timeoutMs: 900000,
+    agents: Object.fromEntries(seats.map((s) => [s, { ...providerOf(s).defaults }])),
+  };
+}
+function defaultState(seats = DEFAULT_SEATS) {
+  return {
+    lastAddressed: null,
+    nextTurn: 1,
+    lastUser: null, // { n, text, target, done: {agent:true}, pair:boolean }
+    pair: null,     // { worker, reviewer, rounds, roundsSource } while pair mode is on
+    codexLastWarned: false,
+    agents: Object.fromEntries(seats.map((s) => [s, {
+      sessionRef: null,
+      cursor: 0,
+      ...(s === "claude" ? { permissionScope: null } : {}),
+    }])),
+  };
+}
+
+// ---------------------------------------------------------------- utilities
+
+function tsLocal() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+function readJSON(file) {
+  // tolerate a UTF-8 BOM — hand-edited configs often have one on Windows
+  return JSON.parse(fs.readFileSync(file, "utf8").replace(/^﻿/, ""));
+}
+function writeJSON(file, obj) {
+  fs.writeFileSync(file, JSON.stringify(obj, null, 2) + "\n", "utf8");
+}
+function deepMerge(base, extra) {
+  if (extra === undefined) return base; // absent field: keep
+  if (extra === null) return null;      // explicit null: clear
+  if (base === null || base === undefined) return extra;
+  if (Array.isArray(base) || Array.isArray(extra)) return extra;
+  if (typeof base === "object" && typeof extra === "object") {
+    const out = { ...base };
+    for (const k of Object.keys(extra)) out[k] = k in base ? deepMerge(base[k], extra[k]) : extra[k];
+    return out;
+  }
+  return extra;
+}
+function truncate(s, n = 400) {
+  s = String(s || "").trim();
+  return s.length > n ? s.slice(0, n) + " …" : s;
+}
+function stderrTail(r) {
+  const src = (r.stderr || "").trim() || (r.stdout || "").trim();
+  if (!src) return "";
+  const lines = src.split(/\r?\n/).filter((l) => l.trim());
+  return " — " + truncate(lines.slice(-3).join(" | "), 300);
+}
+
+function cliArgValue(args, option) {
+  const wanted = option.toLowerCase();
+  let found = 0;
+  let value = null;
+  for (let i = 0; i < (args || []).length; i++) {
+    const raw = String(args[i]);
+    if (raw.split("=", 1)[0].toLowerCase() !== wanted) continue;
+    found++;
+    value = raw.includes("=") ? raw.slice(raw.indexOf("=") + 1) : String(args[i + 1] || "");
+    if (!value.trim() || value.startsWith("-")) value = "invalid";
+  }
+  return found > 1 ? "invalid" : value;
+}
+
+// `auto` is Parley's legacy name for "follow the room", not Claude Code's
+// newer classifier-backed Auto mode. An explicit Extra CLI arg still wins.
+function effectiveClaudePermissionMode(cfg, roomMode) {
+  const override = cliArgValue(cfg.extraArgs || [], "--permission-mode");
+  if (override !== null) return override || "invalid";
+  const configured = CLAUDE_PERMISSION_MODES.has(cfg.permissionMode) ? cfg.permissionMode : "auto";
+  return configured === "auto" ? (roomMode === "work" ? "acceptEdits" : "default") : configured;
+}
+
+function isolatedClaudeProtectedTurn(room, agent, { discussion, readOnly } = {}) {
+  return agent === "claude" && !!(discussion || readOnly) &&
+    effectiveClaudePermissionMode(room.cfg.agents.claude, room.cfg.mode) === "bypassPermissions";
+}
+
+function applyAdapterSession(room, agent, res) {
+  // A protected Claude turn must not reuse a bypass-enabled native session:
+  // Claude documents that Plan's write blocks do not hold once bypass is
+  // available in that session. Discard the full-access session after the
+  // isolated Plan invocation; the next ordinary turn is re-briefed from the
+  // transcript before starting a fresh full-access session.
+  if (res.resetSession) room.state.agents[agent].sessionRef = null;
+  else if (res.sessionRef) {
+    room.state.agents[agent].sessionRef = res.sessionRef;
+    if (agent === "claude") {
+      room.state.agents.claude.permissionScope = effectiveClaudePermissionMode(
+        room.cfg.agents.claude, room.cfg.mode);
+    }
+  }
+}
+
+// Extra args are an advanced escape hatch. Direct dangerous flags and direct
+// Claude bypass arguments are rejected here as well as in the config endpoint
+// because room.json is intentionally hand-editable. Provider/user settings and
+// custom command wrappers remain part of the trusted local CLI boundary.
+function extraArgsViolation(agent, value) {
+  if (!Array.isArray(value)) return "Extra CLI args must be a list";
+  const args = value.map((v) => String(v));
+  let claudePermissionFlags = 0;
+  for (let i = 0; i < args.length; i++) {
+    const raw = args[i];
+    const flag = raw.split("=", 1)[0].toLowerCase();
+    if (flag.startsWith("--dangerously-") || flag.startsWith("--allow-dangerously-")) {
+      return `${raw} is intentionally blocked by Parley`;
+    }
+    if (agent === "claude" && flag === "--permission-mode") {
+      claudePermissionFlags++;
+      if (claudePermissionFlags > 1) {
+        return "Only one Claude --permission-mode override is allowed";
+      }
+      const mode = raw.includes("=") ? raw.slice(raw.indexOf("=") + 1) : args[i + 1];
+      if (!String(mode || "").trim() || String(mode).startsWith("-")) {
+        return "Claude --permission-mode requires a value";
+      }
+      if (String(mode || "").trim().toLowerCase() === "bypasspermissions") {
+        return "Use Claude's warned Full access setting instead of bypassPermissions in Extra CLI args";
+      }
+    }
+  }
+  return null;
+}
+
+function checkedExtraArgs(agent, value) {
+  const issue = extraArgsViolation(agent, value || []);
+  if (issue) throw new AdapterError(`unsafe Extra CLI args: ${issue}`);
+  return (value || []).map((v) => String(v));
+}
+
+function withoutArgWithValue(args, option) {
+  const wanted = option.toLowerCase();
+  const out = [];
+  for (let i = 0; i < args.length; i++) {
+    const raw = String(args[i]);
+    if (raw.split("=", 1)[0].toLowerCase() !== wanted) {
+      out.push(raw);
+      continue;
+    }
+    if (!raw.includes("=") && i + 1 < args.length) i++;
+  }
+  return out;
+}
+
+// A failed resume is safe to repeat fresh only when the provider explicitly
+// says the native conversation no longer exists. Authentication, rate limits,
+// transport errors and tool failures must surface without an automatic second
+// paid invocation (which could also duplicate side effects).
+function missingNativeSession(agent, r) {
+  const src = `${r.stderr || ""}\n${r.stdout || ""}`;
+  if (agent === "claude") {
+    return /\bno conversation found with session id\b/i.test(src) ||
+      /\bconversation(?:\s+with)?(?:\s+session)?(?:\s+id)?[^\r\n]{0,80}\b(?:not found|does not exist)\b/i.test(src);
+  }
+  if (agent === "codex") {
+    return /\bno rollout found for (?:thread|conversation) id\b/i.test(src) ||
+      /\bsession not found for (?:thread|request)_id\b/i.test(src) ||
+      /\bthread not found\b/i.test(src);
+  }
+  return false;
+}
+
+class AdapterError extends Error {
+  constructor(message, opts = {}) {
+    super(message);
+    this.resumeFailed = !!opts.resumeFailed;
+    this.stopped = !!opts.stopped;
+  }
+}
+
+// ---------------------------------------------------------------- command resolution
+// npm-installed CLIs on Windows are .cmd/.ps1 shims that Node can't spawn
+// directly (and spawning via a shell risks mangling args). We resolve the shim
+// to its real target: an .exe or a .js run with the current Node binary.
+
+const cmdCache = new Map();
+
+function resolveCommand(cmd) {
+  if (cmdCache.has(cmd)) return cmdCache.get(cmd);
+  const r = resolveCommandUncached(cmd);
+  cmdCache.set(cmd, r);
+  return r;
+}
+
+function asSpec(file) {
+  if (/\.(mjs|cjs|js)$/i.test(file)) return { cmd: process.execPath, pre: [file], via: "node" };
+  return { cmd: file, pre: [], via: "direct" };
+}
+
+function resolveCommandUncached(cmd) {
+  // Explicit path given
+  if (cmd.includes("/") || cmd.includes("\\")) {
+    if (!fs.existsSync(cmd)) return { error: `command path not found: ${cmd}` };
+    return asSpec(cmd);
+  }
+  if (!IS_WIN) return { cmd, pre: [], via: "direct" }; // spawn does PATH lookup on posix
+
+  const dirs = (process.env.PATH || "").split(";").filter(Boolean);
+  const tryFile = (f) => { try { return fs.existsSync(f); } catch { return false; } };
+  let shim = null;
+  for (const dir of dirs) {
+    const exe = path.join(dir, cmd + ".exe");
+    if (tryFile(exe)) return asSpec(exe);
+    for (const ext of [".cmd", ".bat"]) {
+      const f = path.join(dir, cmd + ext);
+      if (!shim && tryFile(f)) shim = f;
+    }
+  }
+  if (shim) {
+    // Parse the npm shim for its "%dp0%\<target>" — the real script/binary.
+    try {
+      const text = fs.readFileSync(shim, "utf8");
+      const targets = [...text.matchAll(/"%dp0%\\([^"]+)"/g)].map((m) => m[1]);
+      for (const rel of targets.reverse()) {
+        const full = path.join(path.dirname(shim), rel);
+        if (fs.existsSync(full) && /\.(exe|mjs|cjs|js)$/i.test(full)) return asSpec(full);
+      }
+    } catch { /* fall through */ }
+    // Last resort: run the shim through cmd.exe with hand-quoted args.
+    return { cmd: "cmd.exe", pre: ["/d", "/s", "/c", shim], via: "cmdshell" };
+  }
+  return { error: `'${cmd}' was not found on PATH` };
+}
+
+// ---------------------------------------------------------------- process runner
+
+function killTree(child) {
+  if (!child || !child.pid) return;
+  try {
+    if (IS_WIN) spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+    else if (child.rtProcessGroup) process.kill(-child.pid, "SIGKILL");
+    else child.kill("SIGKILL");
+  } catch { /* already gone */ }
+}
+
+// `spawn()` reports a missing executable asynchronously through an `error`
+// event, so try/catch alone cannot protect startup or the folder-open API.
+// Resolve once the OS accepted the launch and keep an error listener attached
+// so a later child error can never crash Parley.
+function launchDetached(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawn(command, args, { detached: true, stdio: "ignore", ...options });
+    } catch (e) {
+      reject(e);
+      return;
+    }
+    let settled = false;
+    child.once("error", (e) => {
+      if (!settled) { settled = true; reject(e); }
+    });
+    child.once("spawn", () => {
+      if (settled) return;
+      settled = true;
+      child.unref();
+      resolve(child);
+    });
+  });
+}
+
+/**
+ * Spawn a CLI, feed `input` on stdin, stream stdout lines to onLine,
+ * enforce a timeout. Registers the child on room.procs[agent] so /stop works.
+ */
+function runCli(spec, args, { cwd, timeoutMs, input, onLine, room, agent }) {
+  return new Promise((resolve) => {
+    if (spec.error) return resolve({ code: -1, stdout: "", stderr: spec.error, spawnError: true });
+    const child = spawn(spec.cmd, [...spec.pre, ...args], {
+      cwd,
+      env: process.env,
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+      // A separate POSIX process group lets Stop/timeout terminate tools and
+      // commands launched by the CLI, not just the CLI parent process.
+      detached: !IS_WIN,
+    });
+    child.rtProcessGroup = !IS_WIN;
+    if (room && agent) room.procs.set(agent, child);
+
+    let stdout = "", stderr = "", buf = "", timedOut = false, spawnErr = null;
+    const timer = setTimeout(() => { timedOut = true; killTree(child); }, timeoutMs || 300000);
+
+    child.on("error", (e) => { spawnErr = e; });
+    child.stdout.on("data", (d) => {
+      const s = d.toString("utf8");
+      if (stdout.length < 20_000_000) stdout += s;
+      buf += s;
+      let i;
+      while ((i = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, i); buf = buf.slice(i + 1);
+        if (onLine) { try { onLine(line.trim()); } catch { /* tolerate bad line */ } }
+      }
+    });
+    child.stderr.on("data", (d) => { if (stderr.length < 2_000_000) stderr += d.toString("utf8"); });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (room && agent && room.procs.get(agent) === child) room.procs.delete(agent);
+      if (buf.trim() && onLine) { try { onLine(buf.trim()); } catch { /* ignore */ } }
+      resolve({
+        code: spawnErr ? -1 : code,
+        stdout, stderr: spawnErr ? String(spawnErr.message) : stderr,
+        timedOut,
+        stopped: !!child.rtStopped,
+        spawnError: !!spawnErr,
+      });
+    });
+    try { child.stdin.write(input || ""); child.stdin.end(); } catch { /* proc died early */ }
+  });
+}
+
+// ---------------------------------------------------------------- adapters
+
+function makeBriefing(agent, room) {
+  const other = otherSeat(room, agent);
+  return `You are ${agent}, a participant in "Parley", a shared chat room with a human user and another AI agent (${other}, ${providerOf(other).desc}). Everyone sees the same conversation.
+
+How it works: messages from the user and from ${other} that occurred since your last turn are relayed to you inside a [Room activity ...] block. Lines are prefixed with the speaker. "user (to you)" is addressed to you; other lines are context. React to context naturally — you may agree, disagree, or build on what ${other} said.
+
+The full transcript is at ${room.transcriptFile}. Your working directory is ${room.cfg.projectDir ? "the user's project folder" : "a shared scratch workspace"} at ${workDir(room)}; you may read and write files there when the user asks.
+
+Style: you are a chat participant, not running a coding task. Reply in plain conversational text, concise by default. Do not use tools or modify files unless the user explicitly asks for it. Never speak for ${other} or fabricate their messages. You may address ${other} directly by including @${other} in a reply; if the room's hop limit allows it, they will see your message and may respond.`;
+}
+
+// When a native session is lost, replay recent history inline instead of
+// pointing at a file the agent may not have permission to read. Covers what
+// the dead session knew (entries up to the cursor, plus the agent's own
+// words); the normal delta carries everything after.
+function historyTail(room, agent, maxChars = 6000, maxEntries = 40) {
+  const cur = room.state.agents[agent].cursor;
+  const lines = [];
+  let used = 0;
+  const perEntryChars = Math.max(20, Math.min(1600, maxChars));
+  for (let i = room.entries.length - 1; i >= 0 && lines.length < maxEntries; i--) {
+    const e = room.entries[i];
+    if (e.kind !== "user" && e.kind !== "agent") continue;
+    if (!(e.n <= cur || e.author === agent)) continue;
+    const fullLine = e.kind === "user"
+      ? `user (to ${e.target === "both" ? "both" : e.target === agent ? "you" : e.target}): ${e.text}`
+      : `${e.author === agent ? "you" : e.author}: ${e.text}`;
+    const line = fullLine.length > perEntryChars
+      ? truncate(fullLine, perEntryChars - 2)
+      : fullLine;
+    const remaining = maxChars - used;
+    if (line.length + 1 > remaining) {
+      // Keep a useful prefix rather than returning no history at all when the
+      // caller supplies an unusually small total budget.
+      if (!lines.length && remaining > 20) lines.push(truncate(line, remaining - 2));
+      break;
+    }
+    used += line.length + 1;
+    lines.push(line);
+  }
+  return lines.reverse().join("\n");
+}
+
+function resetRecoveryBriefing(room, agent) {
+  const tail = historyTail(room, agent);
+  return makeBriefing(agent, room) +
+    "\n\nNote: this is a fresh native session (the prior session was reset or this turn was deliberately isolated)." +
+    (tail ? ` Recent room history, so you can pick up where things left off:\n[Recent room history]\n${tail}\n[End of history]` : "") +
+    `\nThe full transcript is at ${room.transcriptFile} if you need older context.`;
+}
+
+function freshTurnBriefing(room, agent, isolated = false) {
+  // A deliberate isolated call cannot see the ordinary native session. A
+  // later fresh call also needs inline history after that session is discarded.
+  // `cursor > 0` covers every other intentional reset (mode, project, sandbox,
+  // offline permission edits) without another fragile state flag.
+  return isolated || room.state.agents[agent].cursor > 0
+    ? resetRecoveryBriefing(room, agent)
+    : makeBriefing(agent, room);
+}
+
+// ------- shared helpers for work mode & activity lines -------
+
+// Deep reasoning levels can think for many minutes — a five-minute cap used to
+// kill perfectly healthy turns, so a seat set to one of these gets more room.
+const DEEP_EFFORTS = new Set(["xhigh", "max", "ultra", "ultracode"]);
+function seatTimeout(room, seatId) {
+  let t = room.cfg.timeoutMs || 900000;
+  if (room.cfg.mode === "work") t = Math.max(t, 900000); // work needs breathing room
+  const effort = seatId && room.cfg.agents[seatId] && room.cfg.agents[seatId].effort;
+  if (effort && DEEP_EFFORTS.has(String(effort).toLowerCase())) t = Math.max(t, 1800000);
+  return t;
+}
+
+// The agents' working directory: a linked real project, or the room's sandbox.
+function workDir(room) {
+  return room.cfg.projectDir || room.workspace;
+}
+
+const fileBase = (p) => String(p || "").split(/[\\/]/).pop();
+
+function claudeToolLabel(name, input) {
+  if (name === "Write" || name === "Edit" || name === "NotebookEdit") return `✏️ ${name} ${fileBase(input.file_path)}`;
+  if (name === "Read") return `👁 Read ${fileBase(input.file_path)}`;
+  if (name === "Bash") return `▶ ${truncate(input.description || input.command || "shell", 70)}`;
+  if (name === "Grep" || name === "Glob") return `🔎 ${name} ${truncate(input.pattern || "", 40)}`;
+  return `🔧 ${name}`;
+}
+
+// Agents run their commands through a shell, so the raw string is mostly
+// wrapper — show what was actually run instead of `"C:\…\powershell.exe" -Comm…`.
+function shellCommandLabel(raw) {
+  let cmd = Array.isArray(raw) ? raw.join(" ") : String(raw || "");
+  const shell = /^\s*("[^"]*[\\/](powershell|pwsh|cmd|bash|sh|zsh)(\.exe)?"|\S*\b(powershell|pwsh|cmd|bash|sh|zsh)(\.exe)?)\s*/i;
+  if (shell.test(cmd)) {
+    cmd = cmd.replace(shell, "");
+    const encoded = /(?:-e|-enc|-EncodedCommand)\s+([A-Za-z0-9+/=]{16,})/i.exec(cmd);
+    if (encoded) {
+      try { cmd = Buffer.from(encoded[1], "base64").toString("utf16le"); } catch { /* keep as-is */ }
+    } else {
+      // drop the shell's own switches, then any quoting around the command
+      cmd = cmd.replace(/^(?:-(?:NoProfile|NonInteractive|NoLogo|ExecutionPolicy\s+\S+|WindowStyle\s+\S+|Command|c|lc)\b\s*)+/gi, "");
+      cmd = cmd.replace(/^"([\s\S]*)"$/, "$1").replace(/^'([\s\S]*)'$/, "$1");
+    }
+  }
+  cmd = cmd.replace(/\s+/g, " ").trim();
+  return cmd || "shell";
+}
+
+function codexItemLabel(item) {
+  if (item.type === "file_change") {
+    const ch = item.changes || [];
+    const parts = ch.slice(0, 3).map((c) => `${c.kind || "edit"} ${fileBase(c.path)}`);
+    return `✏️ ${parts.join(", ")}${ch.length > 3 ? " …" : ""}`;
+  }
+  if (item.type === "command_execution") return `▶ ${truncate(shellCommandLabel(item.command), 80)}`;
+  return `🔧 ${item.type}`;
+}
+
+/** Claude Code CLI: print mode + stream-json for live partial text. */
+async function claudeSend(room, { prompt, briefing, onStream, onActivity, discussion, readOnly }) {
+  const cfg = room.cfg.agents.claude;
+  const protectedTurn = !!(discussion || readOnly);
+  const isolatedProtected = isolatedClaudeProtectedTurn(room, "claude", { discussion, readOnly });
+  const sess = isolatedProtected ? null : room.state.agents.claude.sessionRef;
+  const checked = checkedExtraArgs("claude", cfg.extraArgs);
+  // A protected discussion/review turn must not be reopened by an advanced
+  // per-room permission override. Provider/user-level CLI settings remain part
+  // of the local trust boundary, so the prompt still carries the same rule.
+  const extraArgs = protectedTurn ? withoutArgWithValue(checked, "--permission-mode") : checked;
+  const args = ["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages"];
+  if (sess) args.push("--resume", sess);
+  if (briefing) args.push("--append-system-prompt", briefing);
+  // Protected discussion/reviewer/listener turns request Claude's plan mode.
+  // Otherwise an explicit permissionMode wins, "auto" follows the room, and
+  // Extra CLI args remain an advanced override (raw bypass is rejected above).
+  if (protectedTurn) {
+    args.push("--permission-mode", "plan");
+  } else if (!checked.some((a) => a === "--permission-mode" || a.startsWith("--permission-mode="))) {
+    const pm = cfg.permissionMode || "auto";
+    if (pm === "plan" || pm === "acceptEdits" || pm === "bypassPermissions") args.push("--permission-mode", pm);
+    else if (room.cfg.mode === "work") args.push("--permission-mode", "acceptEdits");
+  }
+  if (cfg.model) args.push("--model", cfg.model);
+  if (cfg.effort) args.push("--effort", cfg.effort);
+  args.push(...extraArgs);
+
+  let sessionRef = sess || null, acc = "", resultText = null, assistantText = null, isError = false, usage = null;
+  const seenTools = new Set();
+  const onLine = (line) => {
+    if (!line.startsWith("{")) return;
+    let obj; try { obj = JSON.parse(line); } catch { return; }
+    if (obj.session_id) sessionRef = obj.session_id;
+    if (obj.type === "stream_event" && obj.event && !obj.parent_tool_use_id) {
+      const ev = obj.event;
+      if (ev.type === "content_block_delta" && ev.delta && ev.delta.type === "text_delta") {
+        acc += ev.delta.text;
+        if (onStream) onStream(acc);
+      }
+    } else if (obj.type === "assistant" && obj.message && Array.isArray(obj.message.content)) {
+      const t = obj.message.content.filter((c) => c.type === "text").map((c) => c.text).join("\n");
+      if (t) assistantText = t;
+      for (const c of obj.message.content) {
+        if (c.type === "tool_use" && c.id && !seenTools.has(c.id) && seenTools.size < 100) {
+          seenTools.add(c.id);
+          if (onActivity) onActivity(claudeToolLabel(c.name, c.input || {}));
+        }
+      }
+    } else if (obj.type === "result") {
+      if (typeof obj.result === "string") resultText = obj.result;
+      if (obj.is_error) isError = true;
+      if (obj.session_id) sessionRef = obj.session_id;
+      if (obj.usage && typeof obj.usage.output_tokens === "number") usage = { out: obj.usage.output_tokens };
+    }
+  };
+
+  const r = await runCli(resolveCommand(cfg.command), args, {
+    cwd: workDir(room), timeoutMs: seatTimeout(room, "claude"), input: prompt, onLine, room, agent: "claude",
+  });
+
+  if (r.stopped) throw new AdapterError("claude was stopped by you", { stopped: true });
+  if (r.timedOut) throw new AdapterError(`claude timed out after ${Math.round(seatTimeout(room, "claude") / 1000)}s — raise "Timeout" in Settings if it needs longer`);
+  if (r.spawnError) throw new AdapterError(`could not launch claude (command: "${cfg.command}") — ${r.stderr}`);
+  if (r.code !== 0) {
+    throw new AdapterError(`claude (command: "${cfg.command}") exited with code ${r.code}${stderrTail(r)}`, {
+      resumeFailed: !!sess && missingNativeSession("claude", r),
+    });
+  }
+  let text = resultText ?? assistantText ?? (acc || null);
+  if (text === null) text = r.stdout.trim(); // last-resort fallback
+  if (isError) throw new AdapterError(`claude reported an error: ${truncate(text)}`);
+  if (!text) throw new AdapterError("claude returned an empty reply");
+  return {
+    text,
+    sessionRef: isolatedProtected ? null : sessionRef,
+    resetSession: isolatedProtected,
+    usage,
+  };
+}
+
+/** Codex CLI: exec mode + JSONL events; final text via --output-last-message. */
+async function codexSend(room, { prompt, briefing, onStream, onActivity }) {
+  const cfg = room.cfg.agents.codex;
+  const sess = room.state.agents.codex.sessionRef;
+  const extraArgs = checkedExtraArgs("codex", cfg.extraArgs);
+  const tmp = path.join(os.tmpdir(), `parley-codex-${crypto.randomUUID()}.txt`);
+
+  // Work rooms upgrade the default read-only sandbox; explicit settings win.
+  const sandbox = room.cfg.mode === "work" && (cfg.sandbox || "read-only") === "read-only"
+    ? "workspace-write" : (cfg.sandbox || "read-only");
+
+  const args = [];
+  if (sess === "--last") args.push("exec", "resume", "--last");
+  else if (sess) args.push("exec", "resume", sess);
+  else args.push("exec", "--sandbox", sandbox, "-C", workDir(room));
+  args.push("--json", "--skip-git-repo-check", "--output-last-message", tmp);
+  if (cfg.model) args.push("-m", cfg.model);
+  if (cfg.effort) args.push("-c", "model_reasoning_effort=" + cfg.effort);
+  args.push(...extraArgs);
+  args.push("-"); // prompt on stdin
+
+  const input = briefing ? briefing + "\n\n---\n\n" + prompt : prompt;
+  let threadRef = sess || null, acc = "", lastMsg = null, usage = null;
+  const seenItems = new Set();
+  const onLine = (line) => {
+    if (!line.startsWith("{")) return;
+    let obj; try { obj = JSON.parse(line); } catch { return; }
+    if (obj.type === "turn.completed" && obj.usage) {
+      usage = { out: obj.usage.output_tokens, reasoning: obj.usage.reasoning_output_tokens };
+    }
+    if (obj.type === "thread.started" && obj.thread_id) threadRef = obj.thread_id;
+    else if (obj.thread_id && (!threadRef || threadRef === "--last")) threadRef = obj.thread_id;
+    else if (obj.msg && obj.msg.type === "session_configured" && obj.msg.session_id) threadRef = obj.msg.session_id;
+    const item = obj.item;
+    if (item && (item.type === "agent_message" || item.item_type === "assistant_message")) {
+      const t = item.text ?? item.message ?? null;
+      if (t) { lastMsg = t; if (onStream) onStream(t); }
+    }
+    if (item && (item.type === "file_change" || item.type === "command_execution") && onActivity && seenItems.size < 200) {
+      const startedKey = (item.id || "") + "|start";
+      if (obj.type === "item.started" && !seenItems.has(startedKey)) {
+        seenItems.add(startedKey);
+        onActivity(codexItemLabel(item));
+      } else if (obj.type === "item.completed") {
+        if (!seenItems.has(startedKey)) { seenItems.add(startedKey); onActivity(codexItemLabel(item)); }
+        if (item.type === "command_execution" && item.exit_code) {
+          onActivity(`⚠ exited ${item.exit_code}: ${truncate(shellCommandLabel(item.command), 60)}`);
+        }
+      }
+    }
+    if (obj.msg && obj.msg.type === "agent_message" && obj.msg.message) lastMsg = obj.msg.message;
+    if (obj.msg && obj.msg.type === "agent_message_delta" && obj.msg.delta) {
+      acc += obj.msg.delta;
+      if (onStream) onStream(acc);
+    }
+  };
+
+  const r = await runCli(resolveCommand(cfg.command), args, {
+    cwd: workDir(room), timeoutMs: seatTimeout(room, "codex"), input, onLine, room, agent: "codex",
+  });
+
+  let fileText = null;
+  try { fileText = fs.readFileSync(tmp, "utf8").trim() || null; } catch { /* no file */ }
+  try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+
+  if (r.stopped) throw new AdapterError("codex was stopped by you", { stopped: true });
+  if (r.timedOut) throw new AdapterError(`codex timed out after ${Math.round(seatTimeout(room, "codex") / 1000)}s — raise "Timeout" in Settings if it needs longer`);
+  if (r.spawnError) throw new AdapterError(`could not launch codex (command: "${cfg.command}") — ${r.stderr}`);
+  if (r.code !== 0) {
+    throw new AdapterError(`codex (command: "${cfg.command}") exited with code ${r.code}${stderrTail(r)}`, {
+      resumeFailed: !!sess && missingNativeSession("codex", r),
+    });
+  }
+  const text = fileText ?? lastMsg ?? (acc || null);
+  if (!text) throw new AdapterError("codex returned an empty reply");
+  return { text, sessionRef: threadRef || "--last", sentinelThread: !threadRef || threadRef === "--last", usage };
+}
+
+const adapters = { claude: claudeSend, codex: codexSend };
+
+// ---------------------------------------------------------------- rooms
+
+const rooms = new Map();
+
+// A trailing space makes a folder Windows can create but barely address, so
+// names must start and end with something real. HTTP entry points normalize
+// surrounding whitespace before they validate; internal callers must already
+// hold the canonical name.
+function validRoomName(name) {
+  return typeof name === "string" &&
+    name === name.trim() &&
+    /^[a-zA-Z0-9][a-zA-Z0-9-_ ]{0,39}$/.test(name) &&
+    !/\s$/.test(name);
+}
+
+function cleanRoomName(name) {
+  return String(name || "").trim();
+}
+
+// Rooms come into existence only when explicitly created (the + button, or the
+// bootstrap of `default`). Merely naming a room must never conjure it — that's
+// how a deleted room could otherwise resurrect itself.
+function loadRoom(name, seatChoice, create = false) {
+  if (rooms.has(name)) return rooms.get(name);
+  if (!validRoomName(name)) throw new Error(`invalid room name: ${name}`);
+  const dir = path.join(ROOT, name);
+  if (!create && !fs.existsSync(dir)) {
+    throw Object.assign(new Error(`no such room: ${name}`), { status: 404 });
+  }
+  const workspace = path.join(dir, "workspace");
+  fs.mkdirSync(workspace, { recursive: true });
+
+  const cfgFile = path.join(dir, "room.json");
+  let cfg;
+  if (fs.existsSync(cfgFile)) {
+    const raw = readJSON(cfgFile); // throws on bad JSON — never clobber
+    const seats = Object.keys(raw.agents || {}).filter((k) => PROVIDERS[k]).slice(0, 2);
+    cfg = pruneSeats(deepMerge(defaultConfig(seats.length === 2 ? seats : DEFAULT_SEATS), raw));
+    // A hand-edited unknown value must fail closed to Parley's room default,
+    // rather than becoming an ambiguous permission state in the UI.
+    if (cfg.agents.claude && !CLAUDE_PERMISSION_MODES.has(cfg.agents.claude.permissionMode)) {
+      cfg.agents.claude.permissionMode = "auto";
+    }
+    // Rooms created before deep reasoning levels existed carry the old
+    // five-minute cap, which now kills healthy turns; lift only that value.
+    if (cfg.timeoutMs === 300000) cfg.timeoutMs = 900000;
+  } else {
+    cfg = defaultConfig(seatChoice && seatChoice.length === 2 ? seatChoice : DEFAULT_SEATS);
+    writeJSON(cfgFile, cfg);
+  }
+
+  const seats = Object.keys(cfg.agents);
+  const stateFile = path.join(dir, "state.json");
+  let state;
+  if (fs.existsSync(stateFile)) state = deepMerge(defaultState(seats), readJSON(stateFile));
+  else { state = defaultState(seats); writeJSON(stateFile, state); }
+
+  // A native Claude session was created under one effective permission mode.
+  // Persist that provenance so an offline room.json edit (or an upgrade from a
+  // state file that predates this field) cannot resume a more privileged
+  // session under a newly conservative configuration.
+  let stateMigrated = false;
+  if (state.agents.claude) {
+    const expectedScope = effectiveClaudePermissionMode(cfg.agents.claude, cfg.mode);
+    if (state.agents.claude.permissionScope !== expectedScope) {
+      state.agents.claude.sessionRef = null;
+      state.agents.claude.permissionScope = expectedScope;
+      stateMigrated = true;
+    }
+  }
+
+  // Pair modes created before roundsSource existed captured whatever the room
+  // default happened to be at the time. Treat those legacy values as room-
+  // sourced so Settings and the active mode cannot silently disagree forever.
+  if (state.lastUser && state.lastUser.pair && state.lastUser.pair !== true) {
+    // Early pair-retry builds persisted a whole mode snapshot here. That makes
+    // Retry silently resurrect old workers/settings after the mode is switched.
+    state.lastUser.pair = true;
+    stateMigrated = true;
+  }
+  if (state.pair) {
+    const pair = state.pair;
+    const validSeats = seats.includes(pair.worker) && seats.includes(pair.reviewer) && pair.worker !== pair.reviewer;
+    if (!validSeats) {
+      state.pair = null;
+      stateMigrated = true;
+    } else if (pair.roundsSource !== "command") {
+      pair.roundsSource = "room";
+      pair.rounds = Math.min(99, Math.max(0, Number(cfg.pairRounds) || 0));
+      stateMigrated = true;
+    } else {
+      pair.rounds = Math.min(99, Math.max(0, Number(pair.rounds) || 0));
+    }
+  }
+  if (stateMigrated) writeJSON(stateFile, state);
+
+  const eventsFile = path.join(dir, "events.jsonl");
+  const transcriptFile = path.join(dir, "transcript.md");
+  const entries = [], receipts = [];
+  if (fs.existsSync(eventsFile)) {
+    for (const line of fs.readFileSync(eventsFile, "utf8").split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const obj = JSON.parse(line);
+        (obj.kind === "receipt" ? receipts : entries).push(obj);
+      } catch { /* skip corrupt line */ }
+    }
+  }
+
+  const room = {
+    name, dir, workspace, cfgFile, stateFile, eventsFile, transcriptFile,
+    cfg, state, entries, receipts,
+    generation: 1,        // bumped on /new so stale in-flight turns can't write
+    busy: new Map(),      // agent -> { startedAt }
+    procs: new Map(),     // agent -> child process
+    clients: new Set(),   // SSE responses
+    pendingMsgs: [],      // messages queued while agents are busy
+    pairActive: null,     // { worker, reviewer } while a pair session runs
+  };
+  rooms.set(name, room);
+  return room;
+}
+
+function saveState(room) { writeJSON(room.stateFile, room.state); }
+function saveConfig(room) { writeJSON(room.cfgFile, room.cfg); }
+
+function broadcast(room, obj) {
+  const payload = `data: ${JSON.stringify(obj)}\n\n`;
+  for (const res of room.clients) {
+    try { res.write(payload); } catch { room.clients.delete(res); }
+  }
+}
+
+function transcriptHeader(e) {
+  const author = e.kind === "user" ? `user → @${e.target}` : e.author;
+  return `### ${e.n} | ${author} | ${e.ts}`;
+}
+
+function appendEntry(room, { kind, author, target = null, text, meta = null }, opts = {}) {
+  const entry = { n: room.state.nextTurn++, kind, author, target, ts: tsLocal(), text, ...(meta ? { meta } : {}) };
+  room.entries.push(entry);
+  fs.appendFileSync(room.eventsFile, JSON.stringify(entry) + "\n", "utf8");
+  if (opts.md !== false) fs.appendFileSync(room.transcriptFile, `${transcriptHeader(entry)}\n${text}\n\n`, "utf8");
+  saveState(room);
+  broadcast(room, { type: "entry", entry });
+  return entry;
+}
+
+// Delivery receipt: agent has now heard turns (from, upTo], triggered by the
+// exchange whose user message is `turn`. Lives in events.jsonl (not the
+// transcript — no turn number of its own) and powers the per-message
+// "who was listening" dots in the UI.
+function appendReceipt(room, { agent, from, upTo, turn, mode, spoke }) {
+  if (upTo <= from) return;
+  const rec = { kind: "receipt", agent, from, upTo, turn, mode, ...(spoke === undefined ? {} : { spoke }), ts: tsLocal() };
+  room.receipts.push(rec);
+  fs.appendFileSync(room.eventsFile, JSON.stringify(rec) + "\n", "utf8");
+  broadcast(room, { type: "receipt", receipt: rec });
+}
+
+function roomSummary(room) {
+  const seats = seatIds(room);
+  const cmdStatus = {};
+  for (const a of seats) {
+    const spec = resolveCommand(room.cfg.agents[a].command);
+    cmdStatus[a] = spec.error ? { ok: false, detail: spec.error } : { ok: true, detail: spec.via };
+  }
+  return {
+    name: room.name,
+    cfg: room.cfg,
+    dir: room.dir,
+    workspace: workDir(room),
+    lastAddressed: room.state.lastAddressed,
+    seats,
+    providers: providerCatalog(),
+    agents: Object.fromEntries(seats.map((a) => [a, {
+      linked: !!room.state.agents[a].sessionRef,
+      sessionRef: room.state.agents[a].sessionRef ? String(room.state.agents[a].sessionRef).slice(0, 8) : null,
+      cursor: room.state.agents[a].cursor,
+      command: cmdStatus[a],
+    }])),
+    pair: pairSnapshot(room),
+    // Settings affect the next room-sourced cycle. If a cycle is already in
+    // flight, expose its immutable execution snapshot separately so clients
+    // never mistake the newly configured cap for the cap currently running.
+    workingPair: pairSnapshot(room, room.pairActive),
+    // A multi-step chain is mid-flight even in the gaps between its turns,
+    // when `busy` is momentarily empty. Anything asking "is the room idle?"
+    // needs this or it gets a false yes during a handoff.
+    working: !!room.pairActive,
+    busy: [...room.busy.keys()],
+    queued: room.pendingMsgs.length,
+    canRetry: retryTargets(room).length > 0,
+  };
+}
+
+// ---------------------------------------------------------------- turn engine
+
+function buildDelta(room, agent, excludeTurn) {
+  const cur = room.state.agents[agent].cursor;
+  const lines = [];
+  for (const e of room.entries) {
+    if (e.n <= cur || e.n === excludeTurn) continue;
+    if (e.kind === "system") continue;
+    if (e.author === agent) continue;
+    if (e.kind === "activity") {
+      lines.push(`(${e.author} did: ${e.text})`);
+    } else if (e.kind === "user") {
+      const to = e.target === "both" ? "both" : e.target === agent ? "you" : e.target;
+      lines.push(`user (to ${to}): ${e.text}`);
+    } else {
+      lines.push(`${e.author}: ${e.text}`);
+    }
+  }
+  return lines;
+}
+
+// Standing per-room instruction; included in every prompt so it survives
+// session resets and reaches both agents regardless of when they joined.
+function notePrefix(room) {
+  const n = room.cfg.roomNote && String(room.cfg.roomNote).trim();
+  return n ? `[Room note from the user: ${n}]\n\n` : "";
+}
+
+function buildPrompt(room, deltaLines, text) {
+  const head = notePrefix(room);
+  if (!deltaLines.length) return `${head}user (to you): ${text}`;
+  return `${head}[Room activity since your last turn]\n${deltaLines.join("\n")}\n[End of room activity]\n\nuser (to you): ${text}`;
+}
+
+// @both in a work room is a table discussion: reads allowed, mutations not.
+// Claude is Plan-scoped; a configured bypass session is never reused for the
+// protected call. Codex keeps its thread, so its boundary remains instructional.
+const DISCUSSION_NOTE = "(This message went to both agents — treat it as a table discussion: reply in chat and read files if useful, but do not modify files or run mutating commands this turn. Propose changes instead; the user will tag one agent to implement.)";
+
+async function runAgentTurn(room, agent, userTurn, discussion) {
+  const startedAt = Date.now();
+  const gen = room.generation;
+  room.busy.set(agent, { startedAt });
+  broadcast(room, { type: "status", agent, phase: "start", startedAt });
+  const onStream = (text) => broadcast(room, { type: "stream", agent, text });
+  const onActivity = (label) => {
+    if (gen === room.generation) appendEntry(room, { kind: "activity", author: agent, text: label }, { md: false });
+  };
+
+  try {
+    const heardFrom = room.state.agents[agent].cursor;
+    // A retry can target an old root while its prompt also includes newer room
+    // activity. Capture the high-water mark synchronously with buildDelta; do
+    // not include entries that arrive later while the CLI is running.
+    const heardThrough = room.entries.length ? room.entries[room.entries.length - 1].n : heardFrom;
+    const delta = buildDelta(room, agent, userTurn.n);
+    let prompt = buildPrompt(room, delta, userTurn.text);
+    if (discussion) prompt += `\n\n${DISCUSSION_NOTE}`;
+    const turnScope = { discussion, readOnly: discussion };
+    const isolated = isolatedClaudeProtectedTurn(room, agent, turnScope);
+    const fresh = !room.state.agents[agent].sessionRef || isolated;
+    const briefing = fresh ? freshTurnBriefing(room, agent, isolated) : null;
+
+    let res;
+    try {
+      res = await adapters[agent](room, { prompt, briefing, onStream, onActivity, ...turnScope });
+    } catch (e) {
+      if (e.resumeFailed && !e.stopped) {
+        // Native session lost — start fresh, tell the agent to consult the transcript.
+        room.state.agents[agent].sessionRef = null;
+        saveState(room);
+        broadcast(room, { type: "status", agent, phase: "retrying", startedAt });
+        const b2 = resetRecoveryBriefing(room, agent);
+        res = await adapters[agent](room, { prompt, briefing: b2, onStream, onActivity, ...turnScope });
+      } else throw e;
+    }
+
+    if (gen !== room.generation) return null; // room was reset while this turn ran
+    applyAdapterSession(room, agent, res);
+    // Retry may deliberately replay an older root (including under switched
+    // pair roles). Delivery cursors are high-water marks and must never move
+    // backward, or later turns would re-send context the seat already heard.
+    room.state.agents[agent].cursor = Math.max(heardFrom, userTurn.n, heardThrough);
+    if (room.state.lastUser && room.state.lastUser.n === userTurn.n) room.state.lastUser.done[agent] = true;
+    const replyEntry = appendEntry(room, {
+      kind: "agent", author: agent, text: res.text,
+      meta: { durationMs: Date.now() - startedAt, ...(res.usage ? { tokens: res.usage } : {}) },
+    });
+    appendReceipt(room, {
+      agent, from: heardFrom, upTo: Math.max(userTurn.n, heardThrough),
+      turn: userTurn.n, mode: "turn",
+    });
+
+    if (agent === "codex" && res.sentinelThread && !room.state.codexLastWarned) {
+      room.state.codexLastWarned = true;
+      saveState(room);
+      appendEntry(room, {
+        kind: "system", author: "system",
+        text: "Note: codex did not report a thread id, so Parley will resume its most recent session (--last). Using codex outside Parley at the same time could cross threads.",
+      });
+    }
+    return replyEntry;
+  } catch (e) {
+    if (gen !== room.generation) return null; // room was reset; drop the stale error
+    const icon = e.stopped ? "⏹" : "⚠";
+    appendEntry(room, {
+      kind: "system", author: "system",
+      text: `${icon} ${e.stopped ? e.message : `${agent} failed: ${e.message}`}`,
+      meta: { agent, error: !e.stopped, stopped: !!e.stopped },
+    });
+    return null;
+  } finally {
+    room.busy.delete(agent);
+    broadcast(room, { type: "status", agent, phase: "done" });
+    broadcast(room, { type: "room", room: roomSummary(room) });
+  }
+}
+
+// Lurk mode: an agent with cfg.lurk enabled overhears every exchange it wasn't
+// addressed in. After the addressed agent replies, the lurker is invoked with
+// the room delta and may chime in — or reply "[pass]" to stay silent (the
+// transcript gets nothing, only its cursor advances).
+// Intervention threshold is prompt-space, not mechanics: the lurker's own model
+// judges whether to speak. These styles set the criteria and explicitly fight
+// the politeness bias that makes assistant models default to silence.
+const LURK_STYLES = {
+  quiet: "Interject ONLY for outright problems: a factual or technical error that went uncorrected, or something likely to break or cause harm if the user acts on it. For everything else — even if you could add nuance — reply with exactly: [pass]",
+  balanced: "Interject when speaking would genuinely change the outcome: an uncorrected factual or technical error, a recommendation you substantially disagree with, a critical caveat the user would want before acting, or an obvious need the exchange left unmet (e.g. they just learned their approach fails but not what to use instead — give the fix). Do NOT interject just to agree, rephrase, or add minor color — in those cases reply with exactly: [pass]",
+  vocal: "Ask yourself: would a sharp senior colleague overhearing this speak up? Then interject whenever you have real signal: an error, a disagreement, an important caveat, a materially different approach, a concrete addition the user would value — and especially when the exchange leaves the user hanging (e.g. they learned their approach doesn't work but not what to do instead: jump in with the fix). Only pure acknowledgements and small talk deserve silence — in those cases reply with exactly: [pass]",
+};
+function lurkInstruction(cfgAgent) {
+  const custom = cfgAgent.lurkPrompt && String(cfgAgent.lurkPrompt).trim();
+  return "(You were not addressed in this exchange — you are lurking because the user explicitly enabled it: they WANT your unprompted judgment, and staying silent out of politeness defeats the feature. Your silence will be read as agreement with what was said. " +
+    (custom || LURK_STYLES[cfgAgent.lurkStyle] || LURK_STYLES.balanced) + ")";
+}
+const LURK_PASS = /^[\s\W]*pass[\s\W]*$/i;
+
+async function runListenerTurn(room, agent, userTurnN, discussion) {
+  const startedAt = Date.now();
+  const gen = room.generation;
+  const heardFrom = room.state.agents[agent].cursor;
+  const delta = buildDelta(room, agent, -1);
+  if (!delta.length) return;
+  const lastSeen = room.entries.length ? room.entries[room.entries.length - 1].n : 0;
+  room.busy.set(agent, { startedAt });
+  broadcast(room, { type: "status", agent, phase: "listening", startedAt });
+  const onStream = (text) => broadcast(room, { type: "stream", agent, text });
+  const onActivity = (label) => {
+    if (gen === room.generation) appendEntry(room, { kind: "activity", author: agent, text: label }, { md: false });
+  };
+
+  try {
+    const workHint = room.cfg.mode === "work"
+      ? "\nThe shared workspace (your working directory) contains the work being discussed — you may read files there to verify claims before judging."
+      : "";
+    const prompt = `${notePrefix(room)}[Room activity since your last turn]\n${delta.join("\n")}\n[End of room activity]\n\n${lurkInstruction(room.cfg.agents[agent])}${workHint}${discussion ? `\n${DISCUSSION_NOTE}` : ""}`;
+    const turnScope = { discussion, readOnly: true };
+    const isolated = isolatedClaudeProtectedTurn(room, agent, turnScope);
+    const fresh = !room.state.agents[agent].sessionRef || isolated;
+    const briefing = fresh ? freshTurnBriefing(room, agent, isolated) : null;
+
+    let res;
+    try {
+      res = await adapters[agent](room, { prompt, briefing, onStream, onActivity, ...turnScope });
+    } catch (e) {
+      if (e.resumeFailed && !e.stopped) {
+        room.state.agents[agent].sessionRef = null;
+        saveState(room);
+        const b2 = resetRecoveryBriefing(room, agent);
+        res = await adapters[agent](room, { prompt, briefing: b2, onStream, onActivity, ...turnScope });
+      } else throw e;
+    }
+
+    if (gen !== room.generation) return;
+    applyAdapterSession(room, agent, res);
+    room.state.agents[agent].cursor = Math.max(heardFrom, lastSeen);
+    const passed = res.text.trim().length <= 12 && LURK_PASS.test(res.text.trim());
+    let entry = null;
+    if (passed) {
+      saveState(room);
+      broadcast(room, { type: "lurk", agent, spoke: false });
+    } else {
+      entry = appendEntry(room, {
+        kind: "agent", author: agent, text: res.text,
+        meta: { durationMs: Date.now() - startedAt, lurk: true, ...(res.usage ? { tokens: res.usage } : {}) },
+      });
+    }
+    appendReceipt(room, { agent, from: heardFrom, upTo: lastSeen, turn: userTurnN, mode: "lurk", spoke: !passed });
+    return entry;
+  } catch (e) {
+    if (gen !== room.generation) return null;
+    broadcast(room, { type: "lurk", agent, spoke: false, error: truncate(e.message, 200) });
+    return null;
+  } finally {
+    room.busy.delete(agent);
+    broadcast(room, { type: "status", agent, phase: "done" });
+    broadcast(room, { type: "room", room: roomSummary(room) });
+  }
+}
+
+// ---- hop turns: an explicit @mention always pulls the other agent in. A soft
+// plain-name direct address does so when the target is lurking or the user
+// invited both seats. cfg.maxHops caps exchanges; 0 runs until settled, with a
+// high emergency ceiling for accidental ping-pong.
+
+const HOP_INSTRUCTION = "(You were addressed directly by the other agent. Reply briefly — to them, the user, or both. If you truly have nothing to add, reply with exactly: [pass])";
+const HOP_SAFETY_HOPS = Math.max(2, Number(process.env.PARLEY_HOP_SAFETY) || 25);
+
+const escRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function seatAlt(room) { return seatIds(room).map(escRe).join("|"); }
+
+function findHopTarget(room, entry, opts = {}) {
+  const text = (entry && entry.text) || "";
+  const explicit = text.matchAll(new RegExp(`(^|[\\s(.,;:!?"'\`])@(${seatAlt(room)})\\b`, "gi"));
+  for (const match of explicit) {
+    const target = match[2].toLowerCase();
+    if (target !== entry.author) return target;
+  }
+
+  // Soft calls must look like a vocative at a sentence/line boundary. This
+  // catches "Codex, what do you reckon?" without treating ordinary prose such
+  // as "give Codex write access" as a call.
+  const direct = text.matchAll(new RegExp(`(?:^|[\\n.!?]\\s+)\\s*[*_~]*(${seatAlt(room)})\\b[*_~]*\\s*(?:[,;:]|[—–-]{1,2})`, "gi"));
+  for (const match of direct) {
+    const target = match[1].toLowerCase();
+    if (target !== entry.author && (opts.allowPlain || room.cfg.agents[target].lurk)) return target;
+  }
+  return null;
+}
+
+async function waitForHopSeat(room, agent, gen) {
+  const deadline = Date.now() + seatTimeout(room, agent) + 5000;
+  while (room.busy.has(agent)) {
+    if (gen !== room.generation || room.chainAbort) return false;
+    if (Date.now() > deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+  return gen === room.generation && !room.chainAbort;
+}
+
+const HOP_FAILED = Symbol("hop-failed");
+
+async function runHopTurn(room, agent, triggerEntry, rootN, discussion, opts = {}) {
+  const startedAt = Date.now();
+  const gen = room.generation;
+  room.busy.set(agent, { startedAt });
+  broadcast(room, { type: "status", agent, phase: opts.phase || "hop", startedAt });
+  const onStream = (text) => broadcast(room, { type: "stream", agent, text });
+  const onActivity = (label) => {
+    if (gen === room.generation) appendEntry(room, { kind: "activity", author: agent, text: label }, { md: false });
+  };
+
+  try {
+    const heardFrom = room.state.agents[agent].cursor;
+    const heardThrough = room.entries.length ? room.entries[room.entries.length - 1].n : heardFrom;
+    const delta = buildDelta(room, agent, triggerEntry.n);
+    const head = delta.length ? `[Room activity since your last turn]\n${delta.join("\n")}\n[End of room activity]\n\n` : "";
+    const prompt = `${notePrefix(room)}${head}${triggerEntry.author} (to you): ${triggerEntry.text}\n\n${opts.instruction || HOP_INSTRUCTION}${discussion ? `\n${DISCUSSION_NOTE}` : ""}`;
+    const readOnly = !!(discussion || opts.readOnly);
+    const turnScope = { discussion, readOnly };
+    const isolated = isolatedClaudeProtectedTurn(room, agent, turnScope);
+    const fresh = !room.state.agents[agent].sessionRef || isolated;
+    const briefing = fresh ? freshTurnBriefing(room, agent, isolated) : null;
+
+    let res;
+    try {
+      res = await adapters[agent](room, { prompt, briefing, onStream, onActivity, ...turnScope });
+    } catch (e) {
+      if (e.resumeFailed && !e.stopped) {
+        room.state.agents[agent].sessionRef = null;
+        saveState(room);
+        const b2 = resetRecoveryBriefing(room, agent);
+        res = await adapters[agent](room, { prompt, briefing: b2, onStream, onActivity, ...turnScope });
+      } else throw e;
+    }
+
+    if (gen !== room.generation) return null;
+    applyAdapterSession(room, agent, res);
+    room.state.agents[agent].cursor = Math.max(heardFrom, triggerEntry.n, heardThrough);
+    const passed = res.text.trim().length <= 12 && LURK_PASS.test(res.text.trim());
+    let entry = null;
+    if (passed) {
+      saveState(room);
+      broadcast(room, { type: "lurk", agent, spoke: false, hop: true });
+    } else {
+      entry = appendEntry(room, {
+        kind: "agent", author: agent, text: res.text,
+        meta: { durationMs: Date.now() - startedAt, hop: true, ...(opts.meta || {}), ...(res.usage ? { tokens: res.usage } : {}) },
+      });
+    }
+    appendReceipt(room, {
+      agent, from: heardFrom, upTo: Math.max(triggerEntry.n, heardThrough),
+      turn: rootN, mode: "hop", spoke: !passed,
+    });
+    return entry;
+  } catch (e) {
+    if (gen !== room.generation) return null;
+    appendEntry(room, {
+      kind: "system", author: "system",
+      text: `⚠ ${agent} failed replying to a mention: ${e.message}`,
+      meta: { agent, error: true },
+    });
+    return opts.signalFailure ? HOP_FAILED : null;
+  } finally {
+    room.busy.delete(agent);
+    broadcast(room, { type: "status", agent, phase: "done" });
+    broadcast(room, { type: "room", room: roomSummary(room) });
+  }
+}
+
+// Only explicit @tags route from message text. Multiple distinct seat tags mean
+// both seats; a single leading tag is stripped from the prompt for convenience.
+// Any text-derived target beats the chip; the chip beats last-addressed.
+function textTarget(room, text) {
+  text = String(text || "");
+  const seats = seatIds(room);
+  const alt = seatAlt(room);
+  const tags = new Set([...text.matchAll(new RegExp(`@(${alt}|both)\\b`, "gi"))].map((m) => m[1].toLowerCase()));
+  if (tags.has("both") || seats.every((s) => tags.has(s))) return { target: "both", text };
+  const lead = new RegExp(`^@(${alt})\\b[\\s:,]*`, "i").exec(text);
+  if (lead) return { target: lead[1].toLowerCase(), text: text.slice(lead[0].length).trim() };
+  for (const s of seats) if (tags.has(s)) return { target: s, text };
+  return null;
+}
+
+function resolveTarget(room, text, targetSel) {
+  const t = textTarget(room, text);
+  if (t) return t;
+  let target = targetSel && targetSel !== "auto" ? targetSel : null;
+  if (!target) target = room.state.lastAddressed || room.cfg.defaultAgent;
+  if (target !== "both" && !room.cfg.agents[target]) target = seatIds(room)[0];
+  return { target, text };
+}
+
+// ---- pair sessions: /pair [rounds] <task> ----
+// One worker does the task; the other reviews. [approve] ends it, feedback
+// triggers a fix round, capped at `rounds`. Renders entirely as chat turns.
+
+const PAIR_APPROVE = /^[\s\W]*approved?[\s\W]*$/i;
+const pairReviewNote = (r, rounds, worker) =>
+  `(Pair session — you are the reviewer, round ${r}${typeof rounds === "number" ? `/${rounds}` : ` (this continues until you approve)`}. Critically review ${worker}'s work above: read the relevant files and run things to verify claims if you can, but do NOT modify files yourself — your output is feedback, not a fix. If the work is correct and complete, reply with exactly: [approve] — otherwise give concrete, actionable feedback for ${worker} to fix.)`;
+const pairFixNote = (reviewer) =>
+  `(Pair session — address ${reviewer}'s review feedback above: make the fixes, then briefly report what changed.)`;
+
+// A pair loop ends when the reviewer approves. This is only a runaway guard
+// for two agents that never converge — not a workflow limit.
+const PAIR_SAFETY_ROUNDS = Math.max(2, Number(process.env.PARLEY_PAIR_SAFETY) || 25);
+
+/**
+ * Pair is a MODE, not a one-shot run: once started it stays on, and every
+ * later message you send is worked then reviewed, until you end it.
+ *   /pair start [rounds] @agent [task]   begin (task optional)
+ *   /pair [rounds] @agent <task>         same thing, shorthand
+ *   /pair end | /pair stop               finish
+ * `rounds` is optional — without it the room's setting applies, which
+ * defaults to "keep going until the reviewer approves".
+ */
+function parsePair(text) {
+  const t = text.trim();
+  if (!/^\/pair\b/i.test(t)) return null;
+  const rest = t.replace(/^\/pair\b\s*/i, "");
+  if (/^(end|stop|off)\b/i.test(rest)) return { action: "end" };
+  const m = /^(?:start\s*)?(?:(\d{1,2})\s+)?([\s\S]*)$/i.exec(rest) || [];
+  const rounds = m[1] === undefined ? null : Math.min(99, Math.max(0, Number(m[1])));
+  return { action: "start", rounds, task: (m[2] || "").trim() };
+}
+
+function pairSnapshot(room, pair = room.state.pair) {
+  if (!pair) return null;
+  const roundsSource = pair.roundsSource === "command" ? "command" : "room";
+  return {
+    worker: pair.worker,
+    reviewer: pair.reviewer,
+    rounds: Math.min(99, Math.max(0, Number(pair.rounds) || 0)),
+    roundsSource,
+  };
+}
+
+// A pair cycle stays working between child processes. Publish both lifecycle
+// edges from one place so clients cannot retain a stale working:true summary.
+function beginPairWork(room, pair, gen, rootN) {
+  const active = { ...pair, gen, rootN };
+  room.pairActive = active;
+  broadcast(room, { type: "room", room: roomSummary(room) });
+  return active;
+}
+
+function finishPairWork(room, active, gen) {
+  // A reset may start a new generation before an old promise unwinds.
+  if (room.pairActive === active) room.pairActive = null;
+  if (gen === room.generation) drainPending(room);
+  broadcast(room, { type: "room", room: roomSummary(room) });
+}
+
+function makePairRetryable(room, rootN, pair) {
+  const root = room.entries.find((e) => e.n === rootN && e.kind === "user");
+  if (!root) return false;
+  // A concurrent explicit aside may have replaced lastUser while this pair
+  // cycle was running. The failure is now the action advertised by Retry, so
+  // reconstruct that original turn from the transcript's authoritative entry.
+  room.state.lastUser = {
+    n: root.n,
+    text: root.text,
+    target: pair.worker,
+    done: { [pair.worker]: false },
+    pair: true,
+  };
+  saveState(room);
+  return true;
+}
+
+function pausePairAfterFailure(room, pair, rootN, agent, step) {
+  makePairRetryable(room, rootN, pair);
+  appendEntry(room, {
+    kind: "system", author: "system",
+    text: `⚠ Pair cycle paused — ${agent} could not complete the ${step}, so nothing was approved. Retry the turn, send another message, or /pair end.`,
+    meta: { agent, error: false, pairPaused: true },
+  });
+}
+
+function abandonPairWait(room, pair, rootN, agent, detail) {
+  makePairRetryable(room, rootN, pair);
+  appendEntry(room, {
+    kind: "system", author: "system",
+    text: `⚠ Pair cycle abandoned — ${agent} ${detail}. Send another message to retry, or /pair end.`,
+    meta: { agent, error: false, pairAbandoned: true },
+  });
+  drainPending(room);
+  return false;
+}
+
+// Wait for a seat to free before the next step of a chain. Giving up is
+// announced: a silently abandoned pair cycle looks exactly like one that is
+// still thinking, and the user would wait forever. Only a generation reset is
+// quiet because the reset event already replaces the conversation.
+async function awaitSeat(room, agent, pair, rootN, gen, step) {
+  const limit = Number(process.env.PARLEY_SEAT_WAIT_MS) ||
+    Math.max(seatTimeout(room, pair.worker), seatTimeout(room, pair.reviewer)) + 60000;
+  const deadline = Date.now() + limit;
+  while (room.busy.has(agent)) {
+    if (gen !== room.generation) return false;
+    if (room.chainAbort) return abandonPairWait(room, pair, rootN, agent, "was still busy when the cycle was stopped");
+    if (Date.now() > deadline) {
+      makePairRetryable(room, rootN, pair);
+      appendEntry(room, {
+        kind: "system", author: "system",
+        text: `⚠ Pair cycle abandoned — ${agent} stayed busy too long, so the ${step} never ran. Send another message to pick it back up, or /pair end.`,
+        meta: { agent, error: false, pairAbandoned: true },
+      });
+      drainPending(room);
+      return false;
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  if (gen !== room.generation) return false;
+  if (room.chainAbort) return abandonPairWait(room, pair, rootN, agent, `was stopped before the ${step} could run`);
+  return true;
+}
+
+// review → fix → review …, starting from a piece of the worker's output.
+// `offset` keeps round numbering honest when the loop is resumed.
+async function pairReviewLoop(room, pair, trigger, rootN, gen, offset = 0) {
+  const { worker, reviewer, rounds } = pair;
+  const limited = rounds > 0;                       // a cap you asked for
+  const cap = limited ? rounds : PAIR_SAFETY_ROUNDS; // otherwise: runaway guard
+  for (let r = 1; r <= cap && trigger; r++) {
+    if (!(await awaitSeat(room, reviewer, pair, rootN, gen, "review"))) return;
+    const review = await runHopTurn(room, reviewer, trigger, rootN, false, {
+      instruction: pairReviewNote(offset + r, limited ? offset + cap : "until approved", worker),
+      meta: { pair: "review", round: offset + r, rootN },
+      phase: "review",
+      signalFailure: true,
+      readOnly: true,
+    });
+    if (gen !== room.generation || room.chainAbort) return;
+    if (review === HOP_FAILED) {
+      pausePairAfterFailure(room, pair, rootN, reviewer, "review");
+      return;
+    }
+    if (!review) { // reviewer passed — treat as silent approval
+      appendEntry(room, { kind: "system", author: "system", text: `✅ ${reviewer} had nothing to flag.` });
+      return;
+    }
+    if (PAIR_APPROVE.test(review.text.trim()) && review.text.trim().length <= 16) {
+      appendEntry(room, { kind: "system", author: "system", text: `✅ ${reviewer} approved.` });
+      return;
+    }
+    if (r === cap) {
+      // Unfinished work shouldn't need a typed nudge — offer the next round.
+      const total = offset + cap;
+      appendEntry(room, {
+        kind: "system", author: "system",
+        text: limited
+          ? `🔁 ${reviewer} still has feedback after ${total} round${total === 1 ? "" : "s"} (your pair-rounds setting).`
+          : `🛑 Safety stop after ${total} rounds — ${worker} and ${reviewer} aren't converging. Nothing was cut short by design; check whether they're stuck before continuing.`,
+        meta: { pairContinue: true, rounds: total, rootN },
+      });
+      return;
+    }
+    if (!(await awaitSeat(room, worker, pair, rootN, gen, "fix"))) return;
+    trigger = await runHopTurn(room, worker, review, rootN, false, {
+      instruction: pairFixNote(reviewer),
+      meta: { pair: "fix", round: offset + r, rootN },
+      phase: "fix",
+      signalFailure: true,
+    });
+    if (gen !== room.generation || room.chainAbort) return;
+    if (trigger === HOP_FAILED) {
+      pausePairAfterFailure(room, pair, rootN, worker, "fix");
+      return;
+    }
+  }
+}
+
+// One work-then-review cycle for a single user message. The mode itself
+// (room.state.pair) outlives this and keeps applying to later messages.
+async function runPairCycle(room, userTurn, pair, gen) {
+  const active = beginPairWork(room, pair, gen, userTurn.n);
+  try {
+    const work = await runAgentTurn(room, active.worker, userTurn); // the work itself
+    if (work && gen === room.generation && !room.chainAbort) {
+      await pairReviewLoop(room, active, work, userTurn.n, gen);
+    } else if (!work && gen === room.generation && !room.chainAbort) {
+      makePairRetryable(room, userTurn.n, active);
+    }
+  } finally {
+    finishPairWork(room, active, gen);
+  }
+}
+
+// "Continue" after a round cap: the worker takes the outstanding review and
+// the loop picks up where it stopped.
+async function continuePair(room) {
+  const pair = pairSnapshot(room);
+  if (!pair) throw Object.assign(new Error("pair mode isn't on"), { status: 400 });
+  if (room.busy.size || room.pairActive) throw Object.assign(new Error("the agents are still working"), { status: 409 });
+  const lastCap = [...room.entries].reverse()
+    .find((e) => e.kind === "system" && e.meta && e.meta.pairContinue);
+  const capRootN = Number(lastCap && lastCap.meta && lastCap.meta.rootN) || 0;
+  const lastReview = [...room.entries].reverse().find((e) =>
+    e.kind === "agent" && e.meta && e.meta.pair === "review" &&
+    (!lastCap || e.n < lastCap.n) && (!capRootN || e.meta.rootN === capRootN));
+  if (!lastReview) throw Object.assign(new Error("there's no review to pick up"), { status: 400 });
+  const offset = (lastReview.meta && lastReview.meta.round) || 0; // the review itself knows
+  // rootN was added to pair-generated entries so a failed continuation can
+  // restore the original user turn. Fall back to the nearest earlier pair user
+  // for rooms whose transcript predates that metadata.
+  const rootN = Number(lastReview.meta && lastReview.meta.rootN) ||
+    (([...room.entries].reverse().find((e) =>
+      e.n < lastReview.n && e.kind === "user" && e.meta && e.meta.pair) || {}).n) ||
+    lastReview.n;
+
+  const gen = room.generation;
+  room.chainAbort = false;
+  const active = beginPairWork(room, pair, gen, rootN);
+  (async () => {
+    try {
+      const fix = await runHopTurn(room, active.worker, lastReview, rootN, false, {
+        instruction: pairFixNote(active.reviewer),
+        meta: { pair: "fix", round: offset + 1, rootN },
+        phase: "fix",
+        signalFailure: true,
+      });
+      if (fix === HOP_FAILED) {
+        pausePairAfterFailure(room, active, rootN, active.worker, "fix");
+      } else if (fix && gen === room.generation && !room.chainAbort) {
+        await pairReviewLoop(room, active, fix, rootN, gen, offset);
+      }
+    } finally {
+      finishPairWork(room, active, gen);
+    }
+  })();
+}
+
+// Work out how a message will run before running it, so the queue and the
+// handler always agree about which seats it actually needs. A pair cycle
+// needs both; an explicitly tagged aside needs only the seat it names.
+function planMessage(room, raw, targetSel) {
+  const pairCmd = parsePair(raw);
+  if (pairCmd && pairCmd.action === "end") {
+    return {
+      pairCmd, starting: false, target: null, text: "", explicit: false,
+      pair: room.state.pair, asPairTurn: false, seats: [],
+    };
+  }
+  const starting = !!pairCmd && pairCmd.action === "start";
+  const body = pairCmd ? pairCmd.task : raw;
+  const { target, text } = resolveTarget(room, body, targetSel);
+  const explicit = !!textTarget(room, body);
+  const pair = starting
+    ? { worker: target, reviewer: otherSeat(room, target) }
+    : room.state.pair;
+  const asPairTurn = !!pair && target !== "both" &&
+    (starting || !explicit || target === pair.worker);
+  const seats = asPairTurn || target === "both" ? seatIds(room) : [target];
+  return { pairCmd, starting, target, text, explicit, pair, asPairTurn, seats };
+}
+
+// Synchronous validation + kickoff; agent turns continue in the background
+// and surface over SSE. Throws (with .status) on invalid input so the HTTP
+// route can report it.
+function handleUserMessage(room, rawText, targetSel) {
+  const raw0 = String(rawText || "").trim();
+  // One pass decides everything: who it's for, whether it's a pair turn, and
+  // which seats it needs. The queue asks the same function, so the two can't
+  // drift apart (that disagreement is exactly what made asides queue wrongly).
+  const plan = planMessage(room, raw0, targetSel);
+  const { pairCmd, starting: startingPair, target, text } = plan;
+
+  if (pairCmd && pairCmd.action === "end") {
+    if (!room.state.pair) throw Object.assign(new Error("pair mode isn't on"), { status: 400 });
+    const was = room.state.pair;
+    room.state.pair = null;
+    saveState(room);
+    appendEntry(room, {
+      kind: "system", author: "system",
+      text: `🔁 Pair mode off — ${was.worker} and ${was.reviewer} are back to normal.` +
+        (room.pairActive ? " The current cycle will finish; Stop aborts it." : ""),
+    });
+    broadcast(room, { type: "room", room: roomSummary(room) });
+    drainPending(room);
+    return;
+  }
+
+  if (startingPair && target === "both") throw Object.assign(new Error("/pair needs a single worker — tag one agent"), { status: 400 });
+  if (!text && !startingPair) throw Object.assign(new Error("empty message"), { status: 400 });
+  if (target !== "both" && !room.cfg.agents[target]) throw Object.assign(new Error(`unknown target: ${target}`), { status: 400 });
+
+  // Turning pair mode on: it stays on for every later message until /pair end.
+  if (startingPair) {
+    const rounds = pairCmd.rounds === null ? Math.max(0, room.cfg.pairRounds | 0) : pairCmd.rounds;
+    const roundsSource = pairCmd.rounds === null ? "room" : "command";
+    const was = room.state.pair;
+    const switched = was && was.worker !== target;
+    room.state.pair = { worker: target, reviewer: otherSeat(room, target), rounds, roundsSource };
+    saveState(room);
+    appendEntry(room, {
+      kind: "system", author: "system",
+      text: switched
+        ? `🔁 Pair mode switched: ${target} now works, ${otherSeat(room, target)} reviews ` +
+          (rounds > 0 ? `(up to ${rounds} round${rounds === 1 ? "" : "s"} per message)` : "(until approved)") +
+          `. Every message you send now runs this way; /pair end to stop.`
+        : `🔁 Pair mode on — ${target} works, ${otherSeat(room, target)} reviews ` +
+        (rounds > 0 ? `(up to ${rounds} round${rounds === 1 ? "" : "s"} per message)` : "(until approved)") +
+        `. Every message you send now runs this way; /pair end to stop.`,
+    });
+    if (!text) { // no task given — just arm the mode and wait
+      broadcast(room, { type: "room", room: roomSummary(room) });
+      return;
+    }
+  }
+
+  // In pair mode an untagged message goes to the worker and gets reviewed;
+  // explicitly tagging someone is the escape hatch for a normal aside.
+  const pair = pairSnapshot(room);
+  const asPairTurn = plan.asPairTurn && !!pair;
+  const effectiveTarget = asPairTurn ? pair.worker : target;
+
+  const allSeats = seatIds(room);
+  const agents = effectiveTarget === "both" ? [...allSeats] : [effectiveTarget];
+  const lockAgents = asPairTurn ? [...allSeats] : agents;
+  // A running pair cycle reserves both seats only for another pair turn;
+  // an aside just needs the agent it names.
+  const pairBusy = asPairTurn && room.pairActive ? [...allSeats] : [];
+  if (lockAgents.some((a) => room.busy.has(a) || pairBusy.includes(a))) {
+    throw Object.assign(new Error(`${effectiveTarget} is still busy — try again in a moment`), { status: 409 });
+  }
+  const listeners = asPairTurn ? [] // the reviewer is already in the loop
+    : allSeats.filter((a) => !agents.includes(a) && room.cfg.agents[a].lurk);
+  const discussion = effectiveTarget === "both" && room.cfg.mode === "work";
+  const userTurn = appendEntry(room, {
+    kind: "user", author: "user", target: effectiveTarget, text,
+    meta: {
+      audience: { addressed: agents, lurking: listeners },
+      ...(discussion ? { discussion: true } : {}),
+      ...(asPairTurn ? { pair: { rounds: pair.rounds, worker: pair.worker, reviewer: pair.reviewer } } : {}),
+    },
+  });
+  room.state.lastAddressed = effectiveTarget;
+  room.state.lastUser = {
+    n: userTurn.n, text, target: effectiveTarget, done: {},
+    pair: asPairTurn,
+  };
+  saveState(room);
+
+  if (asPairTurn) {
+    const gen = room.generation;
+    room.chainAbort = false;
+    runPairCycle(room, userTurn, pair, gen);
+    return;
+  }
+
+  const gen = room.generation;
+  room.chainAbort = false;
+  (async () => {
+    const results = await Promise.allSettled(agents.map((a) => runAgentTurn(room, a, userTurn, discussion)));
+    if (gen !== room.generation) return;
+    const invoked = new Set(agents);
+
+    // Bounded exchange loop. maxHops budgets agent-triggered follow-ups —
+    // an open-ended chain that needs a counter. A lurker's spoken chime always
+    // earns the other agent one reply back (right of reply); that step is
+    // structurally bounded (lurkers evaluate exactly once per user message —
+    // no re-lurking, or two polite agents would ping-pong forever), so it
+    // doesn't consume the budget. Lurk's cost is lurk's own toggle.
+    const configuredHops = Math.min(8, Math.max(0, room.cfg.maxHops | 0));
+    const maxHops = configuredHops || HOP_SAFETY_HOPS;
+    const allowPlain = userTurn.target === "both";
+    let hops = 0, capped = false;
+    const queue = [];
+    for (const r of results) if (r.status === "fulfilled" && r.value) queue.push(r.value);
+    queue.sort((a, b) => a.n - b.n); // follow the order the replies appeared in chat
+
+    const drainMentions = async () => {
+      while (queue.length && !room.chainAbort) {
+        const trigger = queue.shift();
+        const target = findHopTarget(room, trigger, { allowPlain });
+        if (!target) continue;
+        if (hops >= maxHops) { capped = true; return; }
+        if (room.busy.has(target) && !(await waitForHopSeat(room, target, gen))) {
+          broadcast(room, { type: "lurk", agent: target, spoke: false, skipped: true });
+          continue;
+        }
+        hops++;
+        const reply = await runHopTurn(room, target, trigger, userTurn.n, discussion);
+        if (gen !== room.generation) return;
+        invoked.add(target);
+        if (reply) queue.push(reply);
+      }
+    };
+    await drainMentions();
+    if (gen !== room.generation || room.chainAbort) return;
+
+    const lurkers = listeners.filter((a) => !invoked.has(a)).filter((a) => {
+      if (room.busy.has(a)) { // busy in another lane — the delta catches it up later
+        broadcast(room, { type: "lurk", agent: a, spoke: false, skipped: true });
+        return false;
+      }
+      return true;
+    });
+    const chimeResults = lurkers.length
+      ? await Promise.allSettled(lurkers.map((a) => runListenerTurn(room, a, userTurn.n, discussion)))
+      : [];
+    if (gen !== room.generation || room.chainAbort) return;
+
+    const chimes = chimeResults.filter((r) => r.status === "fulfilled" && r.value).map((r) => r.value);
+    if (chimes.length) {
+      for (const chime of chimes) {
+        if (room.chainAbort) break;
+        const target = findHopTarget(room, chime, { allowPlain }) || otherSeat(room, chime.author);
+        if (room.busy.has(target) && !(await waitForHopSeat(room, target, gen))) {
+          broadcast(room, { type: "lurk", agent: target, spoke: false, skipped: true });
+          continue;
+        }
+        const reply = await runHopTurn(room, target, chime, userTurn.n, discussion); // free: right of reply
+        if (gen !== room.generation) return;
+        invoked.add(target);
+        if (reply) queue.push(reply); // but any tag in it is budgeted as usual
+      }
+      await drainMentions();
+      if (gen !== room.generation) return;
+    }
+
+    if (capped) {
+      appendEntry(room, {
+        kind: "system", author: "system",
+        text: configuredHops > 0
+          ? `⛓ Agent-hop budget reached (${configuredHops}) — raise "Agent-to-agent hops" in Settings for longer exchanges.`
+          : `🛑 Agent-hop safety stop after ${HOP_SAFETY_HOPS} exchanges — the agents may be stuck in a loop.`,
+      });
+    }
+
+    drainPending(room); // messages the user queued while the table was busy
+  })();
+  // after kickoff, so the summary includes the now-busy agents
+  broadcast(room, { type: "room", room: roomSummary(room) });
+}
+
+// Dispatch every queued message whose target agents are all free, preserving
+// order within each agent's lane (a blocked message also blocks later
+// messages for the same agents, so per-agent ordering holds).
+function drainPending(room) {
+  if (!room.pendingMsgs.length) return;
+  const claimed = new Set([...room.busy.keys()]);
+  const stillPending = [];
+  for (const m of room.pendingMsgs) {
+    // a queued pair turn also waits for the cycle in flight; an aside doesn't
+    if (m.agents.some((a) => claimed.has(a)) || (m.pairTurn && room.pairActive)) {
+      m.agents.forEach((a) => claimed.add(a));
+      stillPending.push(m);
+      continue;
+    }
+    m.agents.forEach((a) => claimed.add(a));
+    try { handleUserMessage(room, m.text, m.target); }
+    catch (e) {
+      appendEntry(room, { kind: "system", author: "system", text: `⚠ queued message failed: ${e.message}` });
+    }
+  }
+  room.pendingMsgs = stillPending;
+  broadcast(room, { type: "queue", size: room.pendingMsgs.length });
+}
+
+function retryTargets(room) {
+  const lu = room.state.lastUser;
+  if (!lu) return [];
+  if (lu.pair && room.state.pair) {
+    const pair = pairSnapshot(room);
+    // Eligibility belongs to the stored turn, not whichever worker the mode
+    // names now. A taskless role switch must not make approved work retryable;
+    // a genuinely failed old turn may still execute under the new roles.
+    return pair && !(lu.done && lu.done[lu.target]) ? [pair.worker] : [];
+  }
+  const agents = lu.target === "both" ? seatIds(room) : [lu.target];
+  return agents.filter((a) => !(lu.done && lu.done[a]));
+}
+
+function handleRetry(room) {
+  const lu = room.state.lastUser;
+  if (!lu) throw Object.assign(new Error("nothing to retry"), { status: 400 });
+  const userTurn = { n: lu.n, text: lu.text };
+  // A pair retry uses the mode active now, never a persisted old snapshot. This
+  // is important after `/pair start @other` switches the worker/reviewer.
+  if (lu.pair && room.state.pair) {
+    const pair = pairSnapshot(room);
+    if (lu.done && lu.done[lu.target]) throw Object.assign(new Error("nothing to retry"), { status: 400 });
+    if (room.pairActive || seatIds(room).some((a) => room.busy.has(a))) {
+      throw Object.assign(new Error("the pair seats are still busy"), { status: 409 });
+    }
+    lu.target = pair.worker;
+    lu.done = {};
+    lu.pair = true;
+    saveState(room);
+    const gen = room.generation;
+    room.chainAbort = false;
+    runPairCycle(room, userTurn, pair, gen);
+    return;
+  }
+  const targets = retryTargets(room);
+  if (!targets.length) throw Object.assign(new Error("nothing to retry"), { status: 400 });
+  if (targets.some((a) => room.busy.has(a))) throw Object.assign(new Error("that agent is still busy"), { status: 409 });
+  const discussion = lu.target === "both" && room.cfg.mode === "work";
+  Promise.allSettled(targets.map((a) => runAgentTurn(room, a, userTurn, discussion))).then(() => drainPending(room));
+}
+
+function handleStop(room, agent = null) {
+  if (agent !== null && !seatIds(room).includes(agent)) {
+    throw Object.assign(new Error(`unknown agent: ${agent}`), { status: 400 });
+  }
+  // A seat-scoped stop interrupts only that response. The other lane and the
+  // queue keep running. Stop-all retains the original silence semantics.
+  if (agent !== null) {
+    const child = room.procs.get(agent);
+    if (!child) return 0;
+    child.rtStopped = true;
+    killTree(child);
+    return 1;
+  }
+  room.chainAbort = true; // also stop any pending hop/lurk follow-ups
+  room.pendingMsgs = []; // Stop all means silence — drop queued messages too
+  broadcast(room, { type: "queue", size: 0 });
+  let n = 0;
+  for (const [, child] of room.procs) { child.rtStopped = true; killTree(child); n++; }
+  return n;
+}
+
+// ---- native folder picker ----
+// A web page can't read a real filesystem path, but the server is on the same
+// machine — so it borrows the OS's own folder dialog rather than making one.
+function pickFolder(start) {
+  return new Promise((resolve) => {
+    let cmd, args;
+    if (IS_WIN) {
+      const s = String(start || "").replace(/'/g, "''");
+      const script = `
+Add-Type -AssemblyName System.Windows.Forms | Out-Null
+$dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+$dlg.Description = 'Choose a project folder for this Parley room'
+$dlg.ShowNewFolderButton = $true
+${s ? `if (Test-Path -LiteralPath '${s}') { $dlg.SelectedPath = '${s}' }` : ""}
+$owner = New-Object System.Windows.Forms.Form
+$owner.TopMost = $true; $owner.ShowInTaskbar = $false; $owner.Opacity = 0
+$owner.Show() | Out-Null
+$res = $dlg.ShowDialog($owner)
+$owner.Close()
+if ($res -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dlg.SelectedPath }`;
+      cmd = "powershell.exe";
+      args = ["-NoProfile", "-STA", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")];
+    } else if (process.platform === "darwin") {
+      cmd = "osascript";
+      args = ["-e", 'POSIX path of (choose folder with prompt "Choose a project folder for this Parley room")'];
+    } else {
+      cmd = "zenity";
+      args = ["--file-selection", "--directory", "--title=Choose a project folder for this Parley room"];
+    }
+    const child = spawn(cmd, args, {
+      stdio: ["ignore", "pipe", "pipe"], windowsHide: true, detached: !IS_WIN,
+    });
+    child.rtProcessGroup = !IS_WIN;
+    let out = "";
+    const timer = setTimeout(() => killTree(child), 300000);
+    child.stdout.on("data", (d) => { out += d.toString("utf8"); });
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      resolve({ error: `couldn't open a folder picker on this system (${e.message}) — type the path instead` });
+    });
+    child.on("close", () => {
+      clearTimeout(timer);
+      const picked = out.trim().split(/\r?\n/).filter(Boolean).pop();
+      resolve(picked ? { path: path.resolve(picked) } : { cancelled: true });
+    });
+  });
+}
+
+// ---- room lifecycle: delete (to .trash) and rename ----
+
+function closeRoom(room) {
+  for (const res of room.clients) { try { res.end(); } catch { /* already gone */ } }
+  room.clients.clear();
+  rooms.delete(room.name); // evict the cache, or a later state flush rebuilds the folder
+}
+
+function deleteRoom(room) {
+  // `default` is the room the app falls back to and re-creates on boot, so
+  // deleting it only produces an empty ghost. Refuse rather than half-work.
+  if (room.name === "default") {
+    throw Object.assign(new Error("the default room can't be deleted — archive its conversation with New conversation instead"), { status: 400 });
+  }
+  if (room.busy.size || room.pairActive) {
+    throw Object.assign(new Error("that room's agents are still working — stop them first"), { status: 409 });
+  }
+  // Recoverable by design: a trashed room is just a folder you can drag back.
+  // `.trash` starts with a dot, so validRoomName already hides it from the list.
+  const trash = path.join(ROOT, ".trash");
+  fs.mkdirSync(trash, { recursive: true });
+  const stamp = tsLocal().replace(/:/g, "-");
+  let dest = path.join(trash, `${room.name}-${stamp}`);
+  for (let n = 2; fs.existsSync(dest); n++) dest = path.join(trash, `${room.name}-${stamp}-${n}`);
+  handleStop(room);
+  closeRoom(room);
+  fs.renameSync(room.dir, dest); // same volume: atomic, and keeps the workspace intact
+  return dest;
+}
+
+function renameRoom(room, newName) {
+  newName = cleanRoomName(newName);
+  if (!validRoomName(newName)) throw Object.assign(new Error("Room names: letters, numbers, dashes, underscores (max 40)."), { status: 400 });
+  if (newName === room.name) return room;
+  if (fs.existsSync(path.join(ROOT, newName))) throw Object.assign(new Error(`a room called "${newName}" already exists`), { status: 409 });
+  if (room.busy.size || room.pairActive) {
+    throw Object.assign(new Error("that room's agents are still working — stop them first"), { status: 409 });
+  }
+
+  const oldName = room.name;
+  const newDir = path.join(ROOT, newName);
+  fs.renameSync(room.dir, newDir);
+
+  // Re-point the live room at its new home; the SSE clients are held on the
+  // room object itself, so open pages keep streaming without reconnecting.
+  rooms.delete(oldName);
+  room.name = newName;
+  room.dir = newDir;
+  room.workspace = path.join(newDir, "workspace");
+  room.cfgFile = path.join(newDir, "room.json");
+  room.stateFile = path.join(newDir, "state.json");
+  room.eventsFile = path.join(newDir, "events.jsonl");
+  room.transcriptFile = path.join(newDir, "transcript.md");
+  rooms.set(newName, room);
+
+  // Seats whose CLI anchors sessions to the working directory lose their
+  // thread when the sandbox moves; clear it so the next turn re-briefs
+  // cleanly (with history replayed) instead of failing a resume first.
+  if (!room.cfg.projectDir) {
+    for (const id of seatIds(room)) room.state.agents[id].sessionRef = null;
+    saveState(room);
+  }
+  broadcast(room, { type: "renamed", from: oldName, to: newName });
+  broadcast(room, { type: "room", room: roomSummary(room) });
+  return room;
+}
+
+function handleNewConversation(room) {
+  if (room.busy.size) handleStop(room);
+  const stamp = tsLocal().replace(/[:]/g, "-");
+  for (const [file, base] of [[room.eventsFile, "events"], [room.transcriptFile, "transcript"]]) {
+    if (fs.existsSync(file)) {
+      try { fs.renameSync(file, path.join(room.dir, `${base}-${stamp}${path.extname(file)}`)); } catch { /* keep going */ }
+    }
+  }
+  room.generation++;
+  room.state = defaultState(seatIds(room));
+  if (room.state.agents.claude) {
+    room.state.agents.claude.permissionScope = effectiveClaudePermissionMode(
+      room.cfg.agents.claude, room.cfg.mode);
+  }
+  room.entries = [];
+  room.receipts = [];
+  room.pendingMsgs = [];
+  saveState(room);
+  broadcast(room, { type: "reset" });
+  broadcast(room, { type: "room", room: roomSummary(room) });
+}
+
+// ---------------------------------------------------------------- HTTP server
+
+// EventSource can't send headers, so the stream accepts the token as a query
+// param; everything else uses X-Parley-Token. A cross-site page could still
+// *send* a request, so a foreign Origin is refused outright.
+function requestHostAllowed(req) {
+  const actualPort = server.address() && server.address().port;
+  const host = String(req.headers.host || "").toLowerCase();
+  return host === `127.0.0.1:${actualPort}` || host === `localhost:${actualPort}`;
+}
+
+function authorized(req, url, route) {
+  // EventSource cannot attach a custom header. Keep query-token acceptance
+  // scoped to that single streaming endpoint; its protocol travels the same
+  // way so an older open tab cannot attach to a newer event schema.
+  const queryToken = route === "GET /api/events"
+    ? url.searchParams.get("token")
+    : null;
+  const protocol = route === "GET /api/events"
+    ? url.searchParams.get("protocol")
+    : req.headers["x-parley-runtime-protocol"];
+  if (protocol !== RUNTIME_PROTOCOL) return false;
+  const given = req.headers["x-parley-token"] || queryToken || "";
+  if (given !== SESSION_TOKEN) return false;
+  const origin = req.headers.origin;
+  if (origin) {
+    const actualPort = server.address() && server.address().port;
+    const allowedOrigins = new Set([
+      `http://127.0.0.1:${actualPort}`,
+      `http://localhost:${actualPort}`,
+    ]);
+    if (!allowedOrigins.has(String(origin).toLowerCase())) return false;
+  }
+  return true;
+}
+
+function json(res, code, obj) {
+  const body = JSON.stringify(obj);
+  res.writeHead(code, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Content-Length": Buffer.byteLength(body),
+    "X-Parley-Runtime-Protocol": RUNTIME_PROTOCOL,
+  });
+  res.end(body);
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", (c) => {
+      data += c;
+      if (data.length > 1_000_000) { reject(new Error("body too large")); req.destroy(); }
+    });
+    req.on("end", () => {
+      try { resolve(data ? JSON.parse(data) : {}); } catch { reject(new Error("invalid JSON body")); }
+    });
+    req.on("error", reject);
+  });
+}
+
+function listRooms() {
+  fs.mkdirSync(ROOT, { recursive: true });
+  const names = fs.readdirSync(ROOT, { withFileTypes: true })
+    .filter((d) => d.isDirectory() && validRoomName(d.name))
+    .map((d) => d.name);
+  if (!names.includes("default")) names.unshift("default");
+  return names.sort((a, b) => (a === "default" ? -1 : b === "default" ? 1 : a.localeCompare(b)));
+}
+
+function roomsWithModes() {
+  return listRooms().map((n) => {
+    try {
+      const r = loadRoom(n);
+      return { name: n, mode: r.cfg.mode || "talk", linked: !!r.cfg.projectDir, seats: seatIds(r) };
+    } catch { return { name: n, mode: "talk", linked: false, seats: [...DEFAULT_SEATS] }; }
+  });
+}
+
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, "http://127.0.0.1");
+  const route = `${req.method} ${url.pathname}`;
+  try {
+    // The listener is loopback-only; validating Host as well closes the DNS-
+    // rebinding route that can otherwise make a foreign name reach it.
+    if (!requestHostAllowed(req)) {
+      return json(res, 403, { error: "forbidden — use this Parley server's loopback URL" });
+    }
+    if (route === "GET /" || route === "GET /index.html") {
+      const html = UI_HTML
+        .replace("<!--PARLEY_TOKEN-->", `<meta name="parley-token" content="${SESSION_TOKEN}">`)
+        .replace("<!--PARLEY_RUNTIME_PROTOCOL-->",
+          `<meta name="parley-runtime-protocol" content="${RUNTIME_PROTOCOL}">`);
+      // Browser caching is still disabled, while UI_HTML remains pinned to the
+      // backend build loaded by this process. Upgrades therefore need a restart
+      // instead of silently mixing a new UI with an old runtime.
+      res.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store, must-revalidate",
+        "Content-Security-Policy": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+        "X-Frame-Options": "DENY",
+        "Referrer-Policy": "no-referrer",
+        "X-Content-Type-Options": "nosniff",
+      });
+      return res.end(html);
+    }
+
+    // Everything past this point is the API, and needs the page's token.
+    if (!authorized(req, url, route)) {
+      return json(res, 403, { error: "forbidden — the Parley API needs the session token from its own page" });
+    }
+
+    if (route === "GET /api/rooms") return json(res, 200, { rooms: roomsWithModes(), providers: providerCatalog() });
+
+    if (route === "POST /api/rooms") {
+      const { name, seats, projectDir } = await readBody(req);
+      const roomName = cleanRoomName(name);
+      if (!validRoomName(roomName)) return json(res, 400, { error: "Room names: letters, numbers, dashes, underscores (max 40)." });
+      let linked = null;
+      if (projectDir) {
+        linked = path.resolve(String(projectDir).trim());
+        let isDir = false;
+        try { isDir = fs.statSync(linked).isDirectory(); } catch { /* missing */ }
+        if (!isDir) return json(res, 400, { error: `Project folder not found (or not a directory): ${linked}` });
+      }
+      let picked;
+      if (Array.isArray(seats)) {
+        picked = seats.map((s) => String(s).toLowerCase()).filter((s) => PROVIDERS[s]);
+        if (picked.length !== 2 || picked[0] === picked[1]) {
+          return json(res, 400, { error: "Pick two different seats from the available providers." });
+        }
+      }
+      const created = loadRoom(roomName, picked, true);
+      if (linked) { created.cfg.projectDir = linked; saveConfig(created); }
+      return json(res, 200, { ok: true, rooms: roomsWithModes() });
+    }
+
+    if (route === "POST /api/pair/continue") {
+      const room = loadRoom((await readBody(req)).room || "default");
+      await continuePair(room);
+      return json(res, 200, { ok: true });
+    }
+
+    if (route === "POST /api/pickfolder") {
+      const { start } = await readBody(req);
+      return json(res, 200, await pickFolder(start));
+    }
+
+    if (route === "POST /api/room/delete") {
+      const { room: name } = await readBody(req);
+      const room = loadRoom(name || "default");
+      const trashed = deleteRoom(room);
+      return json(res, 200, { ok: true, trash: trashed, rooms: roomsWithModes() });
+    }
+
+    if (route === "POST /api/room/rename") {
+      const { room: name, to } = await readBody(req);
+      const room = loadRoom(name || "default");
+      renameRoom(room, to);
+      return json(res, 200, { ok: true, name: room.name, rooms: roomsWithModes() });
+    }
+
+    if (route === "GET /api/room") {
+      const wanted = url.searchParams.get("name") || "default";
+      const room = loadRoom(wanted, undefined, wanted === "default");
+      return json(res, 200, { room: roomSummary(room), entries: room.entries, receipts: room.receipts });
+    }
+
+    if (route === "GET /api/events") {
+      const room = loadRoom(url.searchParams.get("room") || "default");
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+      });
+      res.write(":connected\n\n");
+      room.clients.add(res);
+      const ping = setInterval(() => { try { res.write(":ping\n\n"); } catch { /* closed */ } }, 20000);
+      req.on("close", () => { clearInterval(ping); room.clients.delete(res); });
+      return;
+    }
+
+    if (route === "POST /api/message") {
+      const { room: name, text, target } = await readBody(req);
+      const room = loadRoom(name || "default");
+      const raw = String(text || "").trim();
+      if (!raw) return json(res, 400, { error: "empty message" });
+      // Per-agent lanes: queue only when a target agent is running or already
+      // has queued messages ahead (keeps per-lane order). Pair sessions need
+      // (and hold) both lanes.
+      const plan = planMessage(room, raw, target);
+      if (plan.pairCmd && plan.pairCmd.action === "end") { // ending never queues behind the work it disables
+        handleUserMessage(room, raw, target);
+        return json(res, 200, { ok: true });
+      }
+      // Only the seats this message actually needs — an aside to the free
+      // agent shouldn't wait behind a pair cycle running on the other one.
+      const { target: resolved, seats: wants } = plan;
+      const laneBusy = wants.some((a) => room.busy.has(a)) ||
+        (plan.asPairTurn && !!room.pairActive) ||
+        room.pendingMsgs.some((m) => m.agents.some((a) => wants.includes(a)));
+      if (laneBusy) {
+        room.pendingMsgs.push({ text: raw, target: resolved, agents: wants, pairTurn: plan.asPairTurn });
+        broadcast(room, { type: "queue", size: room.pendingMsgs.length });
+        return json(res, 200, { queued: true, position: room.pendingMsgs.length });
+      }
+      handleUserMessage(room, raw, resolved); // replies arrive over SSE
+      return json(res, 200, { ok: true });
+    }
+
+    if (route === "POST /api/retry") {
+      const room = loadRoom((await readBody(req)).room || "default");
+      handleRetry(room); // replies arrive over SSE
+      return json(res, 200, { ok: true });
+    }
+
+    if (route === "POST /api/stop") {
+      const body = await readBody(req);
+      const room = loadRoom(body.room || "default");
+      const agent = body.agent === undefined || body.agent === null ? null : String(body.agent).toLowerCase();
+      return json(res, 200, { stopped: handleStop(room, agent), agent });
+    }
+
+    if (route === "POST /api/new") {
+      const room = loadRoom((await readBody(req)).room || "default");
+      handleNewConversation(room);
+      return json(res, 200, { ok: true });
+    }
+
+    if (route === "POST /api/config") {
+      const { room: name, config } = await readBody(req);
+      const room = loadRoom(name || "default");
+      const prevMode = room.cfg.mode || "talk";
+      const prevProjectDir = room.cfg.projectDir || null;
+      const prevClaudePermission = room.cfg.agents.claude
+        ? effectiveClaudePermissionMode(room.cfg.agents.claude, prevMode)
+        : null;
+      // Sandboxed seats (codex-style) fix their sandbox at session creation —
+      // track it per seat so a change can trigger a clean relink.
+      const sandboxSeats = seatIds(room).filter((id) => "sandbox" in providerOf(id).defaults);
+      const prevSandboxes = Object.fromEntries(sandboxSeats.map((id) => [id, room.cfg.agents[id].sandbox || "read-only"]));
+      // Validate into a candidate first — a rejected patch must leave the
+      // live room untouched.
+      const next = pruneSeats(deepMerge(defaultConfig(seatIds(room)), deepMerge(room.cfg, config || {})));
+      next.timeoutMs = Math.max(10000, Number(next.timeoutMs) || 300000);
+      next.mode = next.mode === "work" ? "work" : "talk";
+      next.maxHops = Math.min(8, Math.max(0, Number(next.maxHops) || 0));
+      next.pairRounds = Math.min(99, Math.max(0, Number(next.pairRounds) || 0));
+      for (const [id, agentCfg] of Object.entries(next.agents)) {
+        const issue = extraArgsViolation(id, agentCfg.extraArgs || []);
+        if (issue) return json(res, 400, { error: `Unsafe Extra CLI args for ${id}: ${issue}` });
+        if (id === "claude") {
+          const permissionMode = agentCfg.permissionMode ?? "auto";
+          if (!CLAUDE_PERMISSION_MODES.has(permissionMode)) {
+            return json(res, 400, {
+              error: `Unknown Claude permission mode: ${permissionMode}. Choose room default, plan, acceptEdits, or full access.`,
+            });
+          }
+          agentCfg.permissionMode = permissionMode;
+        }
+      }
+      const nextClaudePermission = next.agents.claude
+        ? effectiveClaudePermissionMode(next.agents.claude, next.mode)
+        : null;
+      const claudePermissionChanged = prevClaudePermission !== nextClaudePermission;
+      if (next.projectDir) {
+        const pd = path.resolve(String(next.projectDir).trim());
+        let isDir = false;
+        try { isDir = fs.statSync(pd).isDirectory(); } catch { /* missing */ }
+        if (!isDir) return json(res, 400, { error: `Project folder not found (or not a directory): ${pd}` });
+        next.projectDir = pd;
+      } else {
+        next.projectDir = null;
+      }
+
+      // Settings fixed at native-session creation must not change underneath a
+      // running turn, which could otherwise finish later and reattach the old
+      // session. The same rule covers gaps inside an active pair cycle.
+      const modeResetSeats = new Set();
+      if (prevMode !== next.mode) {
+        for (const id of sandboxSeats) modeResetSeats.add(id);
+        if (claudePermissionChanged) modeResetSeats.add("claude");
+      }
+      const sandboxChangedSeats = new Set(sandboxSeats.filter((id) =>
+        prevSandboxes[id] !== (next.agents[id].sandbox || "read-only")));
+      const resetRequiredSeats = new Set();
+      if (prevProjectDir !== next.projectDir) {
+        for (const id of seatIds(room)) resetRequiredSeats.add(id);
+      }
+      for (const id of modeResetSeats) resetRequiredSeats.add(id);
+      for (const id of sandboxChangedSeats) resetRequiredSeats.add(id);
+      if (claudePermissionChanged) resetRequiredSeats.add("claude");
+
+      const runningResets = [...resetRequiredSeats].filter((id) => room.busy.has(id));
+      if (runningResets.length || (room.pairActive && resetRequiredSeats.size)) {
+        const who = runningResets.length ? runningResets.join(" and ") : "The pair cycle";
+        const verb = runningResets.length > 1 ? "are" : "is";
+        return json(res, 409, {
+          error: `${who} ${verb} still working. Wait for the work to finish or stop it before changing settings that restart an agent session.`,
+        });
+      }
+
+      const hadSession = Object.fromEntries(seatIds(room).map((id) =>
+        [id, !!room.state.agents[id].sessionRef]));
+      room.cfg = next;
+      cmdCache.clear();
+      saveConfig(room);
+      for (const id of resetRequiredSeats) room.state.agents[id].sessionRef = null;
+      if (room.state.agents.claude) {
+        room.state.agents.claude.permissionScope = nextClaudePermission;
+      }
+      if (resetRequiredSeats.size || room.state.agents.claude) saveState(room);
+      // A room-sourced mode follows Settings for its next cycle. An in-flight
+      // cycle keeps the snapshot exposed as `workingPair`; explicit
+      // `/pair start 2 ...` overrides remain pinned to their command value.
+      if (room.state.pair && room.state.pair.roundsSource !== "command") {
+        room.state.pair.roundsSource = "room";
+        room.state.pair.rounds = room.cfg.pairRounds;
+        saveState(room);
+      }
+      if (prevProjectDir !== room.cfg.projectDir) {
+        // CLIs anchor sessions to their working directory — relink cleanly.
+        appendEntry(room, {
+          kind: "system", author: "system",
+          text: room.cfg.projectDir
+            ? `📁 Project linked: ${room.cfg.projectDir} — both agents start fresh sessions there (the transcript keeps the room history).`
+            : "📁 Project unlinked — back to the room's sandbox workspace; both agents start fresh sessions.",
+        });
+      }
+      if (prevMode !== room.cfg.mode) {
+        // A sandboxed seat's sandbox is fixed at session creation — mode flips
+        // relink those seats so the new permissions actually apply.
+        const fresh = modeResetSeats.size ? ` (${[...modeResetSeats].join(", ")}: fresh session so the permission change applies)` : "";
+        appendEntry(room, {
+          kind: "system", author: "system",
+          text: room.cfg.mode === "work"
+            ? `🔨 Switched to work mode — agents may now write files in the workspace and run commands${fresh}.`
+            : `💬 Switched to talk mode — conservative room defaults apply; explicit seat permission overrides, if configured, remain active${fresh}.`,
+        });
+      } else {
+        for (const id of sandboxChangedSeats) {
+          const now = room.cfg.agents[id].sandbox || "read-only";
+          if (hadSession[id]) {
+            appendEntry(room, {
+              kind: "system", author: "system",
+              text: `${id} sandbox changed to ${now} — ${id} starts a fresh session (the sandbox is fixed at session creation; the transcript keeps the room history).`,
+            });
+          }
+        }
+      }
+      if (claudePermissionChanged) {
+        // Mode flips already carry a general permission note. Full-access
+        // transitions always get their own durable audit line as well.
+        if (prevMode === room.cfg.mode ||
+            prevClaudePermission === "bypassPermissions" || nextClaudePermission === "bypassPermissions") {
+          const text = nextClaudePermission === "bypassPermissions"
+            ? "⚠ Claude Full access enabled — ordinary Claude turns bypass ordinary permission prompts and checks. Claude starts a fresh session; Parley requests isolated Plan invocations for protected discussion, review and listener turns."
+            : prevClaudePermission === "bypassPermissions"
+              ? `🔒 Claude Full access disabled — Claude starts a fresh session in ${nextClaudePermission} mode.`
+              : `Claude permission mode changed to ${nextClaudePermission} — Claude starts a fresh session so it applies cleanly.`;
+          appendEntry(room, { kind: "system", author: "system", text });
+        }
+      }
+      broadcast(room, { type: "room", room: roomSummary(room) });
+      return json(res, 200, { room: roomSummary(room) });
+    }
+
+    if (route === "GET /api/transcript") {
+      const room = loadRoom(url.searchParams.get("room") || "default");
+      const text = fs.existsSync(room.transcriptFile) ? fs.readFileSync(room.transcriptFile, "utf8") : "";
+      res.writeHead(200, {
+        "Content-Type": "text/markdown; charset=utf-8",
+        "Content-Disposition": `attachment; filename="parley-${room.name}-transcript.md"`,
+      });
+      return res.end(text);
+    }
+
+    if (route === "POST /api/open") {
+      const { room: name, what } = await readBody(req);
+      const room = loadRoom(name || "default");
+      const target = what === "room" ? room.dir : workDir(room);
+      if (IS_WIN) {
+        // Reuse the folder's existing Explorer window if there is one, else
+        // open it — then wait for the window and explicitly bring it forward,
+        // because a window opened by a background process lands behind the
+        // browser. `Start-Process -FilePath` takes the path as one argument,
+        // so folder names with spaces survive; -EncodedCommand avoids quoting
+        // problems in the script itself.
+        const script = `
+$ErrorActionPreference = 'SilentlyContinue'
+$p = '${target.replace(/'/g, "''")}'
+$u = ([uri]$p).AbsoluteUri
+$sig = '[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h); [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);'
+$W = Add-Type -MemberDefinition $sig -Name PW -Namespace Parley -PassThru
+function Find-Win { $sh = New-Object -ComObject Shell.Application; @($sh.Windows() | Where-Object { $_.LocationURL -eq $u })[0] }
+$w = Find-Win
+if (-not $w) {
+  Start-Process -FilePath $p
+  for ($i = 0; $i -lt 20 -and -not $w; $i++) { Start-Sleep -Milliseconds 150; $w = Find-Win }
+}
+if ($w) { $h = [IntPtr]$w.HWND; [void]$W::ShowWindow($h, 9); [void]$W::SetForegroundWindow($h) }
+`;
+        const enc = Buffer.from(script, "utf16le").toString("base64");
+        await launchDetached("powershell.exe",
+          ["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", enc],
+          { windowsHide: true });
+      } else {
+        const opener = process.platform === "darwin" ? "open" : "xdg-open";
+        await launchDetached(opener, [target]);
+      }
+      return json(res, 200, { ok: true, path: target });
+    }
+
+    json(res, 404, { error: "not found" });
+  } catch (e) {
+    if (!res.headersSent) json(res, e.status || 500, { error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------- startup
+
+function openBrowser(u) {
+  const launched = IS_WIN
+    ? launchDetached("cmd.exe", ["/c", "start", "", u])
+    : process.platform === "darwin"
+      ? launchDetached("open", [u])
+      : launchDetached("xdg-open", [u]);
+  launched.catch(() => { /* user can open manually */ });
+}
+
+function shutdown() {
+  for (const room of rooms.values()) for (const [, child] of room.procs) killTree(child);
+  process.exit(0);
+}
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
+
+let port = PORT_WANTED;
+function listen(attempt = 0) {
+  server.once("error", (e) => {
+    if (e.code === "EADDRINUSE" && attempt < 20) { port++; listen(attempt + 1); }
+    else { console.error("Failed to start:", e.message); process.exit(1); }
+  });
+  server.listen(port, "127.0.0.1", () => {
+    const u = `http://127.0.0.1:${server.address().port}`;
+    loadRoom("default", undefined, true); // bootstrap: always somewhere to land
+    console.log(`\n  Parley is running\n\n  UI:     ${u}\n  Rooms:  ${ROOT}\n\n  Ctrl+C to quit.\n`);
+    if (!NO_OPEN) openBrowser(u);
+  });
+}
+listen();

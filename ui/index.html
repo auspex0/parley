@@ -1,0 +1,2017 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--PARLEY_TOKEN-->
+<!--PARLEY_RUNTIME_PROTOCOL-->
+<title>Parley</title>
+<link rel="icon" href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><circle cx="16" cy="16" r="13" fill="none" stroke="%23555c6b" stroke-width="2"/><circle cx="16" cy="7" r="4" fill="%237aa2f7"/><circle cx="8" cy="22" r="4" fill="%23e8845c"/><circle cx="24" cy="22" r="4" fill="%232fd6a8"/></svg>'>
+<style>
+  :root {
+    --bg: #0b0e14;
+    --bg2: #0e1219;
+    --panel: #121722;
+    --panel2: #161c29;
+    --border: rgba(255,255,255,.07);
+    --border2: rgba(255,255,255,.12);
+    --text: #dee3ec;
+    --text-dim: #8b93a5;
+    --text-faint: #5c6374;
+    --user: #7aa2f7;
+    --claude: #e8845c;
+    --codex: #2fd6a8;
+    --danger: #f26d6d;
+    --radius: 14px;
+    --mono: ui-monospace, "Cascadia Code", Consolas, "SF Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    font: 15px/1.55 "Segoe UI Variable Text", "Segoe UI", Inter, system-ui, sans-serif;
+    color: var(--text);
+    background:
+      radial-gradient(1200px 700px at 85% -10%, rgba(47,214,168,.055), transparent 60%),
+      radial-gradient(1000px 600px at -10% 110%, rgba(232,132,92,.05), transparent 60%),
+      var(--bg);
+    overflow: hidden;
+  }
+  button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
+  input, textarea, select { font: inherit; color: inherit; }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-thumb { background: rgba(255,255,255,.1); border-radius: 5px; border: 2px solid transparent; background-clip: content-box; }
+  ::-webkit-scrollbar-track { background: transparent; }
+
+  #app { display: flex; height: 100%; }
+
+  /* ---------- sidebar ---------- */
+  #sidebar {
+    width: 250px; flex-shrink: 0; display: flex; flex-direction: column;
+    background: var(--bg2); border-right: 1px solid var(--border);
+  }
+  .logo { display: flex; align-items: center; gap: 10px; padding: 18px 18px 14px; }
+  .logo svg { flex-shrink: 0; }
+  .logo b { font-size: 17px; letter-spacing: .2px; }
+  .logo span { color: var(--text-faint); font-size: 11px; display: block; margin-top: -3px; }
+  .side-label { padding: 14px 18px 6px; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-faint); display:flex; justify-content: space-between; align-items:center;}
+  .side-label button { color: var(--text-dim); font-size: 16px; line-height: 1; padding: 2px 6px; border-radius: 6px; }
+  .side-label button:hover { background: var(--panel2); color: var(--text); }
+  #roomList { overflow-y: auto; flex: 1; padding: 0 10px; }
+  .room-item {
+    display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+    padding: 8px 10px; border-radius: 9px; color: var(--text-dim); margin-bottom: 2px;
+  }
+  .room-item:hover { background: var(--panel); color: var(--text); }
+  .room-item.active { background: var(--panel2); color: var(--text); }
+  .room-item .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-faint); flex-shrink: 0; }
+  /* status icons and the hover actions occupy the same slot on the right, so
+     a mode marker never sits next to a destructive button */
+  .room-item .rmeta { display: flex; gap: 3px; align-items: center; flex-shrink: 0; }
+  .room-item .racts { display: none; gap: 1px; flex-shrink: 0; }
+  .room-item:hover .rmeta { display: none; }
+  .room-item:hover .racts { display: flex; }
+  .room-item .ract { padding: 1px 4px; border-radius: 5px; color: var(--text-faint); font-size: 12px; line-height: 1.2; cursor: pointer; }
+  .room-item .ract:hover { color: var(--text); background: var(--panel2); }
+  .room-item .ract.del:hover { color: var(--danger); }
+  .room-item.active .dot { background: var(--codex); }
+  #newRoomForm { display: none; padding: 4px 12px 8px; }
+  #newRoomForm input {
+    width: 100%; background: var(--panel); border: 1px solid var(--border2); border-radius: 8px;
+    padding: 6px 10px; color: var(--text); outline: none; font-size: 14px;
+  }
+  #newRoomForm select {
+    background: var(--panel); border: 1px solid var(--border2); border-radius: 8px;
+    padding: 4px 6px; color: var(--text-dim); font-size: 12.5px; outline: none;
+  }
+  .side-foot { padding: 12px; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 2px; }
+  .side-foot button, .side-foot a {
+    display: flex; align-items: center; gap: 9px; padding: 7px 10px; border-radius: 8px;
+    color: var(--text-dim); font-size: 13.5px; text-decoration: none;
+  }
+  .side-foot button:hover, .side-foot a:hover { background: var(--panel); color: var(--text); }
+  .side-foot .ico { width: 16px; text-align: center; opacity: .8; }
+
+  /* ---------- main column ---------- */
+  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
+
+  header {
+    display: flex; align-items: center; gap: 14px; padding: 12px 20px;
+    border-bottom: 1px solid var(--border); background: rgba(14,18,25,.7); backdrop-filter: blur(8px);
+  }
+  #roomTitle { font-weight: 600; font-size: 15.5px; }
+  #connDot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-faint); transition: background .3s; }
+  #connDot.on { background: var(--codex); box-shadow: 0 0 6px rgba(47,214,168,.7); }
+  .pills { display: flex; gap: 8px; margin-left: auto; }
+  .pill {
+    display: flex; align-items: center; gap: 7px; padding: 5px 12px; border-radius: 999px;
+    border: 1px solid var(--border2); font-size: 12.5px; color: var(--text-dim); background: var(--panel);
+  }
+  .pill .st { width: 7px; height: 7px; border-radius: 50%; background: var(--text-faint); }
+  .pill.claude b { color: var(--claude); font-weight: 600; }
+  .pill.codex b { color: var(--codex); font-weight: 600; }
+  .pill.linked .st { background: var(--user); }
+  .pill.busy .st { background: #ffd479; animation: pulse 1s infinite; }
+  .pill.bad .st { background: var(--danger); }
+  .pill .ear { font-size: 13px; line-height: 1; padding: 0 1px; opacity: .25; filter: grayscale(1); transition: opacity .15s, filter .15s; }
+  .pill .ear.on { opacity: 1; filter: none; }
+  .pill .ear:hover { opacity: .8; }
+  @keyframes pulse { 50% { opacity: .3; } }
+  .hbtn { padding: 6px 10px; border-radius: 9px; color: var(--text-dim); font-size: 13px; border: 1px solid transparent; }
+  .hbtn:hover { background: var(--panel2); color: var(--text); border-color: var(--border); }
+
+  /* talk/work mode */
+  #modeToggle { display: flex; border: 1px solid var(--border2); border-radius: 999px; overflow: hidden; }
+  .mbtn { padding: 4px 12px; font-size: 12.5px; color: var(--text-dim); }
+  .mbtn:hover { color: var(--text); }
+  .mbtn.active[data-m="talk"] { background: var(--panel2); color: var(--text); }
+  .mbtn.active[data-m="work"] { background: rgba(224,158,66,.25); color: #f2c078; }
+  #workBanner {
+    display: none; padding: 6px 20px; font-size: 12.5px; color: #e8b45c;
+    background: rgba(224,158,66,.1); border-bottom: 1px solid rgba(224,158,66,.35);
+  }
+
+  /* agent activity lines (tool use / exec) */
+  .activity {
+    align-self: flex-start; display: flex; gap: 7px; align-items: center;
+    font-family: var(--mono); font-size: 12px; color: var(--text-dim);
+    padding: 0 10px; animation: rise .18s ease-out; max-width: 85%;
+    overflow-wrap: anywhere;
+  }
+  .activity .adot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+  .activity.claude .adot { background: var(--claude); }
+  .activity.codex .adot { background: var(--codex); }
+  .activity-more { opacity: .82; }
+  .activity-more:hover { color: var(--text); opacity: 1; }
+  .history-more { align-self: center; padding: 2px 10px; color: var(--user); font-size: 12px; }
+  .history-more:hover { text-decoration: underline; }
+
+  /* ---------- chat ---------- */
+  #chatWrap { flex: 1; overflow-y: auto; scroll-behavior: smooth; display: flex; flex-direction: column; }
+  #chat { max-width: 880px; width: 100%; margin: 0 auto; padding: 26px 24px 10px; display: flex; flex-direction: column; gap: 18px; }
+
+  .msg { display: flex; flex-direction: column; max-width: 78%; animation: rise .18s ease-out; }
+  @keyframes rise { from { opacity: 0; transform: translateY(5px); } }
+  .msg.user { align-self: flex-end; align-items: flex-end; }
+  .msg.agent { align-self: flex-start; }
+  .meta { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-faint); margin: 0 6px 5px; }
+  .meta .who { font-weight: 600; font-size: 12.5px; }
+  .msg.claude .who { color: var(--claude); }
+  .msg.codex .who { color: var(--codex); }
+  .msg.user .who { color: var(--user); }
+  .avatar {
+    width: 22px; height: 22px; border-radius: 7px; display: inline-flex; align-items: center; justify-content: center;
+    font-size: 12px; font-weight: 700; color: #0b0e14;
+  }
+  .msg.claude .avatar { background: var(--claude); }
+  .msg.codex .avatar { background: var(--codex); }
+  .bubble {
+    padding: 11px 15px; border-radius: var(--radius); font-size: 14.8px;
+    background: var(--panel); border: 1px solid var(--border);
+    overflow-wrap: break-word; min-width: 40px;
+  }
+  .msg.user .bubble {
+    background: linear-gradient(135deg, rgba(122,162,247,.16), rgba(122,162,247,.09));
+    border-color: rgba(122,162,247,.25);
+  }
+  .msg.claude .bubble { border-left: 2px solid rgba(232,132,92,.55); }
+  .msg.codex .bubble { border-left: 2px solid rgba(47,214,168,.5); }
+  .bubble > :first-child { margin-top: 0; }
+  .bubble > :last-child { margin-bottom: 0; }
+  .bubble p { margin: 8px 0; }
+  .bubble h1, .bubble h2, .bubble h3, .bubble h4 { margin: 14px 0 6px; line-height: 1.3; }
+  .bubble h1 { font-size: 1.25em; } .bubble h2 { font-size: 1.15em; } .bubble h3 { font-size: 1.05em; } .bubble h4 { font-size: 1em; }
+  .bubble ul, .bubble ol { margin: 8px 0; padding-left: 22px; }
+  .bubble li { margin: 3px 0; }
+  .bubble blockquote { margin: 8px 0; padding: 4px 12px; border-left: 3px solid var(--border2); color: var(--text-dim); }
+  .bubble hr { border: none; border-top: 1px solid var(--border2); margin: 12px 0; }
+  .bubble a { color: var(--user); text-decoration: none; }
+  .bubble a:hover { text-decoration: underline; }
+  .bubble code { font-family: var(--mono); font-size: .88em; background: rgba(255,255,255,.08); padding: 2px 5px; border-radius: 5px; }
+  .md-table-wrap { max-width: 100%; margin: 10px 0; overflow-x: auto; border: 1px solid var(--border2); border-radius: 9px; }
+  .bubble table { width: 100%; min-width: max-content; border-collapse: collapse; font-size: .92em; }
+  .bubble th, .bubble td { max-width: 420px; padding: 8px 10px; border-right: 1px solid var(--border); border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
+  .bubble th { background: rgba(255,255,255,.055); color: var(--text); font-weight: 650; }
+  .bubble tbody tr:nth-child(even) { background: rgba(255,255,255,.025); }
+  .bubble tr:last-child td { border-bottom: 0; }
+  .bubble th:last-child, .bubble td:last-child { border-right: 0; }
+  .bubble th.align-center, .bubble td.align-center { text-align: center; }
+  .bubble th.align-right, .bubble td.align-right { text-align: right; }
+  .codeblock { position: relative; margin: 10px 0; border: 1px solid var(--border2); border-radius: 10px; background: #0a0d12; overflow: hidden; }
+  .codeblock .cb-head { display: flex; justify-content: space-between; align-items: center; padding: 5px 12px; font-size: 11.5px; color: var(--text-faint); border-bottom: 1px solid var(--border); }
+  .codeblock .cb-copy { font-size: 11.5px; color: var(--text-dim); padding: 2px 8px; border-radius: 6px; }
+  .codeblock .cb-copy:hover { background: var(--panel2); color: var(--text); }
+  .codeblock pre { margin: 0; padding: 12px 14px; overflow-x: auto; }
+  .codeblock code { background: none; padding: 0; font-size: 13px; line-height: 1.5; }
+
+  .sysmsg { align-self: center; text-align: center; max-width: 85%; font-size: 12.8px; color: var(--text-dim);
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 7px 14px; animation: rise .18s ease-out; }
+  .sysmsg.err { color: #f2a1a1; border-color: rgba(242,109,109,.3); }
+  .sysmsg .retry { margin-left: 8px; color: var(--user); font-weight: 600; }
+  .sysmsg .retry:hover { text-decoration: underline; }
+
+  .whisper { align-self: center; text-align: center; font-size: 12px; color: var(--text-faint);
+    padding: 2px 10px; animation: rise .18s ease-out; transition: opacity .8s; }
+
+  /* who-heard-this receipt dots */
+  .heard { display: flex; gap: 5px; margin: 5px 8px 0; }
+  .hdot { width: 8px; height: 8px; border-radius: 50%; box-sizing: border-box; }
+  .hdot.claude { --hc: var(--claude); }
+  .hdot.codex { --hc: var(--codex); }
+  .hdot.live { background: var(--hc); }
+  .hdot.passed { background: var(--hc); opacity: .45; }
+  .hdot.late { border: 1.5px solid var(--hc); opacity: .75; }
+  .hdot.unheard { border: 1.5px solid var(--text-faint); opacity: .35; }
+  .hdot.pending { border: 1.5px solid var(--hc); opacity: .8; animation: pulse 1s infinite; }
+
+  .meta .cpy { opacity: 0; font-size: 11px; padding: 0 4px; transition: opacity .15s; }
+  .msg:hover .meta .cpy { opacity: .6; }
+  .meta .cpy:hover { opacity: 1 !important; }
+  .bubble.collapsed { max-height: 300px; overflow: hidden;
+    -webkit-mask-image: linear-gradient(#000 75%, transparent); mask-image: linear-gradient(#000 75%, transparent); }
+  .showmore { align-self: flex-start; font-size: 12px; color: var(--user); margin: 4px 6px 0; }
+  .msg.user .showmore { align-self: flex-end; }
+
+  .caret { display: inline-block; width: 7px; height: 15px; background: var(--text-dim); vertical-align: -2px; margin-left: 2px; animation: pulse .8s infinite; border-radius: 2px; }
+  .thinking-dots { display: inline-flex; gap: 4px; align-items: center; }
+  .thinking-dots i { width: 6px; height: 6px; border-radius: 50%; background: var(--text-dim); animation: bounce 1.2s infinite; }
+  .thinking-dots i:nth-child(2) { animation-delay: .15s; } .thinking-dots i:nth-child(3) { animation-delay: .3s; }
+  @keyframes bounce { 0%, 60%, 100% { transform: none; opacity: .4; } 30% { transform: translateY(-4px); opacity: 1; } }
+  .elapsed { color: var(--text-faint); font-size: 12px; }
+
+  /* ---------- empty state ---------- */
+  #empty { margin: auto; text-align: center; padding: 40px 20px; color: var(--text-dim); }
+  #empty .big { font-size: 40px; margin-bottom: 8px; }
+  #empty h2 { color: var(--text); margin: 0 0 6px; font-size: 20px; }
+  #empty p { margin: 0 0 22px; font-size: 14px; }
+  .starters { display: flex; flex-direction: column; gap: 8px; align-items: center; }
+  .starter { background: var(--panel); border: 1px solid var(--border2); border-radius: 10px; padding: 9px 16px; color: var(--text-dim); font-size: 13.5px; }
+  .starter:hover { color: var(--text); border-color: var(--user); }
+  .starter b.c1 { color: var(--claude); } .starter b.c2 { color: var(--codex); } .starter b.c3 { color: var(--user); }
+
+  /* ---------- composer ---------- */
+  #composerWrap { padding: 10px 24px 18px; }
+  #composer { max-width: 880px; margin: 0 auto; position: relative; }
+  .chips { display: flex; gap: 6px; margin-bottom: 8px; align-items: center; }
+  .chip {
+    padding: 4px 13px; border-radius: 999px; font-size: 12.5px; border: 1px solid var(--border2);
+    color: var(--text-dim); background: var(--panel);
+  }
+  .chip:hover { color: var(--text); }
+  .chip.active { color: #0b0e14; font-weight: 600; }
+  .chip.active[data-t="auto"] { background: var(--text-dim); border-color: var(--text-dim); }
+  .chip.active[data-t="claude"] { background: var(--claude); border-color: var(--claude); }
+  .chip.active[data-t="codex"] { background: var(--codex); border-color: var(--codex); }
+  .chip.active[data-t="both"] { background: var(--user); border-color: var(--user); }
+  #routeHint { margin-left: auto; font-size: 12px; color: var(--text-faint); }
+  .box {
+    display: flex; align-items: flex-end; gap: 10px; background: var(--panel);
+    border: 1px solid var(--border2); border-radius: 16px; padding: 10px 10px 10px 16px;
+    transition: border-color .15s;
+  }
+  .box:focus-within { border-color: rgba(122,162,247,.5); }
+  #input {
+    flex: 1; background: none; border: none; outline: none; resize: none;
+    max-height: 200px; line-height: 1.5; padding: 4px 0; color: var(--text);
+  }
+  #input::placeholder { color: var(--text-faint); }
+  #sendBtn, #stopBtn {
+    width: 38px; height: 38px; border-radius: 12px; display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+  }
+  #sendBtn { background: var(--user); color: #0b0e14; }
+  #sendBtn:disabled { background: var(--panel2); color: var(--text-faint); cursor: default; }
+  #stopWrap { position: relative; display: none; flex-shrink: 0; }
+  #stopBtn { background: rgba(242,109,109,.15); color: var(--danger); border: 1px solid rgba(242,109,109,.4); }
+  #stopMenu {
+    position: absolute; right: 0; bottom: calc(100% + 7px); display: none; min-width: 170px;
+    padding: 5px; background: var(--panel2); border: 1px solid var(--border2); border-radius: 11px;
+    box-shadow: 0 8px 30px rgba(0,0,0,.5); z-index: 35;
+  }
+  #stopWrap.open #stopMenu { display: block; }
+  #stopMenu button { width: 100%; padding: 8px 10px; border-radius: 7px; text-align: left; color: var(--text-dim); }
+  #stopMenu button:hover { background: var(--panel); color: var(--text); }
+  #stopMenu button.stop-all { color: var(--danger); border-top: 1px solid var(--border); border-radius: 0 0 7px 7px; margin-top: 4px; padding-top: 9px; }
+  .hint { text-align: center; font-size: 11.5px; color: var(--text-faint); margin-top: 8px; }
+  .hint code { font-family: var(--mono); font-size: 11px; background: var(--panel); padding: 1px 5px; border-radius: 4px; }
+
+  /* mention popover */
+  #mention {
+    position: absolute; bottom: 100%; left: 12px; margin-bottom: 6px; display: none;
+    background: var(--panel2); border: 1px solid var(--border2); border-radius: 10px; overflow: hidden;
+    box-shadow: 0 8px 30px rgba(0,0,0,.5); min-width: 180px; z-index: 30;
+  }
+  #mention button { display: flex; gap: 8px; align-items: center; width: 100%; text-align: left; padding: 8px 14px; font-size: 13.5px; color: var(--text-dim); }
+  #mention button.sel, #mention button:hover { background: var(--panel); color: var(--text); }
+  #mention .mdot { width: 8px; height: 8px; border-radius: 50%; }
+
+  /* jump to bottom */
+  #jump {
+    position: absolute; bottom: 130px; left: 50%; transform: translateX(-50%);
+    background: var(--panel2); border: 1px solid var(--border2); border-radius: 999px;
+    padding: 6px 16px; font-size: 12.5px; color: var(--text-dim); display: none;
+    box-shadow: 0 6px 20px rgba(0,0,0,.4); z-index: 20;
+  }
+  #jump:hover { color: var(--text); }
+
+  /* ---------- modal ---------- */
+  #overlay {
+    position: fixed; inset: 0; background: rgba(5,7,10,.65); backdrop-filter: blur(3px);
+    display: none; align-items: center; justify-content: center; z-index: 50;
+  }
+  #overlay.open { display: flex; }
+  .modal {
+    width: min(560px, 92vw); max-height: 86vh; overflow-y: auto;
+    background: var(--bg2); border: 1px solid var(--border2); border-radius: 18px; padding: 24px 26px;
+    box-shadow: 0 20px 60px rgba(0,0,0,.6);
+  }
+  .modal h2 { margin: 0 0 4px; font-size: 18px; }
+  .modal .sub { color: var(--text-faint); font-size: 12.5px; margin-bottom: 18px; }
+  .mgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .mgroup { border: 1px solid var(--border); border-radius: 12px; padding: 14px; }
+  .mgroup h3 { margin: 0 0 10px; font-size: 13px; }
+  .mgroup h3 .agc { font-weight: 700; }
+  .mgroup h3 .agc.claude { color: var(--claude); } .mgroup h3 .agc.codex { color: var(--codex); }
+  .fld { margin-bottom: 10px; }
+  .fld label { display: block; font-size: 11.5px; color: var(--text-faint); margin-bottom: 4px; }
+  .fld input, .fld select {
+    width: 100%; background: var(--panel); border: 1px solid var(--border2); border-radius: 8px;
+    padding: 7px 10px; outline: none; font-size: 13.5px;
+  }
+  .fld input:focus, .fld select:focus { border-color: rgba(122,162,247,.5); }
+  .fld .note { font-size: 11px; color: var(--text-faint); margin-top: 3px; }
+  .fld .note.danger { color: #d99a72; line-height: 1.35; }
+  .freecombo { position: relative; }
+  .fld .freecombo-input { padding-right: 36px; }
+  .freecombo-toggle {
+    position: absolute; right: 1px; top: 1px; bottom: 1px; width: 34px;
+    border-left: 1px solid var(--border); border-radius: 0 7px 7px 0;
+    color: var(--text-dim); background: var(--panel);
+  }
+  .freecombo-toggle:hover, .freecombo.open .freecombo-toggle { color: var(--text); background: var(--panel2); }
+  .freecombo-menu {
+    position: absolute; z-index: 70; top: calc(100% + 4px); left: 0; right: 0;
+    max-height: 240px; overflow-y: auto; padding: 5px;
+    background: var(--panel2); border: 1px solid var(--border2); border-radius: 9px;
+    box-shadow: 0 12px 30px rgba(0,0,0,.55);
+  }
+  .freecombo-menu[hidden] { display: none; }
+  .freecombo-option {
+    display: block; width: 100%; padding: 7px 8px; border-radius: 6px;
+    text-align: left; line-height: 1.3; color: var(--text-dim);
+  }
+  .freecombo-option b { display: block; color: var(--text); font-size: 13px; }
+  .freecombo-option span { display: block; margin-top: 2px; font-size: 11px; overflow-wrap: anywhere; }
+  .freecombo-option:hover, .freecombo-option.active { background: rgba(122,162,247,.13); }
+  .freecombo-option.selected b { color: var(--user); }
+  .freecombo-empty { padding: 7px 8px; color: var(--text-faint); font-size: 11.5px; }
+  .sess { font-size: 12px; color: var(--text-dim); margin-top: 6px; }
+  .mrow { display: flex; gap: 10px; margin-top: 18px; justify-content: space-between; align-items: center; }
+  .btn { padding: 8px 18px; border-radius: 10px; font-size: 14px; border: 1px solid var(--border2); color: var(--text-dim); }
+  .btn:hover { color: var(--text); background: var(--panel); }
+  .btn.primary { background: var(--user); border-color: var(--user); color: #0b0e14; font-weight: 600; }
+  .btn.primary:hover { filter: brightness(1.1); }
+  .btn.danger { color: var(--danger); border-color: rgba(242,109,109,.4); }
+  .btn.danger:hover { background: rgba(242,109,109,.1); }
+
+  /* toast */
+  #toast {
+    position: fixed; top: 18px; left: 50%; transform: translateX(-50%) translateY(-80px);
+    background: var(--panel2); border: 1px solid var(--border2); border-radius: 12px;
+    padding: 10px 20px; font-size: 13.5px; z-index: 100; transition: transform .25s ease;
+    box-shadow: 0 8px 30px rgba(0,0,0,.5); max-width: 80vw;
+  }
+  #toast.show { transform: translateX(-50%) translateY(0); }
+  #toast.err { border-color: rgba(242,109,109,.5); color: #f2a1a1; }
+
+  @media (max-width: 760px) {
+    #sidebar { display: none; }
+    .msg { max-width: 92%; }
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <div class="logo">
+      <svg width="30" height="30" viewBox="0 0 32 32"><circle cx="16" cy="16" r="13" fill="none" stroke="#555c6b" stroke-width="2"/><circle cx="16" cy="7" r="4" fill="#7aa2f7"/><circle cx="8" cy="22" r="4" fill="#e8845c"/><circle cx="24" cy="22" r="4" fill="#2fd6a8"/></svg>
+      <div><b>Parley</b><span id="tagline">you · claude · codex</span></div>
+    </div>
+    <div class="side-label">Rooms <button id="addRoomBtn" title="New room">+</button></div>
+    <form id="newRoomForm">
+      <input id="newRoomInput" placeholder="room name…" maxlength="40" spellcheck="false">
+      <div style="display:flex;gap:6px;margin-top:6px">
+        <select id="seat1" title="Seat 1" style="flex:1"></select>
+        <select id="seat2" title="Seat 2" style="flex:1"></select>
+      </div>
+      <button type="button" id="newRoomProj" class="ract"
+        style="display:block;width:100%;text-align:left;margin-top:6px;padding:4px 2px;font-size:11.5px;color:var(--text-faint)"
+        title="Point this room at an existing project folder">📁 Link a project folder… <span id="newRoomProjVal"></span></button>
+    </form>
+    <nav id="roomList"></nav>
+    <div class="side-foot">
+      <button id="openWs"><span class="ico">📁</span> <span id="openWsLabel">Open workspace</span></button>
+      <a id="dlTranscript" href="#"><span class="ico">📄</span> Download transcript</a>
+      <button id="openRoomDir"><span class="ico">🗂️</span> Room folder</button>
+      <button id="settingsBtn2"><span class="ico">⚙️</span> Settings</button>
+    </div>
+  </aside>
+
+  <div id="main">
+    <header>
+      <div id="connDot" title="connection"></div>
+      <div id="roomTitle">default</div>
+      <div id="modeToggle" title="Talk: conversational, conservative defaults; explicit seat permission overrides remain active. Work: agents can write files in the workspace and run commands.">
+        <button class="mbtn active" data-m="talk">💬 Talk</button>
+        <button class="mbtn" data-m="work">🔨 Work</button>
+      </div>
+      <div class="pills" id="pills"></div>
+      <button class="hbtn" id="newConvBtn" title="Archive this conversation and start fresh">✨ New conversation</button>
+      <button class="hbtn" id="settingsBtn" title="Settings">⚙️</button>
+    </header>
+    <div id="pairBanner" style="display:none;padding:6px 20px;font-size:12.5px;color:#c9b3f5;background:rgba(150,110,240,.1);border-bottom:1px solid rgba(150,110,240,.35)">
+      <span id="pairBannerText"></span>
+      <button id="pairEndBtn" style="margin-left:10px;color:#c9b3f5;text-decoration:underline;font-size:12.5px">End pair mode</button>
+    </div>
+    <div id="runtimeBanner" role="alert" style="display:none;padding:8px 20px;font-size:12.5px;color:#ffb4b4;background:rgba(235,75,90,.14);border-bottom:1px solid rgba(235,75,90,.5)"></div>
+    <div id="workBanner">🔨 <b>Work room</b> — agents can write files in the shared workspace and run commands. Their actions show as inline activity lines.</div>
+
+    <div id="chatWrap">
+      <div id="chat"></div>
+      <div id="empty" style="display:none">
+        <div class="big">🃏</div>
+        <h2>The table is set</h2>
+        <p>One conversation, three seats. Tag an agent, or just type — Parley remembers who you were talking to.</p>
+        <div class="starters" id="starters"></div>
+      </div>
+    </div>
+    <button id="jump">↓ New messages</button>
+
+    <div id="composerWrap">
+      <div id="composer">
+        <div id="mention"></div>
+        <div class="chips" id="chipsRow">
+          <button class="chip active" data-t="auto">Auto</button>
+          <span id="seatChips" style="display:contents"></span>
+          <button class="chip" data-t="both">@both</button>
+          <span id="queueBadge" style="display:none;color:#e8b45c;font-size:12px"></span>
+          <span id="routeHint"></span>
+        </div>
+        <div class="box">
+          <textarea id="input" rows="1" placeholder="Message the table…  (@claude, @codex, @both)"></textarea>
+          <div id="stopWrap">
+            <button id="stopBtn" title="Stop the running response" aria-haspopup="menu" aria-expanded="false">■</button>
+            <div id="stopMenu" role="menu"></div>
+          </div>
+          <button id="sendBtn" title="Send (Enter)">➤</button>
+        </div>
+        <div class="hint">Enter to send · Shift+Enter newline · <b>/help</b> for commands · replies stream live · both agents see the whole room</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="overlay">
+  <div class="modal">
+    <h2>Room settings</h2>
+    <div class="sub" id="roomPath"></div>
+    <div class="mgrid" id="seatCards"></div>
+    <div class="fld" style="margin-top:14px"><label>Room note (standing instruction both agents see on every turn — also /note)</label>
+      <input id="s_roomnote" placeholder="e.g. We're building a YT-transcription app; keep answers short." spellcheck="false"></div>
+    <div class="fld" style="margin-top:14px"><label>Project folder (blank = room's own sandbox workspace)</label>
+      <div style="display:flex;gap:8px">
+        <input id="s_projdir" placeholder="e.g. D:\Projects\my-app" spellcheck="false" style="flex:1">
+        <button class="btn" id="s_browse" type="button" style="white-space:nowrap">Browse…</button>
+      </div>
+      <div class="note">Point this room at a real project — the agents work and read there, and pick up its CLAUDE.md / AGENTS.md automatically. Changing it resets both agents' sessions.</div></div>
+    <div class="mgrid" style="margin-top:14px">
+      <div class="fld"><label>Default agent (first message, before any tag)</label>
+        <select id="s_default"></select></div>
+      <div class="fld"><label>Timeout (seconds)</label><input id="s_timeout" type="number" min="10" step="10">
+        <div class="note">Work rooms always get at least 900s.</div></div>
+    </div>
+    <div class="mgrid">
+      <div class="fld"><label>Agent-to-agent hops per message (0 = until settled)</label>
+        <input id="s_maxhops" type="number" min="0" max="8" step="1">
+        <div class="note">Explicit @calls qualify regardless of lurk. Plain-name direct calls qualify when lurking or when you addressed both. Limits and a high safety stop catch loops.</div></div>
+      <div class="fld"><label>Pair review rounds per message (0 = until approved)</label>
+        <input id="s_pairrounds" type="number" min="0" max="99" step="1">
+        <div class="note">Pair mode ends when the reviewer approves, so a limit is optional. A high safety stop still catches two agents that never converge.</div></div>
+    </div>
+    <div class="mrow">
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <button class="btn" id="mRename">Rename…</button>
+        <button class="btn danger" id="mNewConv">Archive &amp; start fresh</button>
+        <button class="btn danger" id="mDelete">Delete room</button>
+      </div>
+      <div style="display:flex;gap:10px">
+        <button class="btn" id="mCancel">Cancel</button>
+        <button class="btn primary" id="mSave">Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+// ------------------------------------------------------------ state
+const $ = (id) => document.getElementById(id);
+const state = {
+  room: new URLSearchParams(location.search).get("room") || "default",
+  entries: [],
+  receipts: [],
+  summary: null,
+  providers: {},     // provider catalog (label/avatar/color/fields) from the server
+  chip: "auto",
+  es: null,
+  live: {},          // agent -> { el, mode:"think"|"stream", startedAt, text }
+  streamTimer: {},   // agent -> throttle timer
+  renderFromN: null, // first entry shown by the lazy initial transcript render
+  expandedMessages: new Set(),
+  expandedActivity: new Set(),
+  eventVersion: 0,   // any newer SSE event makes a reconnect snapshot stale for live UI state
+  resyncVersion: 0,
+};
+
+// ------------------------------------------------------------ helpers
+function esc(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+function toast(msg, isErr) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.className = isErr ? "err show" : "show";
+  clearTimeout(t._h);
+  t._h = setTimeout(() => t.classList.remove("show"), 3500);
+}
+// The server hands this page a session token and refuses API calls without it.
+// This blocks blind/cross-origin requests; it is not a secret from local
+// processes, which can fetch the public page and read the embedded token.
+const TOKEN = (document.querySelector('meta[name="parley-token"]') || {}).content || "";
+const REQUIRED_RUNTIME_PROTOCOL = "1";
+const PAGE_RUNTIME_PROTOCOL = (document.querySelector('meta[name="parley-runtime-protocol"]') || {}).content || "";
+const withToken = (url) => url + (url.includes("?") ? "&" : "?") +
+  "token=" + encodeURIComponent(TOKEN) + "&protocol=" + encodeURIComponent(REQUIRED_RUNTIME_PROTOCOL);
+
+let runtimeMismatch = false;
+function showRuntimeMismatch() {
+  if (runtimeMismatch) return;
+  runtimeMismatch = true;
+  const message = "Parley was updated while its old server was still running. Restart Parley, then reload this page.";
+  const banner = $("runtimeBanner");
+  banner.innerHTML = `⚠ <b>Restart Parley</b> — ${esc(message)}`;
+  banner.style.display = "block";
+  document.querySelectorAll("button,input,textarea,select").forEach((el) => { el.disabled = true; });
+  document.querySelectorAll("a").forEach((el) => {
+    el.style.pointerEvents = "none";
+    el.setAttribute("aria-disabled", "true");
+  });
+}
+if (PAGE_RUNTIME_PROTOCOL !== REQUIRED_RUNTIME_PROTOCOL) showRuntimeMismatch();
+
+async function api(path, body) {
+  if (runtimeMismatch) throw new Error("Restart Parley to finish applying the update.");
+  const res = await fetch(path, body === undefined
+    ? { headers: { "X-Parley-Token": TOKEN, "X-Parley-Runtime-Protocol": REQUIRED_RUNTIME_PROTOCOL } }
+    : {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Parley-Token": TOKEN,
+        "X-Parley-Runtime-Protocol": REQUIRED_RUNTIME_PROTOCOL,
+      },
+      body: JSON.stringify(body),
+    });
+  if (res.headers.get("x-parley-runtime-protocol") !== REQUIRED_RUNTIME_PROTOCOL) {
+    showRuntimeMismatch();
+    throw new Error("Restart Parley to finish applying the update.");
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+$("dlTranscript").onclick = async (ev) => {
+  ev.preventDefault();
+  try {
+    const res = await fetch("/api/transcript?room=" + encodeURIComponent(state.room), {
+      headers: { "X-Parley-Token": TOKEN, "X-Parley-Runtime-Protocol": REQUIRED_RUNTIME_PROTOCOL },
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || res.statusText);
+    }
+    const url = URL.createObjectURL(await res.blob());
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `parley-${state.room.replace(/[^a-zA-Z0-9._-]+/g, "-") || "room"}-transcript.md`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (e) { toast(e.message, true); }
+};
+function hhmm(ts) { return (ts || "").slice(11, 16); }
+function secs(ms) { return (ms / 1000).toFixed(1) + "s"; }
+
+// ------------------------------------------------------------ markdown (safe: escape first, then transform)
+// Code blocks are pulled out first and stashed behind private-use-area
+// sentinels so no other rule can touch their contents.
+const SENT_A = "", SENT_B = "";
+const SENT_LINE = new RegExp("^" + SENT_A + "(\\d+)" + SENT_B + "$");
+const SENT_ANY = new RegExp(SENT_A + "(\\d+)" + SENT_B, "g");
+function splitTableRow(line) {
+  let text = line.trim();
+  if (!text.includes("|")) return null;
+  let foundDivider = text.startsWith("|") || (text.endsWith("|") && !text.endsWith("\\|"));
+  if (text.startsWith("|")) text = text.slice(1);
+  if (text.endsWith("|") && !text.endsWith("\\|")) text = text.slice(0, -1);
+
+  const cells = [];
+  let cell = "", inCode = false;
+  for (let i = 0; i < text.length; i++) {
+    if (text.startsWith("<code>", i)) {
+      inCode = true; cell += "<code>"; i += 5; continue;
+    }
+    if (text.startsWith("</code>", i)) {
+      inCode = false; cell += "</code>"; i += 6; continue;
+    }
+    if (text[i] === "\\" && text[i + 1] === "|") {
+      cell += "|"; i++; continue;
+    }
+    if (text[i] === "|" && !inCode) {
+      cells.push(cell.trim()); cell = ""; foundDivider = true; continue;
+    }
+    cell += text[i];
+  }
+  cells.push(cell.trim());
+  return foundDivider ? cells : null;
+}
+function tableAlignments(line, columns) {
+  const cells = splitTableRow(line);
+  if (!cells || cells.length !== columns || !cells.every((cell) => /^:?-{3,}:?$/.test(cell))) return null;
+  return cells.map((cell) => cell.startsWith(":") && cell.endsWith(":") ? "center" : cell.endsWith(":") ? "right" : "left");
+}
+function renderMD(src) {
+  const blocks = [];
+  src = String(src).replace(/```([\w+-]*)\r?\n([\s\S]*?)```/g, (m, lang, code) => {
+    blocks.push({ lang, code });
+    return SENT_A + (blocks.length - 1) + SENT_B;
+  });
+  let t = esc(src);
+  t = t.replace(/`([^`\n]+)`/g, "<code>$1</code>");
+  t = t.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+  t = t.replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s.,;:!?)]|$)/g, "$1<em>$2</em>");
+  t = t.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+
+  const lines = t.split(/\r?\n/);
+  let html = "", para = [], list = null; // list: {type, items}
+  const flushPara = () => { if (para.length) { html += "<p>" + para.join("<br>") + "</p>"; para = []; } };
+  const flushList = () => {
+    if (list) { html += `<${list.type}>` + list.items.map((i) => "<li>" + i + "</li>").join("") + `</${list.type}>`; list = null; }
+  };
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+    const raw = lines[lineIndex];
+    const line = raw.trimEnd();
+    let m;
+    if (SENT_LINE.test(line.trim())) { flushPara(); flushList(); html += line.trim(); continue; }
+    if (!line.trim()) { flushPara(); flushList(); continue; }
+    const header = splitTableRow(line);
+    const alignments = header && lineIndex + 1 < lines.length
+      ? tableAlignments(lines[lineIndex + 1].trim(), header.length)
+      : null;
+    if (header && alignments) {
+      flushPara(); flushList();
+      const cellHTML = (tag, cells) => cells.map((cell, i) =>
+        `<${tag} class="align-${alignments[i]}">${cell}</${tag}>`).join("");
+      const rows = [];
+      let next = lineIndex + 2;
+      while (next < lines.length && lines[next].trim()) {
+        const cells = splitTableRow(lines[next]);
+        if (!cells) break;
+        while (cells.length < header.length) cells.push("");
+        rows.push(cells.slice(0, header.length));
+        next++;
+      }
+      html += `<div class="md-table-wrap"><table><thead><tr>${cellHTML("th", header)}</tr></thead>` +
+        `<tbody>${rows.map((cells) => `<tr>${cellHTML("td", cells)}</tr>`).join("")}</tbody></table></div>`;
+      lineIndex = next - 1;
+      continue;
+    }
+    if ((m = /^(#{1,4})\s+(.*)$/.exec(line))) { flushPara(); flushList(); html += `<h${m[1].length}>${m[2]}</h${m[1].length}>`; continue; }
+    if (/^(---|\*\*\*|___)$/.test(line.trim())) { flushPara(); flushList(); html += "<hr>"; continue; }
+    if ((m = /^\s*[-*+]\s+(.*)$/.exec(line))) {
+      flushPara(); if (!list || list.type !== "ul") { flushList(); list = { type: "ul", items: [] }; }
+      list.items.push(m[1]); continue;
+    }
+    if ((m = /^\s*\d+[.)]\s+(.*)$/.exec(line))) {
+      flushPara(); if (!list || list.type !== "ol") { flushList(); list = { type: "ol", items: [] }; }
+      list.items.push(m[1]); continue;
+    }
+    if ((m = /^&gt;\s?(.*)$/.exec(line))) { flushPara(); flushList(); html += "<blockquote>" + m[1] + "</blockquote>"; continue; }
+    flushList(); para.push(line);
+  }
+  flushPara(); flushList();
+
+  html = html.replace(SENT_ANY, (m, i) => {
+    const b = blocks[+i];
+    if (!b) return m;
+    return `<div class="codeblock"><div class="cb-head"><span>${esc(b.lang || "code")}</span>` +
+      `<button class="cb-copy">copy</button></div><pre><code>${esc(b.code.replace(/\n$/, ""))}</code></pre></div>`;
+  });
+  return html;
+}
+document.addEventListener("click", (e) => {
+  const btn = e.target.closest(".cb-copy");
+  if (btn) {
+    const code = btn.closest(".codeblock").querySelector("code");
+    navigator.clipboard.writeText(code.innerText).then(() => {
+      btn.textContent = "copied ✓"; setTimeout(() => (btn.textContent = "copy"), 1500);
+    });
+  }
+  const cpy = e.target.closest(".cpy");
+  if (cpy) {
+    const bub = cpy.closest(".msg").querySelector(".bubble");
+    navigator.clipboard.writeText(bub.innerText).then(() => {
+      cpy.textContent = "✓"; setTimeout(() => (cpy.textContent = "📋"), 1200);
+    });
+  }
+  if (!e.target.closest("#stopWrap")) {
+    $("stopWrap").classList.remove("open");
+    $("stopBtn").setAttribute("aria-expanded", "false");
+  }
+});
+window.addEventListener("focus", () => { document.title = "Parley"; });
+
+// ------------------------------------------------------------ chat rendering
+const chatWrap = $("chatWrap"), chat = $("chat");
+function nearBottom() { return chatWrap.scrollHeight - chatWrap.scrollTop - chatWrap.clientHeight < 120; }
+function scrollBottom(force) {
+  if (force || nearBottom()) { chatWrap.scrollTop = chatWrap.scrollHeight; $("jump").style.display = "none"; }
+  else $("jump").style.display = "block";
+}
+chatWrap.addEventListener("scroll", () => { if (nearBottom()) $("jump").style.display = "none"; });
+$("jump").onclick = () => scrollBottom(true);
+
+// Receipt dots: for each participant other than the author, show whether they
+// heard this message live, lurked it, caught up later, or haven't seen it.
+function computeHeard(a, e) {
+  const r = state.receipts.find((x) => x.agent === a && x.from < e.n && e.n <= x.upTo);
+  if (r) {
+    const live = e.n >= r.turn; // heard as part of the exchange that delivered it
+    if (live && r.mode === "lurk") return r.spoke
+      ? { cls: "live", title: `${a} · lurking — chimed in` }
+      : { cls: "passed", title: `${a} · lurking — listened, nothing to add` };
+    if (live && r.mode === "hop") return r.spoke
+      ? { cls: "live", title: `${a} · pulled into the exchange — replied` }
+      : { cls: "passed", title: `${a} · pulled into the exchange — nothing to add` };
+    if (live) return { cls: "live", title: `${a} · addressed — heard live` };
+    return { cls: "late", title: `${a} · caught up later (at turn ${r.turn})` };
+  }
+  const agent = state.summary && state.summary.agents && state.summary.agents[a];
+  const cur = agent ? agent.cursor : 0;
+  if (cur >= e.n) return { cls: "late", title: `${a} · has seen this` };
+  if (state.summary && (state.summary.busy || []).includes(a)) return { cls: "pending " + a, title: `${a} · receiving…` };
+  return { cls: "unheard", title: `${a} · hasn't seen this yet` };
+}
+function heardHTML(e) {
+  if (e.kind === "system" || e.kind === "activity") return "";
+  const others = ((state.summary && state.summary.seats) || []).filter((a) => a !== e.author);
+  if (!others.length) return "";
+  return `<div class="heard">` + others.map((a) => {
+    const h = computeHeard(a, e);
+    return `<span class="hdot ${a} ${h.cls}" title="${esc(h.title)}"></span>`;
+  }).join("") + `</div>`;
+}
+function refreshHeard(fromN, upToN) {
+  for (const e of state.entries) {
+    if (e.n <= fromN || e.n > upToN) continue;
+    const el = chat.querySelector(`[data-n="${e.n}"] .heard`);
+    const html = heardHTML(e);
+    if (el && html) el.outerHTML = html;
+  }
+}
+
+function entryEl(e) {
+  const div = document.createElement("div");
+  if (e.n !== undefined && e.n !== null) div.dataset.n = e.n;
+  if (e.kind === "activity") {
+    div.className = "activity " + e.author;
+    div.innerHTML = `<span class="adot"></span><span>${esc(e.text)}</span>`;
+    return div;
+  }
+  if (e.kind === "system") {
+    div.className = "sysmsg" + (e.meta && e.meta.error ? " err" : "");
+    div.innerHTML = esc(e.text);
+    if (e.meta && e.meta.error) {
+      const b = document.createElement("button");
+      b.className = "retry"; b.textContent = "Retry";
+      b.onclick = () => api("/api/retry", { room: state.room }).catch((err) => toast(err.message, true));
+      div.appendChild(b);
+    }
+    if (e.meta && e.meta.pairContinue) {
+      const b = document.createElement("button");
+      b.className = "retry"; b.textContent = "Continue →";
+      b.title = "Let the worker address that review and get checked again";
+      b.onclick = () => {
+        b.disabled = true; b.textContent = "Continuing…";
+        api("/api/pair/continue", { room: state.room })
+          .catch((err) => { toast(err.message, true); b.disabled = false; b.textContent = "Continue →"; });
+      };
+      div.appendChild(b);
+    }
+    return div;
+  }
+  div.className = "msg " + (e.kind === "user" ? "user" : "agent " + e.author);
+  const dur = e.meta && e.meta.durationMs ? ` · ${secs(e.meta.durationMs)}` : "";
+  const t = e.meta && e.meta.tokens;
+  const tok = t && t.out ? ` · <span title="output tokens${t.reasoning ? ` (${t.reasoning} reasoning)` : ""}">${t.out}t${t.reasoning ? ` <span style="opacity:.7">(${t.reasoning}r)</span>` : ""}</span>` : "";
+  // a pair turn is a review or a fix, never a generic "follow-up"
+  const pairTag = e.meta && e.meta.pair && typeof e.meta.pair === "string"
+    ? ` <span style="opacity:.6">· 🔁 ${e.meta.pair} r${e.meta.round}</span>` : "";
+  const lurkTag = pairTag || (e.meta && e.meta.lurk ? ' <span style="opacity:.6">· 👂 chimed in</span>'
+    : e.meta && e.meta.hop && !(e.meta && e.meta.pair) ? ' <span style="opacity:.6">· ⛓ follow-up</span>' : "");
+  const userPair = e.meta && e.meta.pair && typeof e.meta.pair === "object"
+    ? ` · 🔁 pair ×${e.meta.pair.rounds} (${e.meta.pair.worker} works, ${e.meta.pair.reviewer} reviews)` : "";
+  const label = e.kind === "user"
+    ? `You <span style="opacity:.65">→ @${esc(e.target)}${e.meta && e.meta.discussion ? " · 💬 discussion" : ""}${userPair}</span>`
+    : e.author.charAt(0).toUpperCase() + e.author.slice(1) + lurkTag;
+  const av = e.kind === "user" ? "" : `<span class="avatar">${esc((state.providers[e.author] && state.providers[e.author].avatar) || e.author[0].toUpperCase())}</span>`;
+  div.innerHTML = `<div class="meta">${av}<span class="who">${label}</span><span>${hhmm(e.ts)}${dur}${tok}</span>` +
+    `<button class="cpy" title="Copy message">📋</button></div>` +
+    `<div class="bubble">${renderMD(e.text)}</div>` + heardHTML(e);
+  if ((e.text || "").length > 2500) {
+    const bub = div.querySelector(".bubble");
+    const key = e.n === undefined || e.n === null ? null : String(e.n);
+    const expanded = key !== null && state.expandedMessages.has(key);
+    bub.classList.toggle("collapsed", !expanded);
+    const btn = document.createElement("button");
+    btn.className = "showmore";
+    btn.textContent = expanded ? "Show less ▴" : "Show more ▾";
+    btn.onclick = () => {
+      const c = bub.classList.toggle("collapsed");
+      if (key !== null) {
+        if (c) state.expandedMessages.delete(key);
+        else state.expandedMessages.add(key);
+      }
+      btn.textContent = c ? "Show more ▾" : "Show less ▴";
+    };
+    bub.insertAdjacentElement("afterend", btn);
+  }
+  return div;
+}
+
+const INITIAL_ENTRY_LIMIT = 150;
+const ACTIVITY_INLINE_LIMIT = 8;
+
+function appendActivityRun(parent, run) {
+  for (const e of run.slice(0, ACTIVITY_INLINE_LIMIT)) parent.appendChild(entryEl(e));
+  if (run.length <= ACTIVITY_INLINE_LIMIT) return;
+
+  const overflow = run.slice(ACTIVITY_INLINE_LIMIT);
+  const key = `${run[0].author}:${overflow[0].n}`;
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "activity activity-more " + run[0].author;
+  toggle.dataset.activityRun = key;
+  let overflowNodes = [];
+
+  const setLabel = (expanded) => {
+    const count = overflow.length;
+    const label = expanded
+      ? `▾ Hide ${count} action${count === 1 ? "" : "s"}`
+      : `▸ ${count} more action${count === 1 ? "" : "s"}`;
+    toggle.innerHTML = `<span class="adot"></span><span>${label}</span>`;
+  };
+  const showOverflow = () => {
+    overflowNodes = overflow.map(entryEl);
+    for (const node of overflowNodes) toggle.before(node);
+  };
+
+  const expanded = state.expandedActivity.has(key);
+  setLabel(expanded);
+  if (expanded) {
+    overflowNodes = overflow.map(entryEl);
+    for (const node of overflowNodes) parent.appendChild(node);
+  }
+  parent.appendChild(toggle);
+  toggle.onclick = () => {
+    if (state.expandedActivity.has(key)) {
+      state.expandedActivity.delete(key);
+      for (const node of overflowNodes) node.remove();
+      overflowNodes = [];
+      setLabel(false);
+    } else {
+      state.expandedActivity.add(key);
+      showOverflow();
+      setLabel(true);
+    }
+  };
+}
+
+function appendEntryRange(parent, entries) {
+  for (let i = 0; i < entries.length;) {
+    const e = entries[i];
+    if (e.kind !== "activity") {
+      parent.appendChild(entryEl(e));
+      i++;
+      continue;
+    }
+    let end = i + 1;
+    while (end < entries.length && entries[end].kind === "activity" && entries[end].author === e.author) end++;
+    appendActivityRun(parent, entries.slice(i, end));
+    i = end;
+  }
+}
+
+function renderedStartIndex() {
+  if (state.renderFromN === null) return 0;
+  const exact = state.entries.findIndex((e) => e.n === state.renderFromN);
+  if (exact >= 0) return exact;
+  const after = state.entries.findIndex((e) => e.n > state.renderFromN);
+  return after >= 0 ? after : state.entries.length;
+}
+
+function renderAll({ stickToBottom = true, preserveTransient = true } = {}) {
+  const oldTop = chatWrap.scrollTop;
+  // Re-rendering the durable transcript must not erase a whisper or a local
+  // slash-command note that arrived while a reconnect fetch was in flight.
+  const transient = preserveTransient
+    ? [...chat.children].filter((el) =>
+      !el.dataset.n && (el.classList.contains("whisper") || el.classList.contains("sysmsg")))
+    : [];
+  chat.innerHTML = "";
+  const start = renderedStartIndex();
+  const frag = document.createDocumentFragment();
+  if (start > 0) {
+    const earlier = document.createElement("button");
+    earlier.type = "button";
+    earlier.className = "history-more";
+    earlier.textContent = "Show earlier ▸";
+    earlier.title = `${start} earlier entr${start === 1 ? "y" : "ies"}`;
+    earlier.onclick = () => {
+      const beforeHeight = chatWrap.scrollHeight;
+      const beforeTop = chatWrap.scrollTop;
+      state.renderFromN = null;
+      renderAll({ stickToBottom: false });
+      chatWrap.scrollTop = beforeTop + chatWrap.scrollHeight - beforeHeight;
+    };
+    frag.appendChild(earlier);
+  }
+  appendEntryRange(frag, state.entries.slice(start));
+  for (const live of Object.values(state.live)) frag.appendChild(live.el);
+  for (const el of transient) frag.appendChild(el);
+  chat.appendChild(frag);
+  $("empty").style.display = state.entries.length ? "none" : "";
+  if (stickToBottom) scrollBottom(true);
+  else {
+    chatWrap.scrollTop = oldTop;
+    $("jump").style.display = nearBottom() ? "none" : "block";
+  }
+}
+
+function mergeEntries(snapshot, current) {
+  const byN = new Map();
+  for (const e of [...(snapshot || []), ...(current || [])]) {
+    if (e && e.n !== undefined && e.n !== null) byN.set(String(e.n), e);
+  }
+  return [...byN.values()].sort((a, b) => a.n - b.n);
+}
+
+function receiptKey(r) {
+  return [r.agent, r.from, r.upTo, r.turn, r.mode, r.spoke, r.ts].join("\u0001");
+}
+function mergeReceipts(snapshot, current) {
+  const byKey = new Map();
+  for (const r of [...(snapshot || []), ...(current || [])]) byKey.set(receiptKey(r), r);
+  return [...byKey.values()];
+}
+function addReceipt(receipt) {
+  const key = receiptKey(receipt);
+  if (state.receipts.some((r) => receiptKey(r) === key)) return;
+  state.receipts.push(receipt);
+  refreshHeard(receipt.from, receipt.upTo);
+}
+
+function addEntry(e) {
+  if (state.entries.some((cur) => cur.n === e.n)) return;
+  const wasAtBottom = nearBottom();
+  const last = state.entries[state.entries.length - 1];
+  const inOrder = !last || e.n > last.n;
+  state.entries = mergeEntries(state.entries, [e]);
+  // an arriving entry replaces any live bubble for that agent
+  if (e.kind === "agent" && state.live[e.author]) removeLive(e.author);
+  if (e.kind === "system" && e.meta && e.meta.agent && state.live[e.meta.agent]) removeLive(e.meta.agent);
+  $("empty").style.display = "none";
+
+  // A new activity can extend the preceding collapsible run. Re-render only
+  // the lazy transcript window so that run stays a single overflow row.
+  if (e.kind === "activity" || !inOrder) {
+    renderAll({ stickToBottom: wasAtBottom });
+    if (document.hidden && e.kind !== "activity") document.title = "● Parley";
+    return;
+  }
+  if (state.renderFromN !== null && e.n < state.renderFromN) return;
+  chat.appendChild(entryEl(e));
+  // Keep any live bubbles after the durable transcript entry.
+  for (const live of Object.values(state.live)) chat.appendChild(live.el);
+  if (document.hidden && e.kind !== "activity") document.title = "● Parley";
+  scrollBottom(e.kind === "user" || wasAtBottom);
+}
+
+// live (thinking / streaming) bubbles
+function ensureLive(agent, startedAt, label) {
+  if (state.live[agent]) return state.live[agent];
+  const div = document.createElement("div");
+  div.className = "msg agent " + agent;
+  div.innerHTML = `<div class="meta"><span class="avatar">${esc((state.providers[agent] && state.providers[agent].avatar) || agent[0].toUpperCase())}</span>` +
+    `<span class="who">${agent.charAt(0).toUpperCase() + agent.slice(1)}</span>` +
+    `<span class="live-label">${label || "is thinking"} <span class="elapsed"></span></span></div>` +
+    `<div class="bubble"><span class="thinking-dots"><i></i><i></i><i></i></span></div>`;
+  chat.appendChild(div);
+  state.live[agent] = { el: div, mode: "think", startedAt: startedAt || Date.now(), text: "" };
+  scrollBottom();
+  return state.live[agent];
+}
+function removeLive(agent) {
+  const l = state.live[agent];
+  if (l) { l.el.remove(); delete state.live[agent]; }
+  if (state.streamTimer[agent]) { clearTimeout(state.streamTimer[agent]); delete state.streamTimer[agent]; }
+}
+function clearLive() {
+  for (const agent of Object.keys(state.live)) removeLive(agent);
+}
+function liveStream(agent, text) {
+  const l = ensureLive(agent);
+  l.text = text;
+  if (state.streamTimer[agent]) return;
+  state.streamTimer[agent] = setTimeout(() => {
+    delete state.streamTimer[agent];
+    const cur = state.live[agent];
+    if (!cur) return;
+    cur.mode = "stream";
+    cur.el.querySelector(".live-label").innerHTML = 'is replying <span class="elapsed"></span>';
+    cur.el.querySelector(".bubble").innerHTML = renderMD(cur.text) + '<span class="caret"></span>';
+    scrollBottom();
+  }, 90);
+}
+function whisper(agent, error, hop, skipped) {
+  const d = document.createElement("div");
+  d.className = "whisper";
+  d.textContent = skipped
+    ? `⏭ ${agent} is busy in another exchange — it'll catch up on its next turn`
+    : error
+      ? `👂 ${agent} was listening but hit an error: ${error}`
+      : hop
+        ? `⛓ ${agent} read the mention — nothing to add`
+        : `👂 ${agent} listened — nothing to add`;
+  chat.appendChild(d);
+  scrollBottom();
+  setTimeout(() => { d.style.opacity = "0"; setTimeout(() => d.remove(), 900); }, 4500);
+}
+setInterval(() => {
+  for (const a of Object.keys(state.live)) {
+    const l = state.live[a];
+    const el = l.el.querySelector(".elapsed");
+    if (el) el.textContent = "· " + Math.floor((Date.now() - l.startedAt) / 1000) + "s";
+  }
+}, 1000);
+
+// ------------------------------------------------------------ header / pills / busy
+// Seats are data: colors, avatars and controls all render from the summary's
+// seat list + provider catalog, so any provider pair just works.
+function seatColor(a) {
+  return (state.providers[a] && state.providers[a].color) || "#7aa2f7";
+}
+function seatLabel(a) {
+  return (state.providers[a] && state.providers[a].label) || a;
+}
+function injectSeatStyles() {
+  let css = "";
+  for (const [id, p] of Object.entries(state.providers)) {
+    const c = p.color || "#7aa2f7";
+    css += `.msg.${id} .who{color:${c}} .msg.${id} .avatar{background:${c}} ` +
+      `.msg.${id} .bubble{border-left:2px solid ${c}88} .activity.${id} .adot{background:${c}} ` +
+      `.hdot.${id}{--hc:${c}} .chip.active[data-t="${id}"]{background:${c};border-color:${c}}\n`;
+  }
+  let el = $("seatStyles");
+  if (!el) { el = document.createElement("style"); el.id = "seatStyles"; document.head.appendChild(el); }
+  el.textContent = css;
+}
+function renderSeatsUI(s) {
+  const seats = s.seats;
+  $("pills").innerHTML = seats.map((a) =>
+    `<div class="pill" data-seat="${esc(a)}" id="pill_${esc(a)}"><span class="st"></span>` +
+    `<b style="color:${seatColor(a)}">${esc(seatLabel(a))}</b><span class="pinfo"></span>` +
+    `<button class="ear" data-seat="${esc(a)}">👂</button></div>`).join("");
+  $("seatChips").innerHTML = seats.map((a) => `<button class="chip" data-t="${esc(a)}">@${esc(a)}</button>`).join("");
+  document.querySelectorAll(".chip").forEach((c) => c.classList.toggle("active", c.dataset.t === state.chip));
+  $("tagline").textContent = `you · ${seats.join(" · ")}`;
+  input.placeholder = `Message the table…  (@${seats.join(", @")}, @both)`;
+  $("starters").innerHTML =
+    `<button class="starter" data-fill="@both Introduce yourselves in one sentence each."><b class="c3">@both</b> Introduce yourselves in one sentence each.</button>` +
+    seats.map((a, i) => `<button class="starter" data-fill="@${esc(a)} "><b class="${i ? "c2" : "c1"}">@${esc(a)}</b> ask ${esc(seatLabel(a))} something…</button>`).join("") +
+    `<button class="starter" data-fill="/pair start @${esc(seats[0])} "><b class="c1">/pair start</b> one builds, the other reviews…</button>`;
+}
+function syncChipUI() {
+  document.querySelectorAll(".chip").forEach((c) => c.classList.toggle("active", c.dataset.t === state.chip));
+}
+function pairRoundsLabel(rounds) {
+  const n = Math.max(0, Number(rounds) || 0);
+  return n > 0 ? `up to ${n} round${n === 1 ? "" : "s"} per message` : "until approved";
+}
+function configArgValue(args, option) {
+  const wanted = option.toLowerCase();
+  let found = 0;
+  let value = null;
+  for (let i = 0; i < (args || []).length; i++) {
+    const raw = String(args[i]);
+    if (raw.split("=", 1)[0].toLowerCase() !== wanted) continue;
+    found++;
+    value = raw.includes("=") ? raw.slice(raw.indexOf("=") + 1) : String(args[i + 1] || "");
+    if (!value.trim() || value.startsWith("-")) value = "invalid override";
+  }
+  return found > 1 ? "invalid override" : value;
+}
+function effectiveSeatPermission(a, cfg, roomMode) {
+  if ("permissionMode" in cfg) {
+    const override = configArgValue(cfg.extraArgs || [], "--permission-mode");
+    if (override !== null) return override || "invalid override";
+    const configured = cfg.permissionMode || "auto";
+    return configured === "auto" ? (roomMode === "work" ? "acceptEdits" : "default") : configured;
+  }
+  if ("sandbox" in cfg) {
+    const configured = cfg.sandbox || "read-only";
+    return roomMode === "work" && configured === "read-only" ? "workspace-write" : configured;
+  }
+  return "provider default";
+}
+function permissionLabel(mode) {
+  const labels = {
+    default: "CLI default",
+    manual: "manual",
+    plan: "plan — read only",
+    acceptEdits: "accept edits",
+    bypassPermissions: "full access",
+    "read-only": "read only",
+    "workspace-write": "workspace write",
+    "danger-full-access": "full access",
+  };
+  return labels[mode] || mode;
+}
+function isFullAccess(mode) {
+  return String(mode).toLowerCase() === "bypasspermissions" || mode === "danger-full-access";
+}
+function isConservative(mode) {
+  return ["default", "manual", "plan", "read-only"].includes(mode);
+}
+function applySummary(s) {
+  s.busy = s.busy || [];
+  for (const agent of Object.keys(state.live)) {
+    if (!s.busy.includes(agent)) removeLive(agent);
+  }
+  state.summary = s;
+  state.providers = s.providers || state.providers;
+  injectSeatStyles();
+  if (!$("pill_" + s.seats[0]) || !$("pill_" + s.seats[1])) renderSeatsUI(s);
+  syncChipUI();
+  $("roomTitle").textContent = s.name;
+  for (const a of s.seats) {
+    const pill = $("pill_" + a);
+    if (!pill) continue;
+    const ag = s.agents[a];
+    pill.classList.toggle("linked", ag.linked);
+    pill.classList.toggle("busy", s.busy.includes(a));
+    pill.classList.toggle("bad", !ag.command.ok);
+    let txt = "";
+    if (!ag.command.ok) txt = "not found";
+    else if (s.busy.includes(a)) txt = "typing…";
+    else if (s.cfg.agents[a].model) txt = s.cfg.agents[a].model;
+    pill.querySelector(".pinfo").textContent = txt ? " · " + txt : "";
+    pill.title = ag.command.ok
+      ? (ag.linked ? `session linked (${ag.sessionRef}…) · seen through turn ${ag.cursor}` : "fresh session")
+      : ag.command.detail;
+    const ear = pill.querySelector(".ear");
+    const lurking = !!s.cfg.agents[a].lurk;
+    ear.classList.toggle("on", lurking);
+    ear.title = lurking
+      ? `${a} is lurking: it overhears every exchange and may chime in (one extra ${a} call per message). Click to turn off.`
+      : `Let ${a} lurk: it will overhear every exchange and may chime in (one extra ${a} call per message). Click to turn on.`;
+  }
+  const mode = s.cfg.mode || "talk";
+  document.querySelectorAll(".mbtn").forEach((b) => b.classList.toggle("active", b.dataset.m === mode));
+  const access = s.seats.map((a) => ({
+    agent: a,
+    mode: effectiveSeatPermission(a, s.cfg.agents[a], mode),
+  }));
+  const how = access.map(({ agent, mode: permission }) =>
+    `${esc(agent)}: ${esc(permissionLabel(permission))}`).join(" · ");
+  const full = access.filter(({ mode: permission }) => isFullAccess(permission)).map(({ agent }) => agent);
+  const talkOverride = mode === "talk" && access.some(({ mode: permission }) => !isConservative(permission));
+  $("workBanner").style.display = mode === "work" || talkOverride ? "block" : "none";
+  if (full.length) {
+    $("workBanner").innerHTML = `⚠ <b>Full access enabled</b> — ${full.map(esc).join(" + ")} may act beyond ` +
+      (s.cfg.projectDir ? `<b>${esc(s.cfg.projectDir)}</b>` : "the room workspace") +
+      ` within the current OS account's access (${how}).`;
+  } else if (mode === "work") {
+    $("workBanner").innerHTML = `🔨 <b>Work room</b> — agents can write files and run commands in ` +
+      (s.cfg.projectDir ? `<b>${esc(s.cfg.projectDir)}</b>` : "the shared workspace") +
+      ` (${how}). Actions show as inline activity lines.`;
+  } else if (talkOverride) {
+    $("workBanner").innerHTML = `⚠ <b>Talk room with a permission override</b> — configured seats may still make changes (${how}).`;
+  }
+  const pair = s.pair;
+  $("pairBanner").style.display = pair ? "block" : "none";
+  if (pair) {
+    $("pairBannerText").innerHTML = `🔁 <b>Pair mode</b> — <b>${esc(pair.worker)}</b> works, <b>${esc(pair.reviewer)}</b> reviews ` +
+      `(${pairRoundsLabel(pair.rounds)}). Everything you send runs this way.`;
+    const source = pair.roundsSource === "command" ? "command override" : "room setting";
+    const limited = Number(pair.rounds) > 0;
+    const sourceTitle = pair.roundsSource === "command"
+      ? (limited
+        ? "This active round limit came from /pair start and is independent of the room setting."
+        : "This until-approved behavior came from /pair start and is independent of the room setting.")
+      : (limited
+        ? "This active round limit follows the room's Pair review rounds setting."
+        : "This until-approved behavior follows the room's Pair review rounds setting.");
+    $("pairBannerText").insertAdjacentHTML("beforeend",
+      ` <span title="${esc(sourceTitle)}" style="opacity:.62">· ${source}</span>`);
+  }
+  // say what this room actually works in, rather than a vague "workspace"
+  const wsBtn = $("openWs");
+  $("openWsLabel").textContent = s.cfg.projectDir
+    ? s.cfg.projectDir.split(/[\\/]/).filter(Boolean).pop()
+    : "Sandbox workspace";
+  wsBtn.title = s.cfg.projectDir
+    ? `Linked project — open ${s.cfg.projectDir}`
+    : `This room's own scratch folder — open ${s.workspace}`;
+  for (const a of s.busy) ensureLive(a);
+  setQueue(s.queued || 0);
+  refreshHeard(0, Infinity); // busy/cursor changes can flip pending/unheard dots
+  updateBusyUI();
+  updateRouteHint();
+}
+$("pills").addEventListener("click", async (e) => {
+  const ear = e.target.closest(".ear");
+  if (!ear || !state.summary) return;
+  const a = ear.dataset.seat;
+  const cur = !!state.summary.cfg.agents[a].lurk;
+  try {
+    await api("/api/config", { room: state.room, config: { agents: { [a]: { lurk: !cur } } } });
+    toast(!cur ? `👂 ${a} is now lurking — it hears every exchange and may chime in` : `${a} stopped lurking`);
+  } catch (err) { toast(err.message, true); }
+});
+document.querySelectorAll(".mbtn").forEach((b) => {
+  b.onclick = async () => {
+    const mode = b.dataset.m;
+    if (!state.summary || (state.summary.cfg.mode || "talk") === mode) return;
+    const pd = state.summary.cfg.projectDir;
+    if (mode === "work" && pd &&
+        !confirm(`⚠ This room is linked to a real project:\n${pd}\n\nWork mode may let configured agents EDIT files there and run commands. Continue?`)) return;
+    const anyLinked = state.summary.seats.some((a) => state.summary.agents[a].linked);
+    if (!(mode === "work" && pd) && anyLinked &&
+        !confirm(`Switch to ${mode} mode? Affected agents start fresh sessions so the permission change applies (the transcript keeps the room history).`)) return;
+    try { await api("/api/config", { room: state.room, config: { mode } }); refreshRooms(); }
+    catch (e) { toast(e.message, true); }
+  };
+});
+function updateBusyUI() {
+  // `working` covers the gaps between a chain's turns, so Stop doesn't blink
+  // out mid pair cycle when neither agent happens to be running yet.
+  const summary = state.summary;
+  const active = summary ? summary.busy : [];
+  const visible = !!summary && (active.length > 0 || summary.working);
+  const wrap = $("stopWrap");
+  wrap.style.display = visible ? "block" : "none"; // sending stays allowed — messages queue
+  if (!visible) {
+    wrap.classList.remove("open");
+    $("stopBtn").setAttribute("aria-expanded", "false");
+    return;
+  }
+  const choose = active.length > 1 || summary.queued > 0 || (summary.working && active.length > 0);
+  $("stopBtn").title = choose ? "Choose which response to stop" :
+    active.length === 1 ? `Stop ${seatLabel(active[0])}` : "Stop the pair cycle";
+  $("stopMenu").innerHTML = active.map((a) =>
+    `<button role="menuitem" data-stop-agent="${esc(a)}">■ Stop ${esc(seatLabel(a))}</button>`).join("") +
+    (choose ? `<button role="menuitem" class="stop-all" data-stop-agent="">■ Stop all</button>` : "");
+}
+function setQueue(n) {
+  const b = $("queueBadge");
+  b.style.display = n > 0 ? "inline" : "none";
+  b.textContent = `⏳ ${n} queued`;
+}
+function guessTextTarget(raw) {
+  const text = raw.trim();
+  if (!text || !state.summary) return null;
+  const seats = state.summary.seats;
+  const alt = seats.join("|");
+  const tags = new Set([...text.matchAll(new RegExp(`@(${alt}|both)\\b`, "gi"))].map((m) => m[1].toLowerCase()));
+  if (tags.has("both") || seats.every((s) => tags.has(s))) return "both";
+  const lead = new RegExp(`^@(${alt})\\b`, "i").exec(text);
+  if (lead) return lead[1].toLowerCase();
+  for (const s of seats) if (tags.has(s)) return s;
+  return null;
+}
+function updateRouteHint() {
+  if (!state.summary) return;
+  const explicit = guessTextTarget($("input").value);
+  const pair = state.summary.pair;
+  if (pair && !explicit && !$("input").value.trim().startsWith("/")) {
+    $("routeHint").textContent = `→ ${pair.worker} · 🔁 ${pair.reviewer} reviews`;
+    return;
+  }
+  const t = explicit
+    || (state.chip !== "auto" ? state.chip : (state.summary.lastAddressed || state.summary.cfg.defaultAgent));
+  const disc = t === "both" && (state.summary.cfg.mode || "talk") === "work" ? " · discussion (no edits)" : "";
+  $("routeHint").textContent = "→ " + (t === "both" ? state.summary.seats.join(" + ") : t) + disc;
+}
+$("pairEndBtn").onclick = async () => {
+  try { await api("/api/message", { room: state.room, text: "/pair end", target: "auto" }); }
+  catch (e) { toast(e.message, true); }
+};
+
+// ------------------------------------------------------------ SSE
+function followRoomRename(from, to) {
+  if (state.room !== from && state.room !== to) return false;
+  const changed = state.room !== to;
+  state.room = to;
+  if (changed) state.eventVersion++;
+  if (state.summary) state.summary.name = to;
+  $("roomTitle").textContent = to;
+  history.replaceState(null, "", to === "default" ? location.pathname : "?room=" + encodeURIComponent(to));
+
+  let streamRoom = null;
+  try { streamRoom = state.es ? new URL(state.es.url, location.href).searchParams.get("room") : null; }
+  catch { /* an absent or malformed stream URL is simply reconnected below */ }
+  if (streamRoom !== to) {
+    state.resyncVersion++;
+    connect(true);
+  }
+  return true;
+}
+
+function connect(resyncOnOpen = false) {
+  if (state.es) {
+    const old = state.es;
+    state.es = null;
+    old.close();
+  }
+  const es = new EventSource(withToken("/api/events?room=" + encodeURIComponent(state.room)));
+  state.es = es;
+  let wasDown = false;
+  let needsResync = resyncOnOpen;
+  es.onopen = () => {
+    if (state.es !== es) return;
+    $("connDot").classList.add("on");
+    // Entries can land while the stream is down; re-pull rather than silently
+    // showing a transcript with a hole in it.
+    if (wasDown || needsResync) {
+      wasDown = false;
+      needsResync = false;
+      refreshAfterGap();
+    }
+  };
+  es.onerror = () => {
+    if (state.es !== es) return;
+    wasDown = true;
+    $("connDot").classList.remove("on");
+  };
+  es.onmessage = (ev) => {
+    if (state.es !== es) return;
+    const msg = JSON.parse(ev.data);
+    state.eventVersion++;
+    if (msg.type === "entry") addEntry(msg.entry);
+    else if (msg.type === "receipt") addReceipt(msg.receipt);
+    else if (msg.type === "queue") {
+      if (state.summary) state.summary.queued = msg.size;
+      setQueue(msg.size);
+    }
+    else if (msg.type === "lurk") whisper(msg.agent, msg.error, msg.hop, msg.skipped);
+    else if (msg.type === "status") {
+      if (state.summary) { // keep busy state truthful between room summaries
+        const b = state.summary.busy || [];
+        if (msg.phase === "done") state.summary.busy = b.filter((x) => x !== msg.agent);
+        else if (!b.includes(msg.agent)) b.push(msg.agent);
+        const pill = $("pill_" + msg.agent);
+        if (pill) pill.classList.toggle("busy", state.summary.busy.includes(msg.agent));
+        updateBusyUI();
+      }
+      if (msg.phase === "start") ensureLive(msg.agent, msg.startedAt);
+      else if (msg.phase === "listening") ensureLive(msg.agent, msg.startedAt, "is listening 👂");
+      else if (msg.phase === "review") ensureLive(msg.agent, msg.startedAt, "is reviewing 🔁");
+      else if (msg.phase === "fix") ensureLive(msg.agent, msg.startedAt, "is fixing 🔁");
+      else if (msg.phase === "hop") ensureLive(msg.agent, msg.startedAt, "is following up ⛓");
+      else if (msg.phase === "retrying") {
+        const l = ensureLive(msg.agent);
+        l.el.querySelector(".live-label").innerHTML = 'is restoring its session <span class="elapsed"></span>';
+      } else if (msg.phase === "done") removeLive(msg.agent);
+    }
+    else if (msg.type === "stream") liveStream(msg.agent, msg.text);
+    else if (msg.type === "room") {
+      applySummary(msg.room);
+    }
+    else if (msg.type === "reset") {
+      state.resyncVersion++;
+      clearLive();
+      state.entries = [];
+      state.receipts = [];
+      state.renderFromN = null;
+      state.expandedMessages.clear();
+      state.expandedActivity.clear();
+      renderAll({ preserveTransient: false });
+      toast("Fresh conversation — previous one archived.");
+    }
+    else if (msg.type === "renamed") {
+      // The live stream survives the rename (it's held on the room object),
+      // but its URL still carries the old name — so reconnect, or the next
+      // dropout would reconnect to a name that no longer exists.
+      followRoomRename(msg.from, msg.to);
+      refreshRooms().catch((e) => toast(e.message, true));
+    }
+  };
+}
+
+// ------------------------------------------------------------ load room
+async function loadRoom(name) {
+  let data;
+  try {
+    data = await api("/api/room?name=" + encodeURIComponent(name));
+  } catch (e) {
+    if (name === "default") throw e;
+    toast(`Room "${name}" no longer exists — opening default.`, true);
+    return loadRoom("default");
+  }
+  if (state.es) {
+    const old = state.es;
+    state.es = null;
+    old.close();
+  }
+  $("connDot").classList.remove("on");
+  state.resyncVersion++;
+  state.eventVersion++;
+  const roomName = data.room.name || name;
+  state.room = roomName;
+  history.replaceState(null, "", roomName === "default" ? location.pathname : "?room=" + encodeURIComponent(roomName));
+  // Keep an explicit destination if it exists in the destination room. Only a
+  // genuinely stale seat id falls back to automatic routing.
+  const validChips = new Set(["auto", "both", ...(data.room.seats || [])]);
+  if (!validChips.has(state.chip)) state.chip = "auto";
+  clearLive();
+  state.entries = data.entries;
+  state.receipts = data.receipts || [];
+  state.expandedMessages.clear();
+  state.expandedActivity.clear();
+  state.renderFromN = state.entries.length > INITIAL_ENTRY_LIMIT
+    ? state.entries[state.entries.length - INITIAL_ENTRY_LIMIT].n
+    : null;
+  // Entry rendering (avatars and receipt dots) needs the destination room's
+  // provider catalog and seats, not the room we just left.
+  state.summary = data.room;
+  state.providers = data.room.providers || state.providers;
+  renderAll({ preserveTransient: false });
+  applySummary(data.room);
+  connect();
+  await refreshRooms();
+}
+
+// After the event stream was down, pull the room again so anything that
+// happened during the gap appears without a manual refresh.
+async function refreshAfterGap() {
+  const room = state.room;
+  const eventVersion = state.eventVersion;
+  const resyncVersion = ++state.resyncVersion;
+  try {
+    const data = await api("/api/room?name=" + encodeURIComponent(room));
+    if (state.room !== room || state.resyncVersion !== resyncVersion) return;
+    // The stream is already live while this fetch is in flight. Merge by turn
+    // number (live state wins on duplicates) so its arrivals cannot be lost.
+    state.entries = mergeEntries(data.entries, state.entries);
+    state.receipts = mergeReceipts(data.receipts, state.receipts);
+    renderAll({ stickToBottom: nearBottom() });
+    // Any SSE message is newer live evidence: status, queue, stream, whisper,
+    // entry, receipt, reset and rename alike. Never replace it with this fetch.
+    if (state.eventVersion === eventVersion) applySummary(data.room);
+  } catch { /* the room may have gone; loadRoom's own error path handles that */ }
+}
+async function refreshRooms() {
+  const data = await api("/api/rooms");
+  state.providers = data.providers || state.providers;
+  fillSeatPickers();
+  const list = $("roomList");
+  list.innerHTML = "";
+  for (const r of data.rooms) {
+    const name = typeof r === "string" ? r : r.name;
+    const mode = typeof r === "string" ? "talk" : r.mode;
+    const linked = typeof r === "string" ? false : r.linked;
+    const seats = (typeof r === "string" ? null : r.seats) || [];
+    const nonDefault = seats.length && seats.join(",") !== "claude,codex";
+    const seatTag = nonDefault
+      ? `<span style="font-size:10px;opacity:.7">${seats.map((s) => (state.providers[s] && state.providers[s].avatar) || s[0].toUpperCase()).join("+")}</span>`
+      : "";
+    const b = document.createElement("button");
+    b.className = "room-item" + (name === state.room ? " active" : "");
+    b.innerHTML = `<span class="dot"></span><span style="flex:1;overflow:hidden;text-overflow:ellipsis">${esc(name)}</span>` +
+      `<span class="rmeta">${seatTag}${linked ? "📁" : ""}${mode === "work" ? "🔨" : ""}</span>` +
+      `<span class="racts"><span class="ract" data-act="rename" title="Rename room">✎</span>` +
+      // the default room is the app's fallback; it can be emptied, not removed
+      (name === "default" ? "" : `<span class="ract del" data-act="delete" title="Delete room">✕</span>`) +
+      `</span>`;
+    b.onclick = (e) => {
+      const act = e.target.closest(".ract");
+      if (!act) return loadRoom(name);
+      e.stopPropagation();
+      if (act.dataset.act === "rename") renameFlow(name); else deleteFlow(name);
+    };
+    list.appendChild(b);
+  }
+}
+// New-room seat pickers: pre-filled with the default pair, visible so the
+// choice is discoverable, never a required step.
+function fillSeatPickers() {
+  const ids = Object.keys(state.providers);
+  if (!ids.length || $("seat1").options.length) return;
+  for (const [sel, def] of [[$("seat1"), "claude"], [$("seat2"), "codex"]]) {
+    sel.innerHTML = ids.map((p) => `<option value="${esc(p)}">${esc(state.providers[p].label)}</option>`).join("");
+    sel.value = ids.includes(def) ? def : ids[sel === $("seat2") ? 1 : 0] || ids[0];
+  }
+}
+
+// ------------------------------------------------------------ composer
+const input = $("input");
+function autosize() { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, 200) + "px"; }
+input.addEventListener("input", () => { autosize(); updateRouteHint(); mentionCheck(); });
+
+// Local slash commands; /pair goes to the server, the rest resolve here.
+function localSystemNote(html) {
+  const d = document.createElement("div");
+  d.className = "sysmsg";
+  d.innerHTML = html;
+  chat.appendChild(d);
+  scrollBottom(true);
+}
+async function handleSlash(text) {
+  const cmd = (text.split(/\s+/)[0] || "").toLowerCase();
+  const rest = text.slice(cmd.length).trim();
+  if (cmd === "/pair") return false; // server handles
+  if (cmd === "/note") {
+    try {
+      await api("/api/config", { room: state.room, config: { roomNote: rest || null } });
+      toast(rest ? "📌 Room note set — both agents will see it on every turn." : "📌 Room note cleared.");
+    } catch (e) { toast(e.message, true); }
+    return true;
+  }
+  if (cmd === "/summarize") {
+    input.value = (rest ? rest + " " : "") + "Summarize this room's discussion so far: decisions made, open questions, and next steps. Be concise.";
+    await send();
+    return true;
+  }
+  if (cmd === "/help") {
+    localSystemNote(
+      "<b>Routing:</b> only @claude / @codex / @both tags route from text · tagging both names reaches both · untagged goes to whoever you last addressed<br>" +
+      "<b>Agent calls:</b> @name always hands off · a plain direct call ('Codex, …') hands off when that agent is lurking or your message addressed both<br>" +
+      "<b>/pair start @agent [task]</b> — pair mode: that agent works, the other reviews every message you send<br>" +
+      "<b>/pair end</b> — leave pair mode (also the End button in the banner)<br>" +
+      "<b>/note [text]</b> — standing room note both agents see every turn (empty clears)<br>" +
+      "<b>/summarize [@agent]</b> — ask for a recap of the room<br>" +
+      "<b>👂</b> on a pill = lurk · <b>💬/🔨</b> = talk/work mode · dots under messages = who heard what");
+    return true;
+  }
+  localSystemNote(`Unknown command <b>${esc(cmd)}</b> — try <b>/help</b>`);
+  return true;
+}
+
+async function send() {
+  const text = input.value.trim();
+  if (!text) return;
+  if (text.startsWith("/")) {
+    input.value = ""; autosize(); hideMention();
+    const handled = await handleSlash(text);
+    if (handled) return;
+  } else {
+    input.value = ""; autosize(); hideMention();
+  }
+  try {
+    const r = await api("/api/message", { room: state.room, text, target: state.chip });
+    if (r.queued) toast(`⏳ Queued (#${r.position}) — sends when the table quiets down.`);
+  } catch (e) { toast(e.message, true); input.value = text; autosize(); }
+}
+$("sendBtn").onclick = send;
+async function stopResponses(agent) {
+  $("stopWrap").classList.remove("open");
+  $("stopBtn").setAttribute("aria-expanded", "false");
+  try {
+    await api("/api/stop", { room: state.room, ...(agent ? { agent } : {}) });
+  } catch (e) { toast(e.message, true); }
+}
+$("stopBtn").onclick = () => {
+  if (!state.summary) return;
+  const active = state.summary.busy || [];
+  const choose = active.length > 1 || state.summary.queued > 0 || (state.summary.working && active.length > 0);
+  if (!choose) return stopResponses(active[0] || null);
+  const wrap = $("stopWrap");
+  const open = wrap.classList.toggle("open");
+  $("stopBtn").setAttribute("aria-expanded", String(open));
+};
+$("stopMenu").onclick = (e) => {
+  const choice = e.target.closest("[data-stop-agent]");
+  if (choice) stopResponses(choice.dataset.stopAgent || null);
+};
+input.addEventListener("keydown", (e) => {
+  if (mentionKeydown(e)) return;
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+});
+
+$("chipsRow").addEventListener("click", (e) => {
+  const c = e.target.closest(".chip");
+  if (!c) return;
+  document.querySelectorAll(".chip").forEach((x) => x.classList.remove("active"));
+  c.classList.add("active");
+  state.chip = c.dataset.t;
+  updateRouteHint();
+  input.focus();
+});
+$("starters").addEventListener("click", (e) => {
+  const s = e.target.closest(".starter");
+  if (!s) return;
+  input.value = s.dataset.fill; autosize(); input.focus(); updateRouteHint();
+});
+
+// mention popover — options come from the room's seats
+function mentionOptions() {
+  const seats = state.summary ? state.summary.seats : [];
+  return [
+    ...seats.map((a) => ({ tag: "@" + a, color: seatColor(a) })),
+    { tag: "@both", color: "var(--user)" },
+  ];
+}
+let mItems = [], mSel = 0;
+function mentionCheck() {
+  const pos = input.selectionStart;
+  const before = input.value.slice(0, pos);
+  const m = /(^|\s)@([a-z0-9]*)$/i.exec(before);
+  if (!m) return hideMention();
+  const prefix = m[2].toLowerCase();
+  mItems = mentionOptions().filter((x) => x.tag.slice(1).startsWith(prefix));
+  if (!mItems.length) return hideMention();
+  mSel = 0;
+  const el = $("mention");
+  el.innerHTML = mItems.map((x, i) =>
+    `<button data-i="${i}" class="${i === 0 ? "sel" : ""}"><span class="mdot" style="background:${x.color}"></span>${x.tag}</button>`).join("");
+  el.style.display = "block";
+  el.querySelectorAll("button").forEach((b) => { b.onclick = () => pickMention(+b.dataset.i); });
+}
+function hideMention() { $("mention").style.display = "none"; mItems = []; }
+function pickMention(i) {
+  const pos = input.selectionStart;
+  const before = input.value.slice(0, pos).replace(/@[a-z0-9]*$/i, mItems[i].tag + " ");
+  input.value = before + input.value.slice(pos);
+  input.selectionStart = input.selectionEnd = before.length;
+  hideMention(); updateRouteHint(); input.focus();
+}
+function mentionKeydown(e) {
+  if (!mItems.length) return false;
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    mSel = (mSel + (e.key === "ArrowDown" ? 1 : mItems.length - 1)) % mItems.length;
+    $("mention").querySelectorAll("button").forEach((b, i) => b.classList.toggle("sel", i === mSel));
+    e.preventDefault(); return true;
+  }
+  if (e.key === "Enter" || e.key === "Tab") { pickMention(mSel); e.preventDefault(); return true; }
+  if (e.key === "Escape") { hideMention(); return true; }
+  return false;
+}
+
+// ------------------------------------------------------------ rooms sidebar
+$("addRoomBtn").onclick = () => {
+  $("newRoomForm").style.display = "block";
+  $("newRoomInput").focus();
+};
+let newRoomProjectDir = null;
+$("newRoomProj").onclick = async () => {
+  const r = await browseFolder();
+  if (!r) return;
+  newRoomProjectDir = r;
+  $("newRoomProjVal").textContent = "— " + r.split(/[\\/]/).pop();
+  $("newRoomProj").style.color = "var(--text-dim)";
+};
+$("newRoomForm").onsubmit = async (e) => {
+  e.preventDefault();
+  const name = $("newRoomInput").value.trim();
+  if (!name) return;
+  const seats = [$("seat1").value, $("seat2").value].filter(Boolean);
+  if (seats.length === 2 && seats[0] === seats[1]) return toast("Pick two different seats.", true);
+  const body = { name };
+  if (seats.length === 2) body.seats = seats;
+  if (newRoomProjectDir) body.projectDir = newRoomProjectDir;
+  try {
+    await api("/api/rooms", body);
+    $("newRoomInput").value = "";
+    $("newRoomForm").style.display = "none";
+    newRoomProjectDir = null;
+    $("newRoomProjVal").textContent = "";
+    $("newRoomProj").style.color = "var(--text-faint)";
+    await loadRoom(name);
+  } catch (err) { toast(err.message, true); }
+};
+// Ask the server to open the OS folder dialog; returns a path or null.
+async function browseFolder(start) {
+  toast("Opening the folder picker — check the taskbar if it doesn't come forward.");
+  try {
+    const r = await api("/api/pickfolder", { start: start || null });
+    if (r.error) { toast(r.error, true); return null; }
+    return r.cancelled ? null : r.path;
+  } catch (e) { toast(e.message, true); return null; }
+}
+$("s_browse").onclick = async () => {
+  const picked = await browseFolder($("s_projdir").value.trim() || null);
+  if (picked) $("s_projdir").value = picked;
+};
+$("openWs").onclick = () => api("/api/open", { room: state.room, what: "workspace" })
+  .then(() => toast("📁 Workspace opened in Explorer — check the taskbar if it isn't in front."))
+  .catch((e) => toast(e.message, true));
+$("openRoomDir").onclick = () => api("/api/open", { room: state.room, what: "room" })
+  .then(() => toast("🗂️ Room folder opened in Explorer — check the taskbar if it isn't in front."))
+  .catch((e) => toast(e.message, true));
+
+// ------------------------------------------------------------ settings modal
+// Seat cards render from the provider catalog: each provider declares which
+// fields it understands, so a new provider's settings appear automatically.
+function seatFieldHTML(a, field, p) {
+  const d = (n, f) => `data-seat="${esc(a)}" data-f="${f}"`;
+  if (field === "command") return `<div class="fld"><label>Command</label><input ${d(a, "command")} spellcheck="false"></div>`;
+  // Model and effort are comboboxes, not fixed lists: the suggestions are a
+  // convenience, but anything you type is passed straight to the CLI — so
+  // models and effort levels released after this build still work.
+  // Suggestions show the provider's own wording ("Extra High"), while the
+  // value written into the field is what the CLI takes ("xhigh"). A custom
+  // popup is used instead of <datalist>: native datalists filter by the
+  // selected value, so reopening one can hide every other choice.
+  const combo = (fieldName, list, placeholder) => {
+    const id = `combo_${a}_${fieldName}`;
+    const choices = (list || []).map((o, i) => {
+      const detail = [o.label !== o.value ? o.label : "", o.hint || ""].filter(Boolean).join(" — ");
+      return `<button type="button" class="freecombo-option" role="option" id="${esc(id)}_${i}" ` +
+        `data-combo-value="${esc(o.value)}"><b>${esc(o.value)}</b>` +
+        `${detail ? `<span>${esc(detail)}</span>` : ""}</button>`;
+    }).join("");
+    return `<div class="freecombo">` +
+      `<input class="freecombo-input" ${d(a, fieldName)} spellcheck="false" autocomplete="off" ` +
+      `role="combobox" aria-autocomplete="list" aria-haspopup="listbox" aria-expanded="false" ` +
+      `aria-controls="${esc(id)}" placeholder="${esc(placeholder)}">` +
+      `<button type="button" class="freecombo-toggle" aria-label="Show all suggestions" title="Show all suggestions">▾</button>` +
+      `<div class="freecombo-menu" id="${esc(id)}" role="listbox" hidden>${choices}` +
+      `<div class="freecombo-empty" hidden>No matching suggestions — you can still use the value you typed.</div></div></div>`;
+  };
+  if (field === "model") return `<div class="fld"><label>Model override (blank = default)</label>` +
+    combo("model", p.models, "blank = the CLI's default") +
+    `<div class="note">Any value the CLI accepts — aliases or full model names.</div></div>`;
+  if (field === "effort") return `<div class="fld"><label>Reasoning effort</label>` +
+    combo("effort", p.efforts, "blank = default") + `</div>`;
+  if (field === "permissionMode") return `<div class="fld"><label>Permission mode</label><select ${d(a, "permissionMode")}>` +
+    `<option value="auto">room default — Claude's default in Talk, accept edits in Work</option>` +
+    `<option value="plan">plan — read &amp; propose only, even in work rooms</option>` +
+    `<option value="acceptEdits">accept edits — ordinary project edits allowed; protected paths and commands may still prompt</option>` +
+    `<option value="bypassPermissions">full access — bypass ordinary Claude permission checks</option></select>` +
+    `<div class="note">An effective mode change starts a fresh Claude session; the transcript keeps the room history.</div>` +
+    `<div class="note danger">With Claude Code 2.1.126+, Full access includes protected paths such as .git and can reach outside this project. Explicit policy and OS limits may still apply. Claude recommends an isolated container or VM; using it directly on a trusted host grants host-level access.</div></div>`;
+  if (field === "sandbox") return `<div class="fld"><label>Sandbox</label><select ${d(a, "sandbox")}>` +
+    `<option value="read-only">read-only (default)</option><option value="workspace-write">workspace-write</option>` +
+    `<option value="danger-full-access">danger-full-access</option></select>` +
+    `<div class="note">Changing this restarts the seat's session.</div></div>`;
+  if (field === "extraArgs") return `<div class="fld"><label>Extra CLI args</label><input ${d(a, "extraArgs")} spellcheck="false"></div>`;
+  return "";
+}
+function setFreeComboOpen(combo, open, query = "") {
+  const input = combo.querySelector(".freecombo-input");
+  const menu = combo.querySelector(".freecombo-menu");
+  if (open) {
+    document.querySelectorAll(".freecombo.open").forEach((other) => {
+      if (other !== combo) setFreeComboOpen(other, false);
+    });
+  }
+  const needle = String(query).trim().toLowerCase();
+  let visible = 0;
+  combo.querySelectorAll(".freecombo-option").forEach((option) => {
+    const show = !needle || option.textContent.toLowerCase().includes(needle);
+    option.hidden = !show;
+    option.classList.remove("active");
+    option.classList.toggle("selected", option.dataset.comboValue === input.value);
+    if (show) visible++;
+  });
+  combo.querySelector(".freecombo-empty").hidden = visible > 0;
+  combo.classList.toggle("open", open);
+  menu.hidden = !open;
+  if (open) menu.scrollTop = 0;
+  input.setAttribute("aria-expanded", String(open));
+  input.removeAttribute("aria-activedescendant");
+}
+function chooseFreeCombo(option) {
+  const combo = option.closest(".freecombo");
+  const input = combo.querySelector(".freecombo-input");
+  input.value = option.dataset.comboValue;
+  input.dispatchEvent(new Event("change", { bubbles: true }));
+  setFreeComboOpen(combo, false);
+  input.focus();
+}
+$("seatCards").addEventListener("click", (e) => {
+  const toggle = e.target.closest(".freecombo-toggle");
+  if (toggle) {
+    const combo = toggle.closest(".freecombo");
+    const opening = !combo.classList.contains("open");
+    setFreeComboOpen(combo, opening, ""); // the arrow always shows the full list
+    if (opening) combo.querySelector(".freecombo-input").focus();
+    return;
+  }
+  const option = e.target.closest(".freecombo-option");
+  if (option) chooseFreeCombo(option);
+});
+$("seatCards").addEventListener("input", (e) => {
+  const input = e.target.closest(".freecombo-input");
+  if (input) setFreeComboOpen(input.closest(".freecombo"), true, input.value);
+});
+$("seatCards").addEventListener("keydown", (e) => {
+  const input = e.target.closest(".freecombo-input");
+  if (!input) return;
+  const combo = input.closest(".freecombo");
+  if (e.key === "Escape") {
+    if (combo.classList.contains("open")) {
+      e.preventDefault();
+      e.stopPropagation();
+      setFreeComboOpen(combo, false);
+    }
+    return;
+  }
+  if (e.key === "Enter") {
+    const active = combo.querySelector(".freecombo-option.active:not([hidden])");
+    if (active) { e.preventDefault(); chooseFreeCombo(active); }
+    return;
+  }
+  if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+  e.preventDefault();
+  if (!combo.classList.contains("open")) setFreeComboOpen(combo, true, "");
+  const options = [...combo.querySelectorAll(".freecombo-option:not([hidden])")];
+  if (!options.length) return;
+  const current = options.findIndex((option) => option.classList.contains("active"));
+  const next = current < 0
+    ? (e.key === "ArrowDown" ? 0 : options.length - 1)
+    : (current + (e.key === "ArrowDown" ? 1 : options.length - 1)) % options.length;
+  options.forEach((option, i) => option.classList.toggle("active", i === next));
+  input.setAttribute("aria-activedescendant", options[next].id);
+  options[next].scrollIntoView({ block: "nearest" });
+});
+document.addEventListener("click", (e) => {
+  if (!e.target.closest(".freecombo")) {
+    document.querySelectorAll(".freecombo.open").forEach((combo) => setFreeComboOpen(combo, false));
+  }
+});
+function renderSeatCards(s) {
+  $("seatCards").innerHTML = s.seats.map((a) => {
+    const p = s.providers[a] || {};
+    const ag = s.agents[a];
+    let f = (p.fields || []).map((field) => seatFieldHTML(a, field, p)).join("");
+    f += `<div class="fld"><label>Lurk assertiveness (when 👂 is on)</label><select data-seat="${esc(a)}" data-f="lurkStyle">` +
+      `<option value="quiet">quiet — only uncorrected errors</option>` +
+      `<option value="balanced">balanced — errors, real disagreements, critical caveats</option>` +
+      `<option value="vocal">vocal — anything with real signal</option></select></div>`;
+    f += `<div class="fld"><label>Custom lurk instruction (optional, overrides preset)</label>` +
+      `<input data-seat="${esc(a)}" data-f="lurkPrompt" placeholder="e.g. Interject whenever you disagree." spellcheck="false"></div>`;
+    const sess = ag.linked
+      ? `Session linked (${ag.sessionRef}…), seen through turn ${ag.cursor}.`
+      : "No session yet — next message starts one.";
+    return `<div class="mgroup"><h3><span class="agc" style="color:${seatColor(a)}">${esc(seatLabel(a))}</span> · ${esc(p.sub || "")}</h3>${f}<div class="sess">${sess}</div></div>`;
+  }).join("");
+  for (const a of s.seats) {
+    for (const el of document.querySelectorAll(`#seatCards [data-seat="${a}"][data-f]`)) {
+      const v = s.cfg.agents[a][el.dataset.f];
+      el.value = el.dataset.f === "extraArgs" ? (v || []).join(" ") : (v ?? "");
+    }
+  }
+}
+function openSettings() {
+  const s = state.summary; if (!s) return;
+  $("roomPath").textContent = s.dir;
+  $("mDelete").hidden = s.name === "default"; // the fallback room can't be removed
+  renderSeatCards(s);
+  $("s_projdir").value = s.cfg.projectDir || "";
+  $("s_roomnote").value = s.cfg.roomNote || "";
+  $("s_default").innerHTML = s.seats.map((x) => `<option>${esc(x)}</option>`).join("");
+  $("s_default").value = s.cfg.defaultAgent || s.seats[0];
+  $("s_timeout").value = Math.round((s.cfg.timeoutMs || 300000) / 1000);
+  $("s_maxhops").value = s.cfg.maxHops || 0;
+  $("s_pairrounds").value = s.cfg.pairRounds || 0;
+  $("overlay").classList.add("open");
+}
+$("settingsBtn").onclick = openSettings;
+$("settingsBtn2").onclick = openSettings;
+$("mCancel").onclick = () => $("overlay").classList.remove("open");
+$("overlay").addEventListener("click", (e) => { if (e.target === $("overlay")) $("overlay").classList.remove("open"); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") $("overlay").classList.remove("open"); });
+$("mSave").onclick = async () => {
+  const s = state.summary; if (!s) return;
+  const agents = {};
+  for (const a of s.seats) {
+    agents[a] = {};
+    for (const el of document.querySelectorAll(`#seatCards [data-seat="${a}"][data-f]`)) {
+      const f = el.dataset.f;
+      let v = el.value;
+      if (f === "extraArgs") v = v.trim() ? v.trim().split(/\s+/) : [];
+      else if (f === "command") v = v.trim() || undefined; // blank keeps the default
+      else if (typeof v === "string" && v.trim() === "") v = null;
+      if (v !== undefined) agents[a][f] = v;
+    }
+  }
+  if (agents.claude && s.cfg.agents.claude) {
+    const before = effectiveSeatPermission("claude", s.cfg.agents.claude, s.cfg.mode || "talk");
+    const afterCfg = { ...s.cfg.agents.claude, ...agents.claude };
+    const after = effectiveSeatPermission("claude", afterCfg, s.cfg.mode || "talk");
+    if (!isFullAccess(before) && isFullAccess(after)) {
+      const scope = $("s_projdir").value.trim() || "the room workspace";
+      const accepted = confirm(
+        `⚠ Give Claude Full access in this room?\n\n` +
+        `Claude will bypass its ordinary permission prompts and checks. With Claude Code 2.1.126+, it can modify protected paths such as .git; it can also run commands, use inherited credentials and network access, and change files outside:\n${scope}\n\n` +
+        `Explicit ask/deny rules, managed policy, OS permissions, and Claude's hard safety limits may still restrict actions.\n\n` +
+        `Parley requests separate Plan invocations for protected @both discussions, pair reviews, and lurk turns. They discard Claude's ordinary native session; the next ordinary turn is re-briefed from room history. Ordinary handoffs and pair-worker turns still receive Full access. Trusted external Claude settings or wrappers remain outside this boundary.\n\n` +
+        `Claude will start a fresh session. Claude recommends an isolated container or VM; continuing directly on this trusted host grants host-level access.`
+      );
+      if (!accepted) return;
+    }
+  }
+  try {
+    await api("/api/config", {
+      room: state.room,
+      config: {
+        defaultAgent: $("s_default").value,
+        timeoutMs: Math.max(10, Number($("s_timeout").value) || 300) * 1000,
+        maxHops: Math.min(8, Math.max(0, Number($("s_maxhops").value) || 0)),
+        pairRounds: Math.min(99, Math.max(0, Number($("s_pairrounds").value) || 0)),
+        projectDir: $("s_projdir").value.trim() || null,
+        roomNote: $("s_roomnote").value.trim() || null,
+        agents,
+      },
+    });
+    $("overlay").classList.remove("open");
+    toast("Settings saved.");
+  } catch (e) { toast(e.message, true); }
+};
+async function newConversation() {
+  if (!confirm("Archive this conversation and reset both agents' sessions?")) return;
+  try { await api("/api/new", { room: state.room }); $("overlay").classList.remove("open"); }
+  catch (e) { toast(e.message, true); }
+}
+// Rename/delete work on any room — the one you're viewing (Settings) or one
+// you hover in the sidebar — so both flows fetch the target's own details
+// before asking you to confirm.
+async function renameFlow(name) {
+  let info;
+  try { info = await api("/api/room?name=" + encodeURIComponent(name)); }
+  catch (e) { return toast(e.message, true); }
+  const to = prompt(`Rename "${name}" to:`, name);
+  if (to === null) return;
+  const t = to.trim();
+  if (!t || t === name) return;
+  const warn = info.room.cfg.projectDir
+    ? "" // linked rooms keep their working directory, so sessions survive
+    : `\n\nNote: the workspace folder moves with the room, so each agent starts a fresh session (the conversation is replayed to them from the transcript).`;
+  if (warn && !confirm(`Rename "${name}" → "${t}"?${warn}`)) return;
+  try {
+    const r = await api("/api/room/rename", { room: name, to: t });
+    $("overlay").classList.remove("open");
+    // Follow the successful response too: the SSE notification may have been
+    // missed while disconnected. The shared helper is idempotent if it arrived.
+    followRoomRename(name, r.name);
+    toast(`Renamed to "${r.name}".`);
+    await refreshRooms();
+  } catch (e) { toast(e.message, true); }
+}
+async function deleteFlow(name) {
+  let info;
+  try { info = await api("/api/room?name=" + encodeURIComponent(name)); }
+  catch (e) { return toast(e.message, true); }
+  const msgs = info.entries.filter((e) => e.kind === "user" || e.kind === "agent").length;
+  const where = info.room.cfg.projectDir
+    ? `\n\nYour linked project (${info.room.cfg.projectDir}) is NOT touched — only Parley's own folder for this room.`
+    : "\n\nThis includes the room's sandbox workspace and any files the agents made there.";
+  if (!confirm(`Delete room "${name}"?\n\n${msgs} message${msgs === 1 ? "" : "s"} and its transcript will be moved to .parley/.trash — recoverable from your file manager until you clear it.${where}`)) return;
+  try {
+    const r = await api("/api/room/delete", { room: name });
+    $("overlay").classList.remove("open");
+    toast(`"${name}" moved to .trash — restore or clear it from your file manager.`);
+    if (state.room === name) {
+      if (state.es) { state.es.close(); state.es = null; }
+      await loadRoom(r.rooms.length ? (r.rooms[0].name || r.rooms[0]) : "default");
+    } else {
+      await refreshRooms();
+    }
+  } catch (e) { toast(e.message, true); }
+}
+$("mRename").onclick = () => renameFlow(state.room);
+$("mDelete").onclick = () => deleteFlow(state.room);
+$("mDelete").hidden = false;
+$("newConvBtn").onclick = newConversation;
+$("mNewConv").onclick = newConversation;
+
+// ------------------------------------------------------------ boot
+loadRoom(state.room).catch((e) => toast(e.message, true));
+input.focus();
+</script>
+</body>
+</html>

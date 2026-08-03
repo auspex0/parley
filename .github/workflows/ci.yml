@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: smoke (${{ matrix.os }}, node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: ["20", "22"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Syntax check
+        run: |
+          node --check parley.mjs
+          node --check test/smoke.mjs
+          node --check test/fake-cli.mjs
+      # The suite drives a real server against fake agent CLIs, so it needs no
+      # provider login, no API keys and no network access.
+      - name: Smoke test
+        run: npm test
