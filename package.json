@@ -1,7 +1,7 @@
 {
-  "name": "parley",
+  "name": "@auspex0/parley",
   "version": "1.0.0",
-  "private": true,
+  "private": false,
   "description": "Parley — one local chat room shared by you, Claude (Claude Code CLI) and Codex (OpenAI Codex CLI), with a web UI, lurk mode and per-room talk/work modes.",
   "type": "module",
   "bin": {
@@ -15,6 +15,9 @@
     "test": "node test/smoke.mjs"
   },
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/auspex0/parley.git"
@@ -30,6 +33,7 @@
   "files": [
     "parley.mjs",
     "ui/",
+    "docs/parley-demo.gif",
     "README.md",
     "LICENSE"
   ]

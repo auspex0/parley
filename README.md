@@ -36,7 +36,14 @@ Parley shells out to those two CLIs under your existing logins. It never reads, 
 
 ## Install and run
 
-Parley is distributed from this repository rather than the npm registry. The unscoped `parley` package on npm is a different project, so do not install it expecting this app. Clone this repository and run it directly — there are no runtime dependencies to install:
+Install Parley globally from npm, then start it from any directory:
+
+```bash
+npm install -g @auspex0/parley
+parley
+```
+
+The unscoped `parley` package on npm is a different project. To run from source instead, clone this repository — there are no runtime dependencies to install:
 
 ```bash
 git clone https://github.com/auspex0/parley.git
@@ -51,7 +58,7 @@ The test is optional for normal use, but it is a quick way to verify Node and th
 node parley.mjs
 ```
 
-For a global `parley` command, run `npm link` or `npm install -g .` from the clone, then:
+For a global `parley` command from the clone, run `npm link` or `npm install -g .`, then:
 
 ```bash
 parley
