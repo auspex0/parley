@@ -25,7 +25,8 @@ const UI_FILE = path.join(__dirname, "ui", "index.html");
 // index.html on every refresh, so an updated UI could expose controls that the
 // already-running Node process did not understand.
 const UI_HTML = fs.readFileSync(UI_FILE, "utf8");
-const RUNTIME_PROTOCOL = "4";
+// 5: busyInfo provenance, queue snapshots with queueGroupId, scoped Stop.
+const RUNTIME_PROTOCOL = "5";
 const IS_WIN = process.platform === "win32";
 
 const IMAGE_TYPES = new Map([
@@ -210,6 +211,10 @@ function defaultState(seats = DEFAULT_SEATS) {
     lastAddressed: null,
     nextTurn: 1,
     lastUser: null, // { n, text, target, done: {agent:true}, pair:boolean }
+    // turn number -> seats whose delivery of it was cancelled before it ran.
+    // Persisted, because "nobody received this" has to stay true on every
+    // later turn, not just for the exchange that was cancelled.
+    cancelledDeliveries: {},
     pair: null,     // { worker, reviewer, rounds, roundsSource } while pair mode is on
     codexLastWarned: false,
     agents: Object.fromEntries(seats.map((s) => [s, {
@@ -496,6 +501,17 @@ function launchDetached(command, args, options = {}) {
 function runCli(spec, args, { cwd, timeoutMs, input, onLine, room, agent }) {
   return new Promise((resolve) => {
     if (spec.error) return resolve({ code: -1, stdout: "", stderr: spec.error, spawnError: true });
+    const run = room && agent ? room.runs.get(agent) : null;
+    // The final spawn boundary. A Stop that arrived while this turn was still
+    // staging had no process to kill, so it marked the run instead — and this
+    // is where the mark is honoured. The epoch check does the same job for
+    // Stop-everything, which draws its line without touching any single run.
+    if (run && (run.stopRequested || chainStopped(room, run.stopAt))) {
+      return resolve({
+        code: -1, stdout: "", stderr: "",
+        timedOut: false, stopped: true, spawnError: false,
+      });
+    }
     let child;
     try {
       child = spawn(spec.cmd, [...spec.pre, ...args], {
@@ -515,6 +531,13 @@ function runCli(spec, args, { cwd, timeoutMs, input, onLine, room, agent }) {
     }
     child.rtProcessGroup = !IS_WIN;
     if (room && agent) room.procs.set(agent, child);
+    if (run) {
+      run.child = child;
+      // Stop won the race by a hair: it marked the record between the boundary
+      // check above and the process existing. Honour it now that there is
+      // something to kill.
+      if (run.stopRequested) { child.rtStopped = true; killTree(child); }
+    }
 
     let stdout = "", stderr = "", buf = "", timedOut = false, spawnErr = null;
     const timer = setTimeout(() => { timedOut = true; killTree(child); }, timeoutMs || 300000);
@@ -534,6 +557,7 @@ function runCli(spec, args, { cwd, timeoutMs, input, onLine, room, agent }) {
     child.on("close", (code) => {
       clearTimeout(timer);
       if (room && agent && room.procs.get(agent) === child) room.procs.delete(agent);
+      if (run && run.child === child) run.child = null;
       if (buf.trim() && onLine) { try { onLine(buf.trim()); } catch { /* ignore */ } }
       resolve({
         code: spawnErr ? -1 : code,
@@ -573,10 +597,14 @@ function historyTail(room, agent, maxChars = 6000, maxEntries = 40) {
     const e = room.entries[i];
     if (e.kind !== "user" && e.kind !== "agent") continue;
     if (!(e.n <= cur || e.author === agent)) continue;
-    const textLine = e.kind === "user"
-      ? `user (to ${e.target === "both" ? "both" : e.target === agent ? "you" : e.target}): ${e.text}`
-      : `${e.author === agent ? "you" : e.author}: ${e.text}`;
-    const attached = attachmentPromptLines(room, [e]);
+    const textLine = withdrawnFrom(room, agent, e)
+      ? withdrawalLine(room, agent, e)
+      : e.kind === "user"
+        ? `${withdrawalNote(room, agent, e)}user (to ${e.target === "both" ? "both" : e.target === agent ? "you" : e.target}): ${e.text}`
+        : `${e.author === agent ? "you" : e.author}: ${e.text}`;
+    // Same rule as the delta: a withheld message contributes no attachment
+    // metadata either. Names, MIME types and sizes are contents.
+    const attached = withdrawnFrom(room, agent, e) ? [] : attachmentPromptLines(room, [e]);
     const fullLine = textLine + (attached.length ? `\n${attached.join("\n")}` : "");
     const line = fullLine.length > perEntryChars
       ? truncate(fullLine, perEntryChars - 2)
@@ -988,8 +1016,14 @@ function loadRoom(name, seatChoice, create = false) {
     // session is saved. In-memory only: a restart has no in-flight turns to
     // fence. See applyAdapterSession.
     cfgEpoch: {},
-    busy: new Map(),      // agent -> { startedAt }
+    busy: new Map(),      // agent -> { startedAt, runId }
     procs: new Map(),     // agent -> child process
+    // agent -> the run record that owns the seat right now. Unlike `procs`,
+    // this exists from the instant the seat is claimed, so a Stop pressed
+    // while a turn is still staging has something to mark. See beginRun.
+    runs: new Map(),
+    runSeq: 1,
+    dispatchSeq: 1,       // one id per accepted dispatch — the queue's cancel scope
     clients: new Set(),   // SSE responses
     // One arrival-ordered queue of accepted user work per room: whole messages
     // queued behind a busy seat, and held halves of a split @both. See the
@@ -1256,7 +1290,10 @@ function textishAttachment(ref, bytes) {
 }
 
 function stageProviderInputs(room, agent, entries, imageBudget) {
-  const ordered = entries || [];
+  // Attachments on a message this seat never received are not staged at all —
+  // no disposable copy, no path in the prompt, no inline preview. Withholding
+  // the text while still handing over the file would withhold nothing.
+  const ordered = (entries || []).filter((e) => !withdrawnFrom(room, agent, e));
   const selected = nativeFiles(room, ordered, imageBudget);
   if (!selected.length) {
     return { dir: null, paths: new Map(), inline: new Map(), images: [], cleanup() {} };
@@ -1365,27 +1402,221 @@ function roomSummary(room) {
     // ordinary hop and lurk chain as much as a pair cycle.
     working: !!room.pairActive || room.exchanges > 0,
     busy: [...room.busy.keys()],
+    // Provenance rides alongside `busy` rather than replacing it: too much
+    // already asks `busy.includes(agent)`, and those call sites only want the
+    // yes/no. Anything that wants to show *what* a seat is answering reads
+    // busyInfo, which is the same set with the answer attached.
+    busyInfo: busyInfo(room),
+    // Per-seat, durable, and ahead of every receipt: a later high-water receipt
+    // spans a withdrawn entry, so without this the UI cheerfully reports that
+    // the seat caught up on a message it was never shown.
+    cancelledDeliveries: { ...(room.state.cancelledDeliveries || {}) },
     queued: queueSize(room),
+    // `queued` counts deliveries, which is what the lanes owe; one @both held
+    // for both seats is two of them. Anything the user reads has to count
+    // messages instead, or a single held @both reads as "2 queued messages".
+    queuedDispatches: queuedDispatchCount(room),
+    queue: queueSnapshot(room),
     canRetry: retryTargets(room).length > 0,
   };
 }
 
 // ---------------------------------------------------------------- turn engine
 
+// ---- run records ----
+// One record per turn a seat is running, created in the same tick as
+// `busy.set` and living until the seat is released. It exists so Stop has
+// something stable to name and to aim at:
+//
+//   - Identity. Every response gets a runId, so a click can say which response
+//     it meant. A click that lands after that response ended stops nothing
+//     instead of killing whatever started next.
+//   - Ownership. The record knows its exchange, so a scoped Stop can end that
+//     exchange without drawing a room-wide line through unrelated ones.
+//   - A single place to mark. Killing goes through the record rather than the
+//     process table, which is empty both before spawn and after the CLI exits
+//     while the turn is still writing its reply. Staging is synchronous today,
+//     so the pre-spawn half of that is not currently reachable; the check in
+//     runCli is there to keep it unreachable if staging ever grows an await.
+function beginRun(room, agent, { phase, startedAt, rootN = null, sourceN = null, queueGroupId = null, chain = null }) {
+  const run = {
+    runId: `r${room.runSeq++}`,
+    agent, phase, startedAt, queueGroupId, chain,
+    rootN: rootN === undefined ? null : rootN,
+    sourceN: sourceN === undefined ? null : sourceN,
+    // The epoch this turn was accepted under. Stop-everything moves the room
+    // past it, and the spawn boundary reads it — that is what catches work
+    // that was still staging when the line was drawn.
+    stopAt: room.stopEpoch,
+    stopRequested: false,
+    child: null,
+  };
+  room.busy.set(agent, { startedAt, runId: run.runId });
+  room.runs.set(agent, run);
+  broadcast(room, {
+    type: "status", agent, phase, startedAt,
+    runId: run.runId, ...runProvenance(room, run),
+  });
+  return run;
+}
+
+function endRun(room, agent, run) {
+  if (room.runs.get(agent) === run) room.runs.delete(agent);
+}
+
+function entrySnippet(entry, max = 160) {
+  const text = String((entry && entry.text) || "").replace(/\s+/g, " ").trim();
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+// What a running turn is answering, in a shape the client can render without
+// looking anything up — it may have reloaded mid-run, or the entry may sit in
+// collapsed scrollback. `sourceN` is the immediate trigger (the user message,
+// the reply that mentioned this seat); `rootN` is the user turn the whole
+// exchange hangs off, and is null when there isn't one.
+function runProvenance(room, run) {
+  const src = run.sourceN === null || run.sourceN === undefined
+    ? null : room.entries.find((e) => e.n === run.sourceN) || null;
+  return {
+    rootN: run.rootN, sourceN: run.sourceN,
+    // Sibling dispatches from one message share a rootN, so matching running
+    // rows on that alone makes both cards claim the same run. The dispatch id
+    // is what actually identifies whose work this is.
+    queueGroupId: run.queueGroupId || null,
+    source: src ? {
+      n: src.n, kind: src.kind, author: src.author,
+      target: src.target || null, ts: src.ts, text: entrySnippet(src),
+    } : null,
+  };
+}
+
+function busyInfo(room) {
+  return [...room.runs.values()].map((run) => ({
+    agent: run.agent, runId: run.runId, phase: run.phase,
+    startedAt: run.startedAt, ...runProvenance(room, run),
+  }));
+}
+
+// A cancellation notice is the one system entry agents must see. Everything
+// else system-authored is Parley talking to the user, but this changes the
+// meaning of a message a seat may already have read and acted on — the
+// delivered half of a split @both is past that entry's turn number and would
+// otherwise never learn its sibling was withdrawn.
+function isCancellationNotice(e) {
+  return e.kind === "system" && !!(e.meta && e.meta.cancelledQueue);
+}
+
+// New notices preserve the source-to-seat relationship. Keep a legacy fallback
+// for transcripts written by protocol 5's first implementation, which stored
+// the two columns as independent unions.
+function cancellationWithdrawals(e) {
+  const meta = (e && e.meta) || {};
+  if (Array.isArray(meta.withdrawals)) {
+    return meta.withdrawals.flatMap((record) => {
+      if (!record || record.sourceN === undefined || record.sourceN === null) return [];
+      const agents = [...new Set((Array.isArray(record.agents) ? record.agents : []).map(String))];
+      return agents.length ? [{ sourceN: record.sourceN, agents }] : [];
+    });
+  }
+  const agents = [...new Set((Array.isArray(meta.agents) ? meta.agents : []).map(String))];
+  return (Array.isArray(meta.sourceNs) ? meta.sourceNs : [])
+    .filter((sourceN) => sourceN !== undefined && sourceN !== null)
+    .map((sourceN) => ({ sourceN, agents }));
+}
+
+// …but only while each source/seat pair is still true. Retry can clear one
+// message or one seat while another record from the same Cancel-all remains.
+// Intersecting at render time keeps the append-only transcript truthful without
+// relaying a superseded withdrawal to a native session.
+function liveCancellationWithdrawals(room, e) {
+  return cancellationWithdrawals(e).flatMap((record) => {
+    const live = new Set(cancelledFor(room, record.sourceN));
+    const agents = record.agents.filter((agent) => live.has(agent));
+    return agents.length ? [{ sourceN: record.sourceN, agents }] : [];
+  });
+}
+
+function isLiveCancellationNotice(room, e) {
+  return isCancellationNotice(e) && liveCancellationWithdrawals(room, e).length > 0;
+}
+
 function deltaEntries(room, agent, excludeTurn) {
   const cur = room.state.agents[agent].cursor;
   return room.entries.filter((e) =>
-    e.n > cur && e.n !== excludeTurn && e.kind !== "system" && e.author !== agent);
+    e.n > cur && e.n !== excludeTurn && e.author !== agent &&
+    (e.kind !== "system" || isLiveCancellationNotice(room, e)));
+}
+
+// Which seats never got a message, because the user cancelled it while it was
+// still queued. Read from state rather than the entry, since entries are an
+// append-only log and this fact arrives after the entry was written.
+function cancelledFor(room, n) {
+  const map = room.state.cancelledDeliveries || {};
+  const seats = map[String(n)];
+  return Array.isArray(seats) ? seats : [];
+}
+
+// A cancelled message cannot simply vanish from the delta: the entry is in the
+// shared transcript because the user really did send it, and dropping it
+// outright would advance the seat's cursor past something it was never shown.
+//
+// So the seat it was withdrawn from gets a placeholder and nothing else — no
+// body, no attachment lines, no staged bytes. "Never received it" has to mean
+// never received it; relaying the text with a note attached would hand the
+// agent the whole message and rely on it choosing not to read it. Seats that
+// *did* receive it keep the message in full and are simply told who did not.
+function withdrawnFrom(room, agent, e) {
+  return e.kind === "user" && cancelledFor(room, e.n).includes(agent);
+}
+function withdrawalLine(room, agent, e) {
+  const to = e.target === "both" ? "both" : e.target === agent ? "you" : e.target;
+  return `(the user sent a message to ${to} here and cancelled it before it was delivered — ` +
+    `its contents were withheld from you)`;
+}
+function withdrawalNote(room, agent, e) {
+  const seats = cancelledFor(room, e.n).filter((seat) => seat !== agent);
+  return seats.length
+    ? `(the user cancelled delivery of this message to ${seats.join(" and ")} before it started) `
+    : "";
+}
+
+// Rendered per source and per seat, because the notice must neither reveal a
+// withheld message nor tell a seat whose own delivery ran to disregard it.
+// `explained` prevents repeating what an original entry or placeholder in this
+// same delta already said, without hiding an unrelated record from the batch.
+function cancellationNoticeLines(room, agent, e, explained) {
+  const lines = [];
+  for (const record of liveCancellationWithdrawals(room, e)) {
+    if (explained.has(record.sourceN)) continue;
+    const which = `message #${record.sourceN}`;
+    if (record.agents.includes(agent)) {
+      lines.push(`(the user cancelled delivery of ${which} to you before it started — its contents were withheld from you)`);
+    } else {
+      lines.push(`(the user cancelled delivery of ${which} to ${record.agents.join(" and ")} before it started; ` +
+        `${record.agents.join(" and ")} did not receive it)`);
+    }
+    explained.add(record.sourceN);
+  }
+  return lines;
 }
 
 function buildDelta(room, agent, excludeTurn, entries = deltaEntries(room, agent, excludeTurn), attachmentContext = null) {
   const lines = [];
+  const explained = new Set(); // turns this delta already explained as cancelled
   for (const e of entries) {
     if (e.kind === "activity") {
       lines.push(`(${e.author} did: ${e.text})`);
+    } else if (isCancellationNotice(e)) {
+      lines.push(...cancellationNoticeLines(room, agent, e, explained));
+    } else if (withdrawnFrom(room, agent, e)) {
+      lines.push(withdrawalLine(room, agent, e));
+      explained.add(e.n);
+      continue; // no body and no attachments: this seat never received either
     } else if (e.kind === "user") {
       const to = e.target === "both" ? "both" : e.target === agent ? "you" : e.target;
-      lines.push(`user (to ${to}): ${e.text}`);
+      const note = withdrawalNote(room, agent, e);
+      if (note) explained.add(e.n);
+      lines.push(`${note}user (to ${to}): ${e.text}`);
     } else {
       lines.push(`${e.author}: ${e.text}`);
     }
@@ -1423,8 +1654,12 @@ const STEP_STOPPED = Symbol("step-stopped");
 async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) {
   const startedAt = Date.now();
   const gen = room.generation;
-  room.busy.set(agent, { startedAt });
-  broadcast(room, { type: "status", agent, phase: "start", startedAt });
+  // An ordinary turn answers the user message directly, so the immediate
+  // trigger and the root of the exchange are the same entry.
+  const run = beginRun(room, agent, {
+    phase: "start", startedAt, rootN: userTurn.n, sourceN: userTurn.n,
+    queueGroupId: opts.queueGroupId || null, chain: opts.chain || null,
+  });
   const onStream = (text) => broadcast(room, { type: "stream", agent, text });
   const onActivity = (label) => {
     if (gen === room.generation) appendEntry(room, { kind: "activity", author: agent, text: label }, { md: false });
@@ -1472,7 +1707,7 @@ async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) 
         // Native session lost — start fresh, tell the agent to consult the transcript.
         room.state.agents[agent].sessionRef = null;
         saveState(room);
-        broadcast(room, { type: "status", agent, phase: "retrying", startedAt });
+        broadcast(room, { type: "status", agent, phase: "retrying", startedAt, runId: run.runId, ...runProvenance(room, run) });
         turnScope = scopeNow();
         prompt = turnScope.discussion ? `${basePrompt}\n\n${DISCUSSION_NOTE}` : basePrompt;
         const b2 = resetRecoveryBriefing(room, agent);
@@ -1497,6 +1732,10 @@ async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) 
         // This seat was busy when the message arrived, so its answer lands
         // after the other seat's — and it saw that answer in its delta.
         ...(opts.deferred ? { deferred: true } : {}),
+        // The provenance the live bubble showed, kept on the finished entry so
+        // the quote header stays in scrollback instead of vanishing with the
+        // bubble it was rendered in.
+        replyTo: userTurn.n,
         ...(res.usage ? { tokens: res.usage } : {}),
       },
     });
@@ -1525,7 +1764,7 @@ async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) 
     return e.stopped && opts.signalStop ? STEP_STOPPED : null;
   } finally {
     if (providerInputs) providerInputs.cleanup();
-    releaseSeat(room, agent);
+    releaseSeat(room, agent, run);
   }
 }
 
@@ -1548,15 +1787,24 @@ function lurkInstruction(cfgAgent) {
 }
 const LURK_PASS = /^[\s\W]*pass[\s\W]*$/i;
 
-async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE) {
+async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE, opts = {}) {
   const startedAt = Date.now();
   const gen = room.generation;
   const heardFrom = room.state.agents[agent].cursor;
   const unseen = deltaEntries(room, agent, -1);
   if (!unseen.length) return;
   const lastSeen = room.entries.length ? room.entries[room.entries.length - 1].n : 0;
-  room.busy.set(agent, { startedAt });
-  broadcast(room, { type: "status", agent, phase: "listening", startedAt });
+  // A lurker reacts to the exchange, so the immediate trigger is the last
+  // thing it overheard, while the root stays the user message that started it.
+  const run = beginRun(room, agent, {
+    phase: "listening", startedAt,
+    rootN: userTurnN > 0 ? userTurnN : null,
+    // The last thing it actually overheard someone say. A cancellation notice
+    // rides in the same delta but is Parley speaking, not a participant, so it
+    // makes a poor "replying to" target.
+    sourceN: (unseen.filter((e) => e.kind !== "system").pop() || unseen[unseen.length - 1]).n,
+    chain: opts.chain || null,
+  });
   const onStream = (text) => broadcast(room, { type: "stream", agent, text });
   const onActivity = (label) => {
     if (gen === room.generation) appendEntry(room, { kind: "activity", author: agent, text: label }, { md: false });
@@ -1610,18 +1858,34 @@ async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE) {
     } else {
       entry = appendEntry(room, {
         kind: "agent", author: agent, text: res.text,
-        meta: { durationMs: Date.now() - startedAt, lurk: true, ...(res.usage ? { tokens: res.usage } : {}) },
+        meta: {
+          durationMs: Date.now() - startedAt, lurk: true,
+          replyTo: run.sourceN, ...(run.rootN !== null && run.rootN !== run.sourceN ? { replyRoot: run.rootN } : {}),
+          ...(res.usage ? { tokens: res.usage } : {}),
+        },
       });
     }
     appendReceipt(room, { agent, from: heardFrom, upTo: lastSeen, turn: userTurnN, mode: "lurk", spoke: !passed });
     return entry;
   } catch (e) {
     if (gen !== room.generation) return null;
+    // A lurker you stopped is not a lurker that broke. Ordinary and hop turns
+    // already say this with a neutral ⏹ entry; routing a deliberate Stop down
+    // the lurk-error whisper instead put an error in front of the user for
+    // something they asked for.
+    if (e.stopped) {
+      appendEntry(room, {
+        kind: "system", author: "system",
+        text: `⏹ ${e.message}`,
+        meta: { agent, error: false, stopped: true, lurk: true },
+      });
+      return null;
+    }
     broadcast(room, { type: "lurk", agent, spoke: false, error: truncate(e.message, 200) });
     return null;
   } finally {
     if (providerInputs) providerInputs.cleanup();
-    releaseSeat(room, agent);
+    releaseSeat(room, agent, run);
   }
 }
 
@@ -1658,19 +1922,31 @@ function findHopTarget(room, entry, opts = {}) {
 // A hop waits for the seat's running turn *and* for any user delivery held for
 // it: the user asked first, so their message must not be answered after a
 // follow-up the agents generated between themselves.
-async function waitForHopSeat(room, agent, gen, stopAt) {
+async function waitForHopSeat(room, agent, gen, chain) {
   const deadline = Date.now() + seatTimeout(room, agent) + 5000;
   while (seatOccupied(room, agent)) {
-    if (gen !== room.generation || chainStopped(room, stopAt)) return false;
+    if (gen !== room.generation || chainHalted(room, chain)) return false;
     if (Date.now() > deadline) return false;
     await new Promise((resolve) => setTimeout(resolve, 150));
   }
-  return gen === room.generation && !chainStopped(room, stopAt);
+  return gen === room.generation && !chainHalted(room, chain);
 }
 
 // True once Stop all has been pressed since this chain began. Compared against
 // the epoch the chain captured at kickoff, so a later message cannot clear it.
 function chainStopped(room, stopAt) { return room.stopEpoch !== stopAt; }
+
+// An exchange carries its own record of why it might stop. Two different
+// reasons, and they must stay separate: the room-wide line Stop-everything
+// draws (the epoch) ends every chain at once, while a scoped Stop singles out
+// the exchanges it actually named and must leave the rest — including a
+// replacement response that started a moment ago — completely alone.
+function newChain(room) {
+  return { stopAt: room.stopEpoch, halted: false, delivered: 0, cancelled: 0 };
+}
+function chainHalted(room, chain) {
+  return !!chain.halted || room.stopEpoch !== chain.stopAt;
+}
 
 // Was this user turn protected by the @both no-edit boundary? Read from the
 // durable record rather than inferred, so a turn accepted by an older build —
@@ -1718,8 +1994,15 @@ const HOP_FAILED = Symbol("hop-failed");
 async function runHopTurn(room, agent, triggerEntry, rootN, scope = NO_SCOPE, opts = {}) {
   const startedAt = Date.now();
   const gen = room.generation;
-  room.busy.set(agent, { startedAt });
-  broadcast(room, { type: "status", agent, phase: opts.phase || "hop", startedAt });
+  // A hop, review or fix answers one specific reply, which is rarely the user
+  // message the exchange started from — so the immediate trigger and the root
+  // come apart here, and both are reported.
+  const run = beginRun(room, agent, {
+    phase: opts.phase || "hop", startedAt,
+    rootN: rootN === undefined ? null : rootN,
+    sourceN: triggerEntry.n,
+    chain: opts.chain || null,
+  });
   const onStream = (text) => broadcast(room, { type: "stream", agent, text });
   const onActivity = (label) => {
     if (gen === room.generation) appendEntry(room, { kind: "activity", author: agent, text: label }, { md: false });
@@ -1739,7 +2022,10 @@ async function runHopTurn(room, agent, triggerEntry, rootN, scope = NO_SCOPE, op
     // the root attachment block separately only after that cursor has moved
     // past it; otherwise a large inline preview would be duplicated.
     const rootInDelta = !!rootEntry && unseen.some((entry) => entry.n === rootEntry.n);
-    const rootAttachments = rootEntry && !rootInDelta
+    // A root this seat never received carries nothing for it — not even the
+    // "not staged in this invocation" line, which would imply the attachment
+    // was merely crowded out rather than withheld.
+    const rootAttachments = rootEntry && !rootInDelta && !withdrawnFrom(room, agent, rootEntry)
       ? attachmentPromptLines(room, [rootEntry], providerInputs) : [];
     const images = providerInputs.images;
     const head = delta.length ? `[Room activity since your last turn]\n${delta.join("\n")}\n[End of room activity]\n\n` : "";
@@ -1788,7 +2074,12 @@ async function runHopTurn(room, agent, triggerEntry, rootN, scope = NO_SCOPE, op
     } else {
       entry = appendEntry(room, {
         kind: "agent", author: agent, text: res.text,
-        meta: { durationMs: Date.now() - startedAt, hop: true, ...(opts.meta || {}), ...(res.usage ? { tokens: res.usage } : {}) },
+        meta: {
+          durationMs: Date.now() - startedAt, hop: true,
+          replyTo: triggerEntry.n,
+          ...(run.rootN !== null && run.rootN !== triggerEntry.n ? { replyRoot: run.rootN } : {}),
+          ...(opts.meta || {}), ...(res.usage ? { tokens: res.usage } : {}),
+        },
       });
     }
     appendReceipt(room, {
@@ -1816,7 +2107,7 @@ async function runHopTurn(room, agent, triggerEntry, rootN, scope = NO_SCOPE, op
     return opts.signalFailure ? HOP_FAILED : null;
   } finally {
     if (providerInputs) providerInputs.cleanup();
-    releaseSeat(room, agent);
+    releaseSeat(room, agent, run);
   }
 }
 
@@ -1938,13 +2229,13 @@ function pausePairAfterFailure(room, pair, rootN, agent, step) {
 // already been told, by the reset event and by the stopped turn respectively.
 // Stop must also leave Retry alone: reconstructing this cycle's root would
 // rewind past anything the user sent while it was waiting.
-async function awaitSeat(room, agent, pair, rootN, gen, step, stopAt) {
+async function awaitSeat(room, agent, pair, rootN, gen, step, chain) {
   const limit = Number(process.env.PARLEY_SEAT_WAIT_MS) ||
     Math.max(seatTimeout(room, pair.worker), seatTimeout(room, pair.reviewer)) + 60000;
   const deadline = Date.now() + limit;
   while (room.busy.has(agent)) {
     if (gen !== room.generation) return false;
-    if (chainStopped(room, stopAt)) return false;
+    if (chainHalted(room, chain)) return false;
     if (Date.now() > deadline) {
       makePairRetryable(room, rootN, pair);
       appendEntry(room, {
@@ -1958,26 +2249,26 @@ async function awaitSeat(room, agent, pair, rootN, gen, step, stopAt) {
     await new Promise((r) => setTimeout(r, 500));
   }
   if (gen !== room.generation) return false;
-  if (chainStopped(room, stopAt)) return false;
+  if (chainHalted(room, chain)) return false;
   return true;
 }
 
 // review → fix → review …, starting from a piece of the worker's output.
 // `offset` keeps round numbering honest when the loop is resumed.
-async function pairReviewLoop(room, pair, trigger, rootN, gen, offset = 0, stopAt = room.stopEpoch) {
+async function pairReviewLoop(room, pair, trigger, rootN, gen, offset = 0, chain = newChain(room)) {
   const { worker, reviewer, rounds } = pair;
   const limited = rounds > 0;                       // a cap you asked for
   const cap = limited ? rounds : PAIR_SAFETY_ROUNDS; // otherwise: runaway guard
   for (let r = 1; r <= cap && trigger; r++) {
-    if (!(await awaitSeat(room, reviewer, pair, rootN, gen, "review", stopAt))) return;
+    if (!(await awaitSeat(room, reviewer, pair, rootN, gen, "review", chain))) return;
     const review = await runHopTurn(room, reviewer, trigger, rootN, NO_SCOPE, {
       instruction: pairReviewNote(offset + r, limited ? offset + cap : "until approved", worker),
       meta: { pair: "review", round: offset + r, rootN },
-      phase: "review",
+      phase: "review", chain,
       signalFailure: true,
       readOnly: true,
     });
-    if (gen !== room.generation || chainStopped(room, stopAt)) return;
+    if (gen !== room.generation || chainHalted(room, chain)) return;
     if (review === STEP_STOPPED) return;
     if (review === HOP_FAILED) {
       pausePairAfterFailure(room, pair, rootN, reviewer, "review");
@@ -2003,14 +2294,14 @@ async function pairReviewLoop(room, pair, trigger, rootN, gen, offset = 0, stopA
       });
       return;
     }
-    if (!(await awaitSeat(room, worker, pair, rootN, gen, "fix", stopAt))) return;
+    if (!(await awaitSeat(room, worker, pair, rootN, gen, "fix", chain))) return;
     trigger = await runHopTurn(room, worker, review, rootN, NO_SCOPE, {
       instruction: pairFixNote(reviewer),
       meta: { pair: "fix", round: offset + r, rootN },
-      phase: "fix",
+      phase: "fix", chain,
       signalFailure: true,
     });
-    if (gen !== room.generation || chainStopped(room, stopAt)) return;
+    if (gen !== room.generation || chainHalted(room, chain)) return;
     if (trigger === STEP_STOPPED) return;
     if (trigger === HOP_FAILED) {
       pausePairAfterFailure(room, pair, rootN, worker, "fix");
@@ -2021,16 +2312,16 @@ async function pairReviewLoop(room, pair, trigger, rootN, gen, offset = 0, stopA
 
 // One work-then-review cycle for a single user message. The mode itself
 // (room.state.pair) outlives this and keeps applying to later messages.
-async function runPairCycle(room, userTurn, pair, gen, stopAt) {
+async function runPairCycle(room, userTurn, pair, gen, chain) {
   const active = beginPairWork(room, pair, gen, userTurn.n);
   try {
     const work = await runAgentTurn(room, active.worker, userTurn, NO_SCOPE, {
-      signalStop: true,
+      signalStop: true, chain,
     }); // the work itself
     if (work === STEP_STOPPED) return;
-    if (work && gen === room.generation && !chainStopped(room, stopAt)) {
-      await pairReviewLoop(room, active, work, userTurn.n, gen, 0, stopAt);
-    } else if (!work && gen === room.generation && !chainStopped(room, stopAt)) {
+    if (work && gen === room.generation && !chainHalted(room, chain)) {
+      await pairReviewLoop(room, active, work, userTurn.n, gen, 0, chain);
+    } else if (!work && gen === room.generation && !chainHalted(room, chain)) {
       makePairRetryable(room, userTurn.n, active);
     }
   } finally {
@@ -2064,7 +2355,7 @@ async function continuePair(room) {
     lastReview.n;
 
   const gen = room.generation;
-  const stopAt = room.stopEpoch;
+  const chain = newChain(room);
   const active = beginPairWork(room, pair, gen, rootN);
   (async () => {
     try {
@@ -2072,17 +2363,17 @@ async function continuePair(room) {
         instruction: pairFixNote(active.reviewer),
         meta: { pair: "fix", round: offset + 1, rootN },
         phase: "fix",
-        signalFailure: true,
+        signalFailure: true, chain,
       });
       // Stop-all is observed through the chain epoch, while a per-seat Stop is
       // the distinct STEP_STOPPED result. Both must be handled before failure,
       // or Retry is handed this cycle's old root and rewinds past newer work.
-      if (gen !== room.generation || chainStopped(room, stopAt)) return;
+      if (gen !== room.generation || chainHalted(room, chain)) return;
       if (fix === STEP_STOPPED) return;
       if (fix === HOP_FAILED) {
         pausePairAfterFailure(room, active, rootN, active.worker, "fix");
       } else if (fix) {
-        await pairReviewLoop(room, active, fix, rootN, gen, offset, stopAt);
+        await pairReviewLoop(room, active, fix, rootN, gen, offset, chain);
       }
     } finally {
       finishPairWork(room, active, gen);
@@ -2220,18 +2511,33 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles) {
   };
   saveState(room);
   const scope = makeScope(room, userTurn.n, effectiveTarget, discussion);
+  // One id per accepted dispatch, not per message: a message that produces a
+  // second batch later gets a second id, so cancelling one never reaches the
+  // other. The queue view groups rows by it and hangs the ✕ off it.
+  const queueGroupId = `d${room.dispatchSeq++}`;
+  // One chain object per dispatch, shared by its runs and its queued items, so
+  // a scoped Stop can end exactly this exchange. `delivered`/`cancelled` count
+  // what the dispatch actually got to do, which is how a cancelled queue entry
+  // ends its own chain without ending one a sibling seat is already running.
+  const chain = newChain(room);
+  const dispatch = { queueGroupId, chain };
 
   if (asPairTurn) {
     const gen = room.generation;
-    const stopAt = room.stopEpoch;
     // The roles and round cap are snapshotted here, at acceptance, so a queued
     // cycle runs the pairing the user actually asked for even if /pair start
     // switches the worker while it waits.
     const snap = pairSnapshot(room, pair);
-    const start = () => runPairCycle(room, userTurn, snap, gen, stopAt);
+    // Read the epoch when the cycle actually starts, not when it was accepted:
+    // a queued cycle that survives a "keep queued work" stop runs under the
+    // line drawn behind it.
+    const start = () => runPairCycle(room, userTurn, snap, gen, chain);
     if (room.pairActive || allSeats.some((a) => seatOccupied(room, a))) {
       enqueue(room, {
-        kind: "cycle", agents: [...allSeats], pairTurn: true, gen, stopAt,
+        kind: "cycle", agents: [...allSeats], pairTurn: true, gen,
+        stopAt: chain.stopAt, chain,
+        queueGroupId, sourceN: userTurn.n, target: effectiveTarget,
+        snippet: entrySnippet(userTurn), ts: userTurn.ts || null,
         run: start,
         // Nothing to undo: this cycle never started, and the snapshot taken
         // when it was accepted is still in lastUser if nothing newer arrived.
@@ -2246,7 +2552,6 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles) {
   }
 
   const gen = room.generation;
-  const stopAt = room.stopEpoch;
   // An exchange is in flight from here until the chain closes, including the
   // gaps between its turns where no seat is busy. A hop launches a new process
   // in one of those gaps, so anything that must not change underneath a single
@@ -2259,10 +2564,17 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles) {
     // kinds are awaited here, so the hop and lurk chain below still runs
     // exactly once, after every addressed seat has had its say — or failed, or
     // been stopped.
-    const results = await Promise.allSettled(agents.map((a) => deferred.has(a)
-      ? deferDelivery(room, a, userTurn, scope)
-      : runAgentTurn(room, a, userTurn, scope)));
+    const results = await Promise.allSettled(agents.map((a) => {
+      if (deferred.has(a)) return deferDelivery(room, a, userTurn, scope, dispatch);
+      chain.delivered++;
+      return runAgentTurn(room, a, userTurn, scope, { queueGroupId, chain });
+    }));
     if (gen !== room.generation) return;
+    // Every delivery this message owed was cancelled before it ran, so there is
+    // no exchange to continue: no hops, and no lurk check either — a lurker
+    // chiming in about a message the user cancelled is the whole bug. A split
+    // @both whose other half already ran keeps its chain.
+    if (chain.cancelled && !chain.delivered) return;
     const invoked = new Set(agents);
 
     // Bounded exchange loop. maxHops budgets agent-triggered follow-ups —
@@ -2280,7 +2592,7 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles) {
     queue.sort((a, b) => a.n - b.n); // follow the order the replies appeared in chat
 
     const drainMentions = async () => {
-      while (queue.length && !chainStopped(room, stopAt)) {
+      while (queue.length && !chainHalted(room, chain)) {
         const trigger = queue.shift();
         const target = findHopTarget(room, trigger, { allowPlain });
         if (!target) continue;
@@ -2290,19 +2602,19 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles) {
         // seen yet — a later reply, a chime — still hops normally.
         if (deferred.has(target) && room.state.agents[target].cursor >= trigger.n) continue;
         if (hops >= maxHops) { capped = true; return; }
-        if (seatOccupied(room, target) && !(await waitForHopSeat(room, target, gen, stopAt))) {
+        if (seatOccupied(room, target) && !(await waitForHopSeat(room, target, gen, chain))) {
           broadcast(room, { type: "lurk", agent: target, spoke: false, skipped: true });
           continue;
         }
         hops++;
-        const reply = await runHopTurn(room, target, trigger, userTurn.n, scope);
+        const reply = await runHopTurn(room, target, trigger, userTurn.n, scope, { chain });
         if (gen !== room.generation) return;
         invoked.add(target);
         if (reply) queue.push(reply);
       }
     };
     await drainMentions();
-    if (gen !== room.generation || chainStopped(room, stopAt)) return;
+    if (gen !== room.generation || chainHalted(room, chain)) return;
 
     const lurkers = listeners.filter((a) => !invoked.has(a)).filter((a) => {
       if (seatOccupied(room, a)) { // busy in another lane — the delta catches it up later
@@ -2312,20 +2624,20 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles) {
       return true;
     });
     const chimeResults = lurkers.length
-      ? await Promise.allSettled(lurkers.map((a) => runListenerTurn(room, a, userTurn.n, scope)))
+      ? await Promise.allSettled(lurkers.map((a) => runListenerTurn(room, a, userTurn.n, scope, { chain })))
       : [];
-    if (gen !== room.generation || chainStopped(room, stopAt)) return;
+    if (gen !== room.generation || chainHalted(room, chain)) return;
 
     const chimes = chimeResults.filter((r) => r.status === "fulfilled" && r.value).map((r) => r.value);
     if (chimes.length) {
       for (const chime of chimes) {
-        if (chainStopped(room, stopAt)) break;
+        if (chainHalted(room, chain)) break;
         const target = findHopTarget(room, chime, { allowPlain }) || otherSeat(room, chime.author);
-        if (seatOccupied(room, target) && !(await waitForHopSeat(room, target, gen, stopAt))) {
+        if (seatOccupied(room, target) && !(await waitForHopSeat(room, target, gen, chain))) {
           broadcast(room, { type: "lurk", agent: target, spoke: false, skipped: true });
           continue;
         }
-        const reply = await runHopTurn(room, target, chime, userTurn.n, scope); // free: right of reply
+        const reply = await runHopTurn(room, target, chime, userTurn.n, scope, { chain }); // free: right of reply
         if (gen !== room.generation) return;
         invoked.add(target);
         if (reply) queue.push(reply); // but any tag in it is budgeted as usual
@@ -2373,6 +2685,40 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles) {
 
 function queueSize(room) { return room.pending.length; }
 
+// One row per still-pending delivery, carrying the two ids the queue view
+// needs and keeping them separate on purpose: `queueGroupId` is the cancel
+// scope (everything one dispatch still owes, so its ✕ can never reach past
+// what the user pointed at) and `sourceN` is only the jump target. Two
+// dispatches from the same message therefore render as sibling cards.
+function queueSnapshot(room) {
+  const ahead = {};
+  return room.pending.map((item) => {
+    const positions = {};
+    for (const a of item.agents) positions[a] = (ahead[a] = (ahead[a] || 0) + 1);
+    return {
+      seq: item.seq, kind: item.kind, agents: [...item.agents], positions,
+      queueGroupId: item.queueGroupId || null,
+      sourceN: item.sourceN === undefined ? null : item.sourceN,
+      target: item.target || null,
+      text: item.snippet || "",
+      ts: item.ts || null,
+    };
+  });
+}
+
+function queuedDispatchCount(room) {
+  const groups = new Set();
+  for (const item of room.pending) groups.add(item.queueGroupId || `seq:${item.seq}`);
+  return groups.size;
+}
+
+function broadcastQueue(room) {
+  broadcast(room, {
+    type: "queue", size: queueSize(room),
+    dispatches: queuedDispatchCount(room), items: queueSnapshot(room),
+  });
+}
+
 // Is the room doing anything at all on the user's behalf? Running turns, work
 // the lanes still owe them, and chains mid-flight between turns. Anything that
 // moves the room's own folder underneath a working directory, or starts a fresh
@@ -2390,26 +2736,38 @@ function seatOccupied(room, agent) {
 
 function enqueue(room, item) {
   room.pending.push({ seq: room.pendingSeq++, ...item });
-  broadcast(room, { type: "queue", size: queueSize(room) });
+  broadcastQueue(room);
 }
 
 // Hold one seat's share of an already-appended user turn until that seat frees.
 // The entry is never appended twice; only its delivery is split. Resolves with
 // the reply entry, or null if the turn failed, was stopped or was abandoned —
 // so the single hop/lurk chain that awaits it always runs exactly once.
-function deferDelivery(room, agent, userTurn, scope) {
+function deferDelivery(room, agent, userTurn, scope, dispatch = {}) {
   let settle;
   const done = new Promise((resolve) => { settle = resolve; });
   enqueue(room, {
-    kind: "delivery", agents: [agent], gen: room.generation, stopAt: room.stopEpoch,
+    kind: "delivery", agents: [agent], gen: room.generation,
+    stopAt: dispatch.chain ? dispatch.chain.stopAt : room.stopEpoch,
+    chain: dispatch.chain || null,
+    queueGroupId: dispatch.queueGroupId || null,
+    sourceN: userTurn.n, target: userTurn.target || null,
+    snippet: entrySnippet(userTurn), ts: userTurn.ts || null,
     run() {
       // The badge means "the other seat answered this before me", so it belongs
       // to a split @both. A single-seat message simply waiting its turn in its
       // own lane is the ordinary case and needs no marking.
       const deferred = userTurn.target === "both";
-      runAgentTurn(room, agent, userTurn, scope, { deferred }).then(settle, () => settle(null));
+      if (dispatch.chain) dispatch.chain.delivered++;
+      runAgentTurn(room, agent, userTurn, scope, {
+        deferred, queueGroupId: dispatch.queueGroupId || null, chain: dispatch.chain || null,
+      }).then(settle, () => settle(null));
     },
-    abandon() { settle(null); },
+    // Resolving with null is not enough on its own: the coordinator would read
+    // it as "that seat had nothing to say" and carry on into hops and the lurk
+    // check, so cancelling a queued message could still make the *other* agent
+    // chime in about it. The count is what lets the chain tell the difference.
+    abandon() { if (dispatch.chain) dispatch.chain.cancelled++; settle(null); },
   });
   // Normally the seat's own release drains this. If it is somehow already free,
   // drain anyway — a delivery nobody ever wakes would hang the chain.
@@ -2441,16 +2799,17 @@ function drainLanes(room) {
     go.push(item);
   }
   room.pending = still;
-  broadcast(room, { type: "queue", size: queueSize(room) });
+  broadcastQueue(room);
   for (const item of drop) item.abandon();
   // Both runners mark the seat busy synchronously, so nothing can slip into the
   // gap between leaving this queue and the seat being claimed.
   for (const item of go) item.run();
 }
 
-function releaseSeat(room, agent) {
+function releaseSeat(room, agent, run = null) {
   room.busy.delete(agent);
-  broadcast(room, { type: "status", agent, phase: "done" });
+  if (run) endRun(room, agent, run); else room.runs.delete(agent);
+  broadcast(room, { type: "status", agent, phase: "done", ...(run ? { runId: run.runId } : {}) });
   broadcast(room, { type: "room", room: roomSummary(room) });
   // Deferred by a tick so the turn that just ended finishes unwinding first.
   if (room.pending.length) setImmediate(() => drainLanes(room));
@@ -2460,6 +2819,83 @@ function clearPending(room) {
   const held = room.pending;
   room.pending = [];
   for (const item of held) item.abandon();
+}
+
+// Drop still-pending deliveries without touching anything already running.
+// `groupId` null is the blunt "cancel all queued"; a group id cancels exactly
+// what one dispatch still owes. Abandoning settles the promise the exchange
+// coordinator is awaiting, so the chain closes out rather than hanging on a
+// delivery that will never run.
+function cancelQueued(room, groupId = null) {
+  if (!room.pending.length) return 0;
+  const keep = [], drop = [];
+  for (const item of room.pending) {
+    (groupId === null || item.queueGroupId === groupId ? drop : keep).push(item);
+  }
+  if (!drop.length) return 0;
+  room.pending = keep;
+  broadcastQueue(room);
+  for (const item of drop) item.abandon();
+  // Cancelling stops the work, not the record: the message was accepted and
+  // has been in the transcript since the user sent it, so it cannot quietly
+  // vanish. Say what happened instead — both the user and the agents reading
+  // the room then know the message was withdrawn before anyone received it.
+  recordWithdrawals(room, drop);
+  return drop.length;
+}
+
+// Durable, per message and per seat. A system entry alone would not do: only
+// live cancellation notices cross the ordinary system-entry boundary, and the
+// original message still needs a durable per-seat placeholder on every later
+// delta and recovery replay.
+function recordWithdrawals(room, dropped) {
+  const items = dropped.filter((item) => item.sourceN !== undefined && item.sourceN !== null);
+  if (!items.length) return;
+  if (!room.state.cancelledDeliveries) room.state.cancelledDeliveries = {};
+  const grouped = new Map();
+  for (const item of items) {
+    const key = String(item.sourceN);
+    const merged = new Set([...(room.state.cancelledDeliveries[key] || []), ...item.agents]);
+    room.state.cancelledDeliveries[key] = [...merged];
+    const noticeSeats = grouped.get(key) || new Set();
+    item.agents.forEach((agent) => noticeSeats.add(agent));
+    grouped.set(key, noticeSeats);
+  }
+  saveState(room);
+  const withdrawals = [...grouped.entries()]
+    .map(([sourceN, agents]) => ({ sourceN: Number(sourceN), agents: [...agents] }))
+    .sort((a, b) => a.sourceN - b.sourceN);
+  // Past tense on purpose: Retry can deliver this message later, and a note
+  // claiming it was *never* delivered would then be permanently wrong.
+  const detail = withdrawals.length === 1
+    ? `that message was not delivered to ${withdrawals[0].agents.join(" and ")}`
+    : withdrawals.map((record) =>
+      `message #${record.sourceN} was not delivered to ${record.agents.join(" and ")}`).join("; ");
+  appendEntry(room, {
+    kind: "system", author: "system",
+    text: `⏹ Cancelled before delivery — ${detail}.`,
+    meta: { cancelledQueue: true, withdrawals },
+  });
+  // Receipt dots derive from the room summary. The queue event was emitted
+  // before these durable markers existed, so publish the new snapshot now.
+  broadcast(room, { type: "room", room: roomSummary(room) });
+}
+
+// Retry re-delivers a message, so any record of it having been withdrawn from
+// those seats has to go — otherwise the seat receives it now and every later
+// turn still reads "its contents were withheld from you".
+function clearWithdrawals(room, n, seats) {
+  const map = room.state.cancelledDeliveries;
+  if (!map) return;
+  const key = String(n);
+  if (!map[key]) return;
+  const left = map[key].filter((seat) => !seats.includes(seat));
+  if (left.length === map[key].length) return;
+  if (left.length) map[key] = left; else delete map[key];
+  saveState(room);
+  // Retry changes the meaning of the receipt dot before the response finishes;
+  // do not leave the browser showing a stale withheld state until releaseSeat.
+  broadcast(room, { type: "room", room: roomSummary(room) });
 }
 
 function retryTargets(room) {
@@ -2505,8 +2941,11 @@ function handleRetry(room) {
     lu.done = {};
     lu.pair = true;
     saveState(room);
+    // A pair cycle re-runs the whole exchange through both seats, so neither
+    // can still be carrying "this was withheld from you" for that message.
+    clearWithdrawals(room, lu.n, seatIds(room));
     const gen = room.generation;
-    runPairCycle(room, userTurn, pair, gen, room.stopEpoch);
+    runPairCycle(room, userTurn, pair, gen, newChain(room));
     return;
   }
   const targets = retryTargets(room);
@@ -2520,34 +2959,116 @@ function handleRetry(room) {
   // build that only recorded it on the entry, from the entry itself — and keeps
   // it latched, so a Work→Talk flip since the failure cannot widen this retry.
   const scope = makeScope(room, lu.n, lu.target, lu.discussion);
+  clearWithdrawals(room, lu.n, targets); // it is being delivered after all
   Promise.allSettled(targets.map((a) => runAgentTurn(room, a, userTurn, scope))).then(() => drainLanes(room));
 }
 
-function handleStop(room, agent = null) {
-  if (agent !== null && !seatIds(room).includes(agent)) {
-    throw Object.assign(new Error(`unknown agent: ${agent}`), { status: 400 });
+// Stop is four different intentions, not one button with a guess attached:
+//   seat   — this agent's current response; the other lane and the queue live
+//   active — every running response and the chains around them; queue survives
+//   queue  — everything still waiting; whatever is running finishes
+//   all    — silence: responses, pair cycle, hops, lurkers and the queue
+const STOP_SCOPES = new Set(["seat", "active", "queue", "all"]);
+
+// Kill through the run record rather than the process table, because the
+// record exists during the window where the process does not. Marking it is
+// what the spawn boundary in runCli reads.
+function stopRun(room, run) {
+  run.stopRequested = true;
+  const child = run.child || room.procs.get(run.agent);
+  if (child) { child.rtStopped = true; killTree(child); }
+}
+
+// The runs the user could actually see when they clicked, as [{agent, runId}].
+// Anything that started since is not what they aimed at.
+function pinnedRuns(room, pins) {
+  const wanted = new Map();
+  for (const pin of pins) {
+    if (pin && pin.agent && pin.runId) wanted.set(String(pin.agent), String(pin.runId));
   }
-  // A seat-scoped stop interrupts only that response. The other lane and the
-  // queue keep running. Stop-all retains the original silence semantics.
-  if (agent !== null) {
-    const child = room.procs.get(agent);
-    if (!child) return 0;
+  const matched = [];
+  for (const run of room.runs.values()) {
+    if (wanted.get(run.agent) === run.runId) matched.push(run);
+  }
+  return matched;
+}
+
+function handleStop(room, opts = {}) {
+  const agent = opts.agent === undefined || opts.agent === null ? null : opts.agent;
+  const runId = opts.runId || null;
+  const pins = Array.isArray(opts.runs) ? opts.runs : null;
+  const scope = opts.scope || (agent !== null ? "seat" : "all");
+  if (!STOP_SCOPES.has(scope)) {
+    throw Object.assign(new Error(`unknown stop scope: ${scope}`), { status: 400 });
+  }
+  if (scope === "seat") {
+    if (agent === null || !seatIds(room).includes(agent)) {
+      throw Object.assign(new Error(`unknown agent: ${agent}`), { status: 400 });
+    }
+    const run = room.runs.get(agent);
+    // A click that names a response which has already ended — or, worse, one
+    // that has been replaced by the next response in the same seat — is stale,
+    // not an error. It stops nothing, says so, and gets a 200 so the UI has no
+    // reason to show a failure the user would answer by clicking again.
+    if (!run || (runId && run.runId !== runId)) {
+      return { stopped: false, count: 0, cancelled: 0, stale: true, scope, agent, runId };
+    }
+    stopRun(room, run);
+    return { stopped: true, count: 1, cancelled: 0, stale: false, scope, agent, runId: run.runId };
+  }
+  if (scope === "queue") {
+    const cancelled = cancelQueued(room, opts.groupId || null);
+    return { stopped: false, count: 0, cancelled, stale: false, scope, agent: null };
+  }
+  if (scope === "active") {
+    // "Stop the current responses" means the ones the user was looking at.
+    // Between their click and this request a run can end and the queue can
+    // start the next one in the same seat; unpinned, that next response — which
+    // they never saw, let alone aimed at — is what dies.
+    const targets = pins ? pinnedRuns(room, pins) : [...room.runs.values()];
+    // Nothing matched: every response they aimed at had already ended. Return
+    // before touching anything. This scope must never leave a mark when it
+    // stopped nothing — the room-wide epoch in particular, which would fence
+    // off the chains of the very responses that replaced them.
+    if (!targets.length) {
+      return { stopped: false, count: 0, cancelled: 0, stale: !!pins, scope, agent: null };
+    }
+    let count = 0;
+    for (const run of targets) {
+      stopRun(room, run);
+      // End this exchange, and only this one: no hops, no lurk check. Chains
+      // belonging to runs that were not named — including a replacement that
+      // started after the click — are left completely alone.
+      if (run.chain) run.chain.halted = true;
+      count++;
+    }
+    return { stopped: true, count, cancelled: 0, stale: false, scope, agent: null };
+  }
+  // Stop everything. Here the room-wide line is exactly right: draw it forward
+  // rather than raising a flag, so every chain running now abandons itself and
+  // no later message can undo that by clearing a shared boolean.
+  room.stopEpoch++;
+  // Silence means the queue goes too. Held deliveries settle so the chain
+  // waiting on them closes out instead of hanging on a turn that will never
+  // run — and they are recorded as withdrawn, exactly as an explicit cancel is.
+  // A message dropped by Stop-everything was never delivered either, so it must
+  // not come back as actionable context on the seat's next turn.
+  const dropped = [...room.pending];
+  const cancelled = dropped.length;
+  clearPending(room);
+  recordWithdrawals(room, dropped);
+  broadcastQueue(room);
+  let count = 0;
+  for (const run of room.runs.values()) { stopRun(room, run); count++; }
+  // A process with no run record can only be a leftover from an older path;
+  // it still belongs to this room, so it still goes.
+  for (const [seat, child] of room.procs) {
+    if (room.runs.has(seat)) continue;
     child.rtStopped = true;
     killTree(child);
-    return 1;
+    count++;
   }
-  // Draw the line forward rather than raising a flag: every chain running now
-  // captured the old count and abandons itself, and no later message can undo
-  // that by clearing a shared boolean.
-  room.stopEpoch++;
-  // Stop all means silence — drop queued messages too. Held deliveries go the
-  // same way, and settle so the chain waiting on them closes out instead of
-  // hanging on a turn that will never run.
-  clearPending(room);
-  broadcast(room, { type: "queue", size: 0 });
-  let n = 0;
-  for (const [, child] of room.procs) { child.rtStopped = true; killTree(child); n++; }
-  return n;
+  return { stopped: count > 0, count, cancelled, stale: false, scope, agent: null };
 }
 
 // ---- native folder picker ----
@@ -2794,7 +3315,10 @@ function handleNewConversation(room) {
   }
   room.entries = [];
   room.receipts = [];
-  clearPending(room); // the entry a held delivery would deliver no longer exists
+  // No withdrawal record here, unlike Stop-everything: the entry a held
+  // delivery would have delivered is being archived along with the rest of the
+  // conversation, and the fresh state has nothing to be truthful about.
+  clearPending(room);
   saveState(room);
   broadcast(room, { type: "reset" });
   broadcast(room, { type: "room", room: roomSummary(room) });
@@ -3045,8 +3569,28 @@ const server = http.createServer(async (req, res) => {
     if (route === "POST /api/stop") {
       const body = await readBody(req);
       const room = loadRoom(body.room || "default");
-      const agent = body.agent === undefined || body.agent === null ? null : String(body.agent).toLowerCase();
-      return json(res, 200, { stopped: handleStop(room, agent), agent });
+      const agent = body.agent === undefined || body.agent === null || body.agent === ""
+        ? null : String(body.agent).toLowerCase();
+      // A stale runId is a 200 with stopped:false — see handleStop. Anything
+      // that made the user press Stop a second time is a bug, including an
+      // error toast on a click that was simply late.
+      const result = handleStop(room, {
+        agent,
+        scope: body.scope ? String(body.scope) : undefined,
+        runId: body.runId ? String(body.runId) : null,
+        runs: Array.isArray(body.runs) ? body.runs : null,
+        groupId: body.groupId ? String(body.groupId) : null,
+      });
+      return json(res, 200, { ...result, agent: result.agent });
+    }
+
+    if (route === "POST /api/queue/cancel") {
+      const body = await readBody(req);
+      const room = loadRoom(body.room || "default");
+      // Cancelling a group that already drained is not a failure — the user
+      // asked for it to be gone and it is gone.
+      const cancelled = cancelQueued(room, body.groupId ? String(body.groupId) : null);
+      return json(res, 200, { ok: true, cancelled, queued: queueSize(room) });
     }
 
     if (route === "POST /api/new") {

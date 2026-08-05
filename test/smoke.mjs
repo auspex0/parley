@@ -34,7 +34,7 @@ function ok(name, cond, detail) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 let TOKEN = ""; // read out of the served page, exactly as the browser does
-const RUNTIME_PROTOCOL = "4";
+const RUNTIME_PROTOCOL = "5";
 
 async function api(method, route, body) {
   const res = await fetch(base + route, method === "GET"
@@ -704,6 +704,10 @@ async function checkFolderPickerUi() {
     history: { replaceState: noop },
     location: { search: "", pathname: "/", href: "http://127.0.0.1/" },
     EventSource: class { constructor() { this.url = ""; } close() {} },
+    // The composer strip watches live bubbles for visibility. Nothing in this
+    // headless DOM has a layout, so the observer never fires — but it must
+    // exist, or the page script dies on the real code path.
+    IntersectionObserver: class { observe() {} unobserve() {} disconnect() {} },
     document: {
       getElementById(id) {
         if (destroyed.has(id)) return null; // destroyed by a textContent write
@@ -750,6 +754,29 @@ async function checkFolderPickerUi() {
   },
   set text(value) { $("input").value = value; },
   get projectDir() { return newRoomProjectDir; },
+  seedRoom(summary, entries, receipts = []) {
+    state.summary = summary;
+    state.providers = summary.providers || state.providers;
+    state.entries = entries || [];
+    state.receipts = receipts;
+    state.queue = summary.queue || [];
+  },
+  heard(agent, n) {
+    const entry = state.entries.find((candidate) => candidate.n === n);
+    return entry ? computeHeard(agent, entry) : null;
+  },
+  setWithdrawals(map) {
+    state.summary.cancelledDeliveries = map;
+    refreshHeard(0, Infinity);
+  },
+  set renderFrom(v) { state.renderFromN = v; },
+  get renderFrom() { return state.renderFromN; },
+  jumpTo(n) { jumpToEntry(n); },
+  queueCards() { return queueGroups(); },
+  queuePop() { renderQueuePop(); return $("queuePop").innerHTML; },
+  queueBadgeText() { setQueue(state.summary.queued, state.summary.queue, state.summary.queuedDispatches); return $("queueBadge").textContent; },
+  stopMenu() { updateBusyUI(); return $("stopMenu").innerHTML; },
+  entryQuote(entry) { return entryQuoteHTML(entry); },
 };`, Object.assign(sandbox, { __windowListeners: windowListeners }), { filename: "parley-ui.js" });
 
   const probe = sandbox.__probe;
@@ -778,6 +805,74 @@ async function checkFolderPickerUi() {
   ok("folder picker UI: a result arriving after the form was reset is discarded",
     probe.projectDir === null, String(probe.projectDir));
   await Promise.race([openWhileReset, sleep(0)]);
+
+  // Behavioural, not source-shaped: drive the real functions over seeded state.
+  // Both queue rows below come from the *same* message (sourceN 4) via two
+  // separate dispatches — the case where matching runs on rootN would let both
+  // cards claim one running seat.
+  const uiSummary = {
+    name: "probe", seats: ["claude", "codex"], busy: ["claude"], working: true,
+    queued: 3, queuedDispatches: 2,
+    agents: { claude: { cursor: 0 }, codex: { cursor: 0 } },
+    cfg: { agents: { claude: {}, codex: {} } },
+    providers: {
+      claude: { label: "Claude", color: "#c8a2ff", avatar: "C" },
+      codex: { label: "Codex", color: "#7fd1b9", avatar: "X" },
+    },
+    busyInfo: [{
+      agent: "claude", runId: "r7", phase: "start", rootN: 4, sourceN: 4, queueGroupId: "d2",
+      source: { n: 4, kind: "user", author: "user", ts: "2026-08-05T02:02:00", text: "the original ask" },
+    }],
+    queue: [
+      { seq: 2, kind: "delivery", agents: ["claude"], positions: { claude: 1 }, queueGroupId: "d2",
+        sourceN: 4, target: "claude", text: "the original ask", ts: "2026-08-05T02:02:00" },
+      { seq: 3, kind: "delivery", agents: ["claude"], positions: { claude: 2 }, queueGroupId: "d3",
+        sourceN: 4, target: "both", text: "the original ask", ts: "2026-08-05T02:02:00" },
+      { seq: 4, kind: "delivery", agents: ["codex"], positions: { codex: 1 }, queueGroupId: "d3",
+        sourceN: 4, target: "both", text: "the original ask", ts: "2026-08-05T02:02:00" },
+    ],
+  };
+  probe.seedRoom(uiSummary, [
+    { n: 4, kind: "user", author: "user", target: "claude", ts: "2026-08-05T02:02:00", text: "the original ask", meta: {} },
+    { n: 5, kind: "agent", author: "claude", ts: "2026-08-05T02:03:00", text: "answer", meta: { replyTo: 4 } },
+  ]);
+  const cards = probe.queueCards();
+  ok("two dispatches from one message become sibling cards, not one",
+    cards.length === 2 && cards[0].groupId === "d2" && cards[1].groupId === "d3" &&
+    cards[0].sourceN === 4 && cards[1].sourceN === 4 &&
+    cards[0].rows.length === 1 && cards[1].rows.length === 2,
+    JSON.stringify(cards.map((c) => ({ id: c.groupId, src: c.sourceN, rows: c.rows.length }))));
+  const pop = probe.queuePop();
+  ok("…and only the dispatch that owns the run shows it as responding",
+    (pop.match(/qp-row running/g) || []).length === 1 &&
+    (pop.match(/data-cancel-group="d[23]"/g) || []).length === 2,
+    pop);
+  ok("the badge counts messages while the lanes count deliveries",
+    probe.queueBadgeText() === "⏳ 2 queued", probe.queueBadgeText());
+  const menu = probe.stopMenu();
+  ok("the Stop menu names each scope and counts messages, not deliveries",
+    /data-stop-scope="seat" /.test(menu) && /data-stop-scope="active"/.test(menu) &&
+    /Cancel 2 queued messages/.test(menu) && /data-stop-scope="all"/.test(menu), menu);
+  ok("a reply that directly follows its source still carries the quote",
+    /data-jump-n="4"/.test(probe.entryQuote({ n: 5, kind: "agent", author: "claude", meta: { replyTo: 4 } })));
+  probe.renderFrom = 4;
+  probe.jumpTo(4);
+  ok("the quote jump expands collapsed history before looking for its target",
+    probe.renderFrom === null);
+
+  // Behavioural precedence, not a source-order assertion: even a spanning live
+  // receipt, an advanced cursor and a busy seat cannot turn a withdrawn message
+  // into "heard". Clearing the Retry marker restores the receipt-derived state.
+  uiSummary.cancelledDeliveries = { "4": ["claude"] };
+  uiSummary.agents.claude.cursor = 9;
+  probe.seedRoom(uiSummary, [
+    { n: 4, kind: "user", author: "user", target: "claude", ts: "2026-08-05T02:02:00", text: "the original ask", meta: {} },
+  ], [{ agent: "claude", from: 0, upTo: 9, turn: 4, mode: "turn", spoke: true, ts: "2026-08-05T02:03:00" }]);
+  ok("a withdrawn receipt dot beats live receipt, cursor and busy state",
+    probe.heard("claude", 4)?.cls === "withheld", JSON.stringify(probe.heard("claude", 4)));
+  probe.setWithdrawals({});
+  ok("clearing the withdrawal immediately restores the ordinary receipt dot",
+    probe.heard("claude", 4)?.cls === "live", JSON.stringify(probe.heard("claude", 4)));
 
   // Inline routing wins on the server. Once that answer comes back, the chip
   // must follow it so the next untagged send does not accidentally stay @both.
@@ -1059,6 +1154,58 @@ async function main() {
     stopChoice({ busy: [], queued: 0, working: false, workingPair: null }) === false &&
     page.includes('summary.workingPair ? "Stop the pair cycle" : "Stop the exchange"') &&
     !/const choose = active\.length > 1 \|\| state\.summary\.queued > 0/.test(page));
+  // The jump is useless precisely when the target sits in collapsed
+  // scrollback, so expanding has to come before the lookup, not after it.
+  ok("the quote jump expands collapsed history before it looks for its target",
+    /function jumpToEntry\(n\) \{\s*\n\s*expandHistory\(\);[\s\S]{0,200}?querySelector/.test(page));
+  // Thresholds are ratios of the target, so a reply several viewports tall can
+  // never cross 0.5 — the decision has to come from the rects.
+  ok("the composer strip measures visibility instead of trusting a ratio",
+    page.includes("function measureLiveVisibility()") &&
+    page.includes("Math.min(r.height, root.height) * 0.5") &&
+    page.includes("if (shown <= 0) state.liveVisible[agent] = false") &&
+    !page.includes("intersectionRatio"));
+  ok("…and re-measures on scroll, not only when a threshold is crossed",
+    page.includes('chatWrap.addEventListener("scroll", scheduleVisibility)') &&
+    page.includes("requestAnimationFrame(run)"));
+  ok("the strip is capped at two rows plus an overflow row",
+    page.includes("const STRIP_ROW_CAP = 2") && page.includes("rows.slice(0, STRIP_ROW_CAP)") &&
+    page.includes("+${rest} more"));
+  ok("the strip only stands in while the live bubble is off-screen",
+    page.includes("info.filter((b) => state.liveVisible[b.agent] === false)"));
+  ok("both surfaces render the same provenance rather than duplicating state",
+    page.includes("function quoteRefHTML(src)") && page.includes("busyInfoFor(agent)") &&
+    page.includes("entryQuoteHTML(e)"));
+  // Agreed explicitly: a finished reply keeps the reference in scrollback.
+  ok("a finished reply keeps its quote unconditionally",
+    !page.includes("answersPrecedingEntry"));
+  ok("queue labels count messages while the lanes count deliveries",
+    page.includes("summary.queuedDispatches === undefined") &&
+    page.includes("${queuedMessages} queued message"));
+  ok("a queue card claims only the run its own dispatch owns",
+    page.includes("b.queueGroupId === g.groupId"));
+  // A later high-water receipt spans a withdrawn entry, so the withheld check
+  // has to come before receipts, cursor and busy — not after them.
+  ok("a withheld message is drawn as withheld, ahead of every other signal",
+    /function computeHeard\(a, e\) \{\s+if \(withheldFrom\(a, e\.n\)\)/.test(page) &&
+    page.includes("cancelledDeliveries") && page.includes("hdot.withheld"));
+  ok("the live status path keeps a run attached to its dispatch",
+    page.includes("queueGroupId: msg.queueGroupId || null"));
+  ok("a queue change refreshes the Stop menu that offers to cancel it",
+    /function setQueue\([\s\S]*?updateBusyUI\(\);\s*\}/.test(page));
+  ok("an active Stop pins the runs that were on screen",
+    page.includes('scope === "active"') && page.includes("{ agent: b.agent, runId: b.runId }") &&
+    page.includes("...(pinned ? { runs: pinned } : {})"));
+  ok("Stop offers each scope explicitly instead of guessing",
+    ['data-stop-scope="seat"', 'data-stop-scope="active"',
+      'data-stop-scope="queue"', 'data-stop-scope="all"'].every((s) => page.includes(s)) &&
+    page.includes("keeps queued work") && page.includes("keeps active responses"));
+  ok("a Stop click names the run it meant, and a stale one is silent",
+    page.includes("info && info.runId ? { runId: info.runId }") &&
+    page.includes("if (r && r.stale) return;"));
+  ok("queue cards group by dispatch, not by source message",
+    page.includes("item.queueGroupId || `seq:${item.seq}`") &&
+    page.includes("data-cancel-group") && page.includes("Cancel all queued"));
   ok("folder picker UI names the taskbar fallback that now exists",
     page.includes("Parley — Choose a project folder") &&
     page.includes("from the taskbar"));
@@ -1968,7 +2115,8 @@ async function main() {
   const beforeSeatStop = (await room("contseatstop")).entries.length;
   const seatStop = await api("POST", "/api/stop", { room: "contseatstop", agent: "claude" });
   ok("a named Stop interrupts only the Continue worker",
-    seatStop.status === 200 && seatStop.data.stopped === 1 && seatStop.data.agent === "claude",
+    seatStop.status === 200 && seatStop.data.stopped === true && seatStop.data.count === 1 &&
+    seatStop.data.agent === "claude",
     JSON.stringify(seatStop.data));
   d = await idle("contseatstop", 30000);
   const seatStopFresh = d.entries.slice(beforeSeatStop);
@@ -2577,12 +2725,617 @@ async function main() {
   await sleep(150);
   const selective = await api("POST", "/api/stop", { room: "selectstop", agent: "claude" });
   ok("a seat-scoped Stop reports only that CLI", selective.status === 200 &&
-    selective.data.stopped === 1 && selective.data.agent === "claude", JSON.stringify(selective.data));
+    selective.data.stopped === true && selective.data.count === 1 && selective.data.agent === "claude", JSON.stringify(selective.data));
   d = await idle("selectstop");
   ok("seat-scoped Stop leaves the other response running",
     !texts(d).includes("CLAUDE_DONE") && texts(d).includes("CODEX_DONE"));
   const badStop = await api("POST", "/api/stop", { room: "selectstop", agent: "nobody" });
   ok("seat-scoped Stop rejects unknown agents", badStop.status === 400);
+
+  console.log("\nstop scopes, run ids & the queue view");
+  // Stop aims through the run record rather than the process table. The record
+  // exists for the whole life of a turn, so "the seat is busy" and "there is
+  // something to stop" cannot disagree, and every response has an id a click
+  // can name. (beginRun through spawn is one synchronous block today, so the
+  // pre-spawn half of that is not reachable from a test; the guard in runCli is
+  // there to keep it unreachable if staging ever grows an await.)
+  await api("POST", "/api/rooms", { name: "stopscope" });
+  await useFakes("stopscope");
+  await say("stopscope", "@claude SLEEP:2500 SAY:PROV_DONE");
+  // Deliberately no sleep: the seat is claimed synchronously with the accept.
+  const claimed = await room("stopscope");
+  const provRoot = [...claimed.entries].reverse().find((e) => e.kind === "user");
+  const provInfo = (claimed.room.busyInfo || []).find((b) => b.agent === "claude");
+  ok("a seat is stoppable from the instant its message is accepted",
+    claimed.room.busy.includes("claude") && !!provInfo && !!provInfo.runId,
+    JSON.stringify({ busy: claimed.room.busy, busyInfo: claimed.room.busyInfo }));
+  ok("busyInfo says which message the seat is answering",
+    !!provInfo && !!provRoot && provInfo.sourceN === provRoot.n && provInfo.rootN === provRoot.n &&
+    !!provInfo.source && /PROV_DONE/.test(provInfo.source.text) && provInfo.source.kind === "user",
+    JSON.stringify(provInfo));
+  ok("busy and busyInfo describe the same seats",
+    (claimed.room.busyInfo || []).map((b) => b.agent).sort().join() ===
+      [...claimed.room.busy].sort().join());
+
+  const staleStop = await api("POST", "/api/stop", { room: "stopscope", agent: "claude", runId: "r-not-a-run" });
+  ok("a stale runId is a quiet 200, never an error",
+    staleStop.status === 200 && staleStop.data.stale === true && staleStop.data.stopped === false,
+    JSON.stringify(staleStop.data));
+  ok("…and it leaves the response that is actually running alone",
+    (await room("stopscope")).room.busy.includes("claude"));
+  d = await idle("stopscope");
+  ok("…which then finishes normally", texts(d).includes("PROV_DONE"));
+
+  await say("stopscope", "@claude SLEEP:2500 SAY:PINNED_DONE");
+  const pinned = await room("stopscope");
+  const liveInfo = (pinned.room.busyInfo || []).find((b) => b.agent === "claude");
+  const liveStop = await api("POST", "/api/stop", { room: "stopscope", agent: "claude", runId: liveInfo.runId });
+  ok("the current runId stops exactly that response",
+    liveStop.status === 200 && liveStop.data.stopped === true && liveStop.data.count === 1 &&
+    liveStop.data.stale === false,
+    JSON.stringify(liveStop.data));
+  d = await idle("stopscope");
+  ok("the stopped reply never landed", !texts(d).includes("PINNED_DONE"));
+  const repeatStop = await api("POST", "/api/stop", { room: "stopscope", agent: "claude", runId: liveInfo.runId });
+  ok("pressing Stop again on a response that already ended stays quiet",
+    repeatStop.status === 200 && repeatStop.data.stale === true && repeatStop.data.stopped === false,
+    JSON.stringify(repeatStop.data));
+  await say("stopscope", "@claude SAY:REF_DONE");
+  d = await idle("stopscope");
+  const refRoot = d.entries.find((e) => e.kind === "user" && /REF_DONE/.test(e.text));
+  ok("a finished reply keeps the reference its live bubble showed",
+    lastAgent(d, "claude").meta.replyTo === refRoot.n, JSON.stringify(lastAgent(d, "claude").meta));
+
+  // "Stop current responses, keep queued work" and its mirror.
+  await api("POST", "/api/rooms", { name: "keepqueue" });
+  await useFakes("keepqueue");
+  await say("keepqueue", "@claude SLEEP:2500 SAY:RUNNING_A");
+  await sleep(200);
+  await say("keepqueue", "@claude SAY:QUEUED_A");
+  ok("the second message waits in the busy lane",
+    (await room("keepqueue")).room.queued === 1);
+  const keepQueue = await api("POST", "/api/stop", { room: "keepqueue", scope: "active" });
+  ok("stopping active responses reports what it cut and what it spared",
+    keepQueue.status === 200 && keepQueue.data.stopped === true && keepQueue.data.count === 1 &&
+    keepQueue.data.cancelled === 0,
+    JSON.stringify(keepQueue.data));
+  d = await idle("keepqueue");
+  ok("…the running reply was cut", !texts(d).includes("RUNNING_A"));
+  ok("…and the queued message still got answered", texts(d).includes("QUEUED_A"));
+
+  await api("POST", "/api/rooms", { name: "dropqueue" });
+  await useFakes("dropqueue");
+  await say("dropqueue", "@claude SLEEP:2500 SAY:RUNNING_B");
+  await sleep(200);
+  await say("dropqueue", "@claude SAY:QUEUED_B");
+  const dropQueue = await api("POST", "/api/stop", { room: "dropqueue", scope: "queue" });
+  ok("cancelling the queue touches nothing that is running",
+    dropQueue.status === 200 && dropQueue.data.stopped === false && dropQueue.data.cancelled === 1,
+    JSON.stringify(dropQueue.data));
+  d = await idle("dropqueue");
+  ok("…the running reply finished normally", texts(d).includes("RUNNING_B"));
+  ok("…and the queued message never ran", !texts(d).includes("QUEUED_B"));
+
+  // One card per dispatch, not per source message: the ✕ must never reach past
+  // what the user pointed at.
+  await api("POST", "/api/rooms", { name: "queueview" });
+  await useFakes("queueview");
+  await say("queueview", "@claude SLEEP:2500 SAY:RUNNING_C");
+  await sleep(200);
+  await say("queueview", "@claude SAY:GROUP_A");
+  await say("queueview", "@claude SAY:GROUP_B");
+  const qv = await room("queueview");
+  const rows = qv.room.queue || [];
+  ok("the queue snapshot carries one row per pending delivery", rows.length === 2,
+    JSON.stringify(rows));
+  ok("each dispatch gets its own cancel scope",
+    rows[0].queueGroupId && rows[1].queueGroupId && rows[0].queueGroupId !== rows[1].queueGroupId,
+    JSON.stringify(rows.map((r) => r.queueGroupId)));
+  ok("…while the jump target stays the message the user sent",
+    rows[0].sourceN !== rows[1].sourceN && /GROUP_A/.test(rows[0].text) &&
+    rows[0].positions.claude === 1 && rows[1].positions.claude === 2,
+    JSON.stringify(rows));
+  const cancelOne = await api("POST", "/api/queue/cancel", { room: "queueview", groupId: rows[0].queueGroupId });
+  ok("cancelling one dispatch drops only its deliveries",
+    cancelOne.status === 200 && cancelOne.data.cancelled === 1 && cancelOne.data.queued === 1,
+    JSON.stringify(cancelOne.data));
+  d = await idle("queueview");
+  ok("…the running response was untouched", texts(d).includes("RUNNING_C"));
+  ok("…the cancelled message never ran", !texts(d).includes("GROUP_A"));
+  ok("…and the dispatch beside it still did", texts(d).includes("GROUP_B"));
+  const cancelGone = await api("POST", "/api/queue/cancel", { room: "queueview", groupId: rows[0].queueGroupId });
+  ok("cancelling an already-drained dispatch is not an error",
+    cancelGone.status === 200 && cancelGone.data.cancelled === 0);
+
+  // The contract behind "Stop everything": one press, and nothing this exchange
+  // would still have spawned — the hop the reply earns, the lurk check after it
+  // — ever starts. The reply is allowed to land first and the hop target is held
+  // busy, so the chain is genuinely parked in a handoff gap with a follow-up
+  // owing when Stop arrives.
+  //
+  // The control below runs the identical setup without the Stop and shows the
+  // hop does land, so the assertion is about Stop and not about the setup.
+  for (const [roomName, pressStop] of [["stopfuture", true], ["stopfuture-control", false]]) {
+    await api("POST", "/api/rooms", { name: roomName });
+    await useFakes(roomName);
+    await cfg(roomName, { agents: { codex: { lurk: true } } });
+    await say(roomName, "@codex SLEEP:3000 SAY:CODEXBUSY");
+    await sleep(150);
+    await say(roomName, "@claude TAG:codex");
+    // The reply exists and its hop is waiting on the busy seat.
+    await waitRoom(roomName,
+      (r) => r.entries.some((e) => e.kind === "agent" && e.author === "claude") &&
+        !r.room.busy.includes("claude"),
+      "the reply to land with its hop still owing");
+    if (pressStop) {
+      const stopAll = await api("POST", "/api/stop", { room: roomName, scope: "all" });
+      ok("Stop everything reports what it interrupted",
+        stopAll.status === 200 && stopAll.data.count >= 1, JSON.stringify(stopAll.data));
+    }
+    d = await idle(roomName);
+    await sleep(500); // anything still coming would have to land in this window
+    d = await room(roomName);
+    const hopped = d.entries.some((e) => e.kind === "agent" && e.author === "codex" && e.meta && e.meta.hop);
+    const lurked = d.receipts.some((r) => r.mode === "lurk");
+    if (pressStop) {
+      ok("the reply that earned the follow-up is still there",
+        d.entries.some((e) => e.kind === "agent" && e.author === "claude"), JSON.stringify(texts(d)));
+      ok("one Stop everything blocks the follow-up waiting on a busy seat", !hopped, JSON.stringify(texts(d)));
+    } else {
+      ok("control: without the Stop that same follow-up does run", hopped, JSON.stringify(texts(d)));
+    }
+    // Nothing is asserted about lurking here: the hop target joins `invoked`
+    // and is excluded from the lurker set either way, so it would pass without
+    // proving anything. The lurk check gets its own pair below.
+  }
+
+  // The lurk check is the other thing an exchange still owes after its reply.
+  // No tag, so nobody is pulled in as a hop and the lurker set is genuinely
+  // non-empty — the control shows the lurk really does happen, and the Stop
+  // variant shows one press ends the exchange before it can.
+  for (const [roomName, pressStop] of [["stoplurk", true], ["stoplurk-control", false]]) {
+    await api("POST", "/api/rooms", { name: roomName });
+    await useFakes(roomName);
+    await cfg(roomName, { agents: { codex: { lurk: true } } });
+    await say(roomName, "@claude SLEEP:1800 SAY:NOHOPREPLY");
+    await waitRoom(roomName, (r) => r.room.busy.includes("claude"), "the reply to start");
+    ok(`${pressStop ? "" : "control: "}the lurker seat is free, so nothing but the chain can stop it`,
+      !(await room(roomName)).room.busy.includes("codex"));
+    if (pressStop) await api("POST", "/api/stop", { room: roomName, scope: "all" });
+    d = await idle(roomName);
+    await sleep(500);
+    d = await room(roomName);
+    const lurkRan = d.receipts.some((r) => r.mode === "lurk");
+    if (pressStop) ok("one Stop everything blocks the lurk check that was still owing", !lurkRan, JSON.stringify(d.receipts));
+    else ok("control: without the Stop that lurk check does run", lurkRan, JSON.stringify(d.receipts));
+  }
+
+  // Cancelling a queued message must end its exchange, not just its delivery:
+  // a lurker chiming in about a message the user cancelled is the bug.
+  await api("POST", "/api/rooms", { name: "cancelchime" });
+  await useFakes("cancelchime");
+  await cfg("cancelchime", { agents: { codex: { lurk: true } } });
+  await say("cancelchime", "@claude SLEEP:2500 SAY:HOLDING");
+  await sleep(200);
+  await say("cancelchime", "@claude CHIME SAY:CANCEL_THIS");
+  const chimeQueue = (await room("cancelchime")).room.queue;
+  await api("POST", "/api/queue/cancel", { room: "cancelchime", groupId: chimeQueue[0].queueGroupId });
+  d = await idle("cancelchime");
+  await sleep(400);
+  d = await room("cancelchime");
+  ok("a cancelled dispatch never runs its delivery", !texts(d).includes("CANCEL_THIS"));
+  ok("…and the transcript records that it was not delivered",
+    d.entries.some((e) => e.kind === "system" && e.meta && e.meta.cancelledQueue &&
+      /was not delivered to claude/.test(e.text) && !/never/.test(e.text)),
+    JSON.stringify(texts(d, "system")));
+  ok("…while the response it was queued behind still finished", texts(d).includes("HOLDING"));
+  // Note: a *concurrent* exchange's lurker can still see the cancelled message,
+  // because the message really was sent and has been in the shared transcript
+  // since the moment it was accepted. Cancelling withdraws the delivery, not
+  // the record — hence the system note above. What must not happen is the
+  // cancelled dispatch running downstream work of its own, which is next.
+
+  // A dispatch whose every delivery was cancelled ends its own chain: no hop,
+  // no lurk check. The lurker is deliberately left *free* here — its seat is
+  // idle the whole time the cancelled chain is unwinding, so nothing but the
+  // chain itself can be what stops the lurk step from running.
+  await api("POST", "/api/rooms", { name: "cancelchain" });
+  await useFakes("cancelchain");
+  await cfg("cancelchain", { agents: { codex: { lurk: true } } });
+  await say("cancelchain", "@claude SLEEP:2600 SAY:CLAUDEHELD");
+  await sleep(200);
+  await say("cancelchain", "@claude SAY:CHAIN_CANCELLED");
+  const chainQueue = (await room("cancelchain")).room.queue;
+  const cancelledN = chainQueue[0].sourceN;
+  ok("the lurker seat is free while the cancelled chain unwinds",
+    !(await room("cancelchain")).room.busy.includes("codex"));
+  await api("POST", "/api/queue/cancel", { room: "cancelchain", groupId: chainQueue[0].queueGroupId });
+  d = await idle("cancelchain");
+  ok("a cancelled dispatch does no downstream work of its own",
+    !texts(d).includes("CHAIN_CANCELLED") &&
+    !d.receipts.some((r) => r.mode === "lurk" && r.turn === cancelledN),
+    JSON.stringify(d.receipts.filter((r) => r.mode === "lurk")));
+
+  // The other half of that rule: a split @both whose held half is cancelled
+  // keeps the chain the seat that already answered earned.
+  await api("POST", "/api/rooms", { name: "splitcancel" });
+  await useFakes("splitcancel");
+  await say("splitcancel", "@codex SLEEP:2500 SAY:BUSYSEAT");
+  await sleep(200);
+  await say("splitcancel", "@both TAG:codex");
+  const splitQueue = (await room("splitcancel")).room.queue;
+  ok("a split @both holds one delivery and counts as one message",
+    splitQueue.length === 1 && (await room("splitcancel")).room.queuedDispatches === 1,
+    JSON.stringify(splitQueue));
+  await api("POST", "/api/queue/cancel", { room: "splitcancel", groupId: splitQueue[0].queueGroupId });
+  d = await idle("splitcancel");
+  ok("cancelling the held half leaves the half that already ran",
+    d.entries.some((e) => e.kind === "agent" && e.author === "claude"));
+  ok("…and the surviving half still earns its follow-up",
+    d.entries.some((e) => e.kind === "agent" && e.author === "codex" && e.meta && e.meta.hop),
+    JSON.stringify(texts(d)));
+
+  // "Stop the current responses" must not kill a response that started after
+  // the click: the request carries the runs that were on screen.
+  await api("POST", "/api/rooms", { name: "pinnedactive" });
+  await useFakes("pinnedactive");
+  await say("pinnedactive", "@claude SLEEP:1500 SAY:FIRST_RUN");
+  const pinnedSnapshot = (await room("pinnedactive")).room.busyInfo;
+  d = await idle("pinnedactive");
+  // The replacement earns a follow-up, so the stale click is checked against
+  // the whole exchange and not just the one reply it would have killed.
+  await say("pinnedactive", "@claude SLEEP:1500 TAG:codex");
+  const stalePin = await api("POST", "/api/stop", {
+    room: "pinnedactive", scope: "active",
+    runs: pinnedSnapshot.map((b) => ({ agent: b.agent, runId: b.runId })),
+  });
+  ok("an active Stop pinned to a finished run stops nothing",
+    stalePin.status === 200 && stalePin.data.stopped === false && stalePin.data.stale === true,
+    JSON.stringify(stalePin.data));
+  d = await idle("pinnedactive");
+  ok("…so the response that started afterwards survives it",
+    d.entries.some((e) => e.kind === "agent" && e.author === "claude"), JSON.stringify(texts(d)));
+  ok("…along with the follow-up that response earned",
+    d.entries.some((e) => e.kind === "agent" && e.author === "codex" && e.meta && e.meta.hop),
+    JSON.stringify(texts(d)));
+
+  // A lurker you stopped is not a lurker that broke.
+  for (const [roomName, stopBody] of [
+    ["lurkstopseat", { agent: "codex" }],
+    ["lurkstopactive", { scope: "active" }],
+    ["lurkstopall", { scope: "all" }],
+  ]) {
+    await api("POST", "/api/rooms", { name: roomName });
+    await useFakes(roomName);
+    await cfg(roomName, { agents: { codex: { lurk: true } } });
+    await say(roomName, "@claude SLEEP:1600 SAY:LURKWAIT");
+    await waitRoom(roomName, (r) => r.room.busy.includes("codex"), "the lurker to start");
+    await api("POST", "/api/stop", { room: roomName, ...stopBody });
+    d = await idle(roomName);
+    ok(`a lurker stopped by ${stopBody.scope || "seat"} scope reads as stopped, not failed`,
+      d.entries.some((e) => e.kind === "system" && e.meta && e.meta.stopped === true &&
+        e.meta.agent === "codex" && e.meta.error === false) &&
+      !d.entries.some((e) => e.kind === "system" && e.meta && e.meta.error === true),
+      JSON.stringify(d.entries.filter((e) => e.kind === "system").map((e) => e.text)));
+  }
+
+  // A cancelled message stays in the transcript, because the user really did
+  // send it — so the withdrawal has to travel with it into every later prompt,
+  // or "nobody received this" quietly stops being true on the next turn.
+  await api("POST", "/api/rooms", { name: "cancelrecall" });
+  await useFakes("cancelrecall");
+  await say("cancelrecall", "@claude SLEEP:2400 SAY:RECALLHOLD");
+  await sleep(200);
+  await say("cancelrecall", "@claude SAY:WITHDRAWNBODY");
+  const recallQueue = (await room("cancelrecall")).room.queue;
+  await api("POST", "/api/queue/cancel", { room: "cancelrecall", groupId: recallQueue[0].queueGroupId });
+  d = await idle("cancelrecall");
+  await say("cancelrecall", "@claude ACTIVITY");
+  d = await idle("cancelrecall");
+  const recalled = lastAgent(d, "claude").text;
+  ok("the seat that never received a message is not handed its body later",
+    !/WITHDRAWNBODY/.test(recalled), recalled.slice(0, 500));
+  ok("…it is told a message was withdrawn, and nothing more",
+    /cancelled it before it was delivered/.test(recalled) &&
+    /contents were withheld from you/.test(recalled), recalled.slice(0, 500));
+  ok("…and the withdrawal survives a reload of the room",
+    JSON.parse(fs.readFileSync(path.join(ROOT, "cancelrecall", "state.json"), "utf8"))
+      .cancelledDeliveries[String(recallQueue[0].sourceN)].includes("claude"));
+
+  // Attachments go the same way as the body: withholding the text while still
+  // staging the file would withhold nothing at all. IMAGEINFO/FILEINFO report
+  // what the provider actually received, which is the only thing that settles
+  // whether bytes leaked — the prompt text cannot see a native image at all.
+  //
+  // One probe per room on purpose: the withheld entry is unseen only on the
+  // first turn after the cancel, so probes sharing a room would silently start
+  // asserting about an empty delta.
+  for (const probe of ["IMAGEINFO", "FILEINFO", "ACTIVITY"]) {
+    const roomName = `cancelbytes-${probe.toLowerCase()}`;
+    await api("POST", "/api/rooms", { name: roomName });
+    await useFakes(roomName);
+    await say(roomName, "@claude SLEEP:2400 SAY:BYTESHOLD");
+    await sleep(200);
+    const queued = await api("POST", "/api/message", {
+      room: roomName, target: "claude", text: "@claude SAY:BYTESBODY",
+      images: [{ name: "secret.png", mime: "image/png", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=" }],
+      files: [{ name: "secret.txt", mime: "text/plain", data: Buffer.from("SECRETFILEBODY").toString("base64") }],
+    });
+    ok(`${probe}: the attachment-carrying message was accepted and queued`,
+      queued.status === 200, JSON.stringify(queued.data));
+    const bytesQueue = (await room(roomName)).room.queue;
+    await api("POST", "/api/queue/cancel", { room: roomName, groupId: bytesQueue[0].queueGroupId });
+    d = await idle(roomName);
+    await say(roomName, `@claude ${probe}`);
+    d = await idle(roomName);
+    const said = lastAgent(d, "claude").text;
+    if (probe === "IMAGEINFO") {
+      const gotImages = JSON.parse(said.replace(/^IMAGEJSON /, ""));
+      ok("no image from a withheld message reaches the provider's native input",
+        Array.isArray(gotImages) && gotImages.length === 0, said.slice(0, 300));
+    } else if (probe === "FILEINFO") {
+      const gotFiles = JSON.parse(said.replace(/^FILEJSON /, ""));
+      ok("…and no file is staged for it either",
+        Array.isArray(gotFiles) && gotFiles.length === 0, said.slice(0, 300));
+    } else {
+      ok("the withheld message is still relayed as a placeholder, so this is not an empty delta",
+        /contents were withheld from you/.test(said) && !/BYTESBODY/.test(said), said.slice(0, 500));
+      ok("…with no attachment name, path or inline bytes beside it",
+        !/secret\.png/.test(said) && !/secret\.txt/.test(said) &&
+        !/SECRETFILEBODY/.test(said) && !/Attached/.test(said), said.slice(0, 500));
+    }
+  }
+
+  // A session reset replays history through the briefing rather than the delta,
+  // so it needs the same rule — and it is the one path that used to leak the
+  // attachment names of a message the seat never received.
+  await api("POST", "/api/rooms", { name: "cancelrecover" });
+  await useFakes("cancelrecover");
+  await say("cancelrecover", "@claude SLEEP:2400 SAY:RECOVERHOLD");
+  await sleep(200);
+  await api("POST", "/api/message", {
+    room: "cancelrecover", target: "claude", text: "@claude SAY:RECOVERBODY",
+    files: [{ name: "leak.txt", mime: "text/plain", data: Buffer.from("LEAKEDFILEBODY").toString("base64") }],
+  });
+  const recoverQueue = (await room("cancelrecover")).room.queue;
+  await api("POST", "/api/queue/cancel", { room: "cancelrecover", groupId: recoverQueue[0].queueGroupId });
+  d = await idle("cancelrecover");
+  // First deliver the placeholder on an ordinary successful turn. That moves
+  // Claude's cursor past the withdrawn entry, making it eligible for
+  // historyTail on the subsequent session reset. Use a reply that does not echo
+  // its activity block, so the later placeholder can only come from historyTail.
+  await say("cancelrecover", "@claude SAY:RECOVERACK");
+  d = await idle("cancelrecover");
+  ok("the recovery setup advances the seat past the withdrawn entry",
+    lastAgent(d, "claude").text === "RECOVERACK", lastAgent(d, "claude").text);
+  await say("cancelrecover", "@claude MISSINGSESSION SAWWHAT");
+  d = await idle("cancelrecover");
+  const saw = JSON.parse(lastAgent(d, "claude").text.replace(/^SAWJSON /, ""));
+  ok("the recovery replay reaches the agent at all",
+    /RECOVERHOLD/.test(saw.briefing), saw.briefing.slice(0, 300));
+  ok("…and actually replays the withdrawn entry as a placeholder",
+    /contents were withheld from you/.test(saw.briefing), saw.briefing.slice(0, 800));
+  ok("…without the body of the message that was never delivered",
+    !/RECOVERBODY/.test(saw.briefing), saw.briefing.slice(0, 800));
+  ok("…and without its attachment name, type or size",
+    !/leak\.txt/.test(saw.briefing) && !/LEAKEDFILEBODY/.test(saw.briefing) &&
+    !/Attached/.test(saw.briefing), saw.briefing.slice(0, 800));
+
+  // The half of a split @both that was already delivered has read the message
+  // and moved past it. The cancellation of its sibling has to reach it anyway.
+  await api("POST", "/api/rooms", { name: "splitnotice" });
+  await useFakes("splitnotice");
+  await say("splitnotice", "@codex SLEEP:2600 SAY:CODEXBUSY");
+  await sleep(200);
+  // SPLITSECRET rides only on the user's message; the reply echoes SPLITREPLY.
+  // Without a token the reply cannot repeat, "no body" would be untestable.
+  await say("splitnotice", "@both SPLITSECRET SAY:SPLITREPLY");
+  const splitNoticeQueue = (await room("splitnotice")).room.queue;
+  await api("POST", "/api/queue/cancel", { room: "splitnotice", groupId: splitNoticeQueue[0].queueGroupId });
+  d = await idle("splitnotice");
+  // The withheld seat goes first: an ACTIVITY reply echoes the delta into the
+  // transcript, so probing the delivered half first would put the body into
+  // ordinary context and make the next assertion meaningless.
+  await say("splitnotice", "@codex ACTIVITY");
+  d = await idle("splitnotice");
+  const withheldSaw = lastAgent(d, "codex").text;
+  ok("the seat it was withheld from gets the placeholder and no body",
+    !/SPLITSECRET/.test(withheldSaw) && /withheld from you/.test(withheldSaw),
+    withheldSaw.slice(0, 600));
+  await say("splitnotice", "@claude ACTIVITY");
+  d = await idle("splitnotice");
+  const siblingSaw = lastAgent(d, "claude").text;
+  const siblingActivity = JSON.parse(siblingSaw.replace(/^ACTIVITY /, ""));
+  const siblingNoticeLine = siblingActivity.split(/\r?\n/).find((line) =>
+    /^\(the user cancelled delivery of message #\d+ to codex before it started;/.test(line)) || "";
+  ok("the delivered half is told its sibling delivery was cancelled",
+    /codex did not receive it/.test(siblingNoticeLine), siblingActivity.slice(0, 600));
+  ok("…without telling the delivered half to disregard its own copy",
+    !/treat it as withdrawn/.test(siblingNoticeLine) && !/withheld from you/.test(siblingNoticeLine),
+    siblingNoticeLine);
+
+  // Cancel-all can drop unrelated dispatches for different seats in one call.
+  // The notice must retain each source→seat pairing; independent unions create
+  // a false cross-product, and a partial Retry must remove only its own record.
+  await api("POST", "/api/rooms", { name: "cancelmixed" });
+  await useFakes("cancelmixed");
+  await say("cancelmixed", "@claude SLEEP:2400 SAY:MIXHOLDCLAUDE");
+  await say("cancelmixed", "@codex SLEEP:2400 SAY:MIXHOLDCODEX");
+  await waitRoom("cancelmixed",
+    (x) => x.room.busy.includes("claude") && x.room.busy.includes("codex"), "both mixed-cancel seats busy");
+  await say("cancelmixed", "@claude SAY:MIXCLAUDEONLY");
+  await say("cancelmixed", "@codex SAWWHAT MIXCODEXONLY");
+  const mixedQueue = (await room("cancelmixed")).room.queue;
+  const mixedClaude = mixedQueue.find((item) => /MIXCLAUDEONLY/.test(item.text));
+  const mixedCodex = mixedQueue.find((item) => /MIXCODEXONLY/.test(item.text));
+  const mixedClaudeN = mixedClaude?.sourceN;
+  const mixedCodexN = mixedCodex?.sourceN;
+  ok("mixed-target messages are independently queued before Cancel all",
+    mixedQueue.length === 2 && mixedClaude?.agents.join() === "claude" && mixedCodex?.agents.join() === "codex",
+    JSON.stringify(mixedQueue));
+  await api("POST", "/api/queue/cancel", { room: "cancelmixed" });
+  d = await room("cancelmixed");
+  const mixedNotice = [...d.entries].reverse().find((e) => e.meta && e.meta.cancelledQueue);
+  const mixedRecords = (mixedNotice?.meta?.withdrawals || []).map((record) => ({
+    sourceN: record.sourceN, agents: [...record.agents].sort(),
+  }));
+  const mixedNoticeText = String(mixedNotice?.text || "");
+  ok("Cancel all preserves the source-to-seat mapping in its durable notice",
+    mixedRecords.length === 2 &&
+      mixedRecords.some((record) => record.sourceN === mixedClaudeN && record.agents.join() === "claude") &&
+      mixedRecords.some((record) => record.sourceN === mixedCodexN && record.agents.join() === "codex"),
+    JSON.stringify(mixedNotice));
+  ok("…and its user-visible text does not cross-product those mappings",
+    mixedNoticeText.includes(`message #${mixedClaudeN} was not delivered to claude`) &&
+      mixedNoticeText.includes(`message #${mixedCodexN} was not delivered to codex`) &&
+      !mixedNoticeText.includes(`message #${mixedClaudeN} was not delivered to codex`) &&
+      !mixedNoticeText.includes(`message #${mixedCodexN} was not delivered to claude`), mixedNoticeText);
+  d = await idle("cancelmixed");
+  const mixedRetry = await api("POST", "/api/retry", { room: "cancelmixed" });
+  ok("one dispatch from a mixed Cancel-all can be retried", mixedRetry.status === 200, JSON.stringify(mixedRetry.data));
+  d = await idle("cancelmixed");
+  const mixedSaw = JSON.parse(lastAgent(d, "codex").text.replace(/^SAWJSON /, ""));
+  const mixedState = JSON.parse(fs.readFileSync(path.join(ROOT, "cancelmixed", "state.json"), "utf8"));
+  ok("partial Retry clears only its source-to-seat withdrawal",
+    !mixedState.cancelledDeliveries[String(mixedCodexN)] &&
+      (mixedState.cancelledDeliveries[String(mixedClaudeN)] || []).join() === "claude",
+    JSON.stringify(mixedState.cancelledDeliveries));
+  ok("…and no live notice still claims the retried message was withheld",
+    /MIXCODEXONLY/.test(mixedSaw.prompt) &&
+      !mixedSaw.prompt.includes(`message #${mixedCodexN}`) &&
+      !/contents were withheld from you/.test(mixedSaw.prompt) &&
+      /cancelled delivery of this message to claude before it started/.test(mixedSaw.prompt),
+    mixedSaw.prompt.slice(0, 1000));
+
+  // Stop-everything drops the queue too, and those messages were never
+  // delivered either — so they must not come back as actionable context.
+  await api("POST", "/api/rooms", { name: "stopallwithdraw" });
+  await useFakes("stopallwithdraw");
+  await say("stopallwithdraw", "@claude SLEEP:2400 SAY:STOPALLHOLD");
+  await sleep(200);
+  await say("stopallwithdraw", "@claude SAY:STOPALLBODY");
+  ok("the message is queued when Stop everything arrives",
+    (await room("stopallwithdraw")).room.queued === 1);
+  await api("POST", "/api/stop", { room: "stopallwithdraw", scope: "all" });
+  d = await idle("stopallwithdraw");
+  ok("Stop everything records the queue it dropped as withdrawn",
+    d.entries.some((e) => e.kind === "system" && e.meta && e.meta.cancelledQueue),
+    JSON.stringify(texts(d, "system")));
+  await say("stopallwithdraw", "@claude ACTIVITY");
+  d = await idle("stopallwithdraw");
+  ok("…and that withdrawal survives into the seat's next turn",
+    !/STOPALLBODY/.test(lastAgent(d, "claude").text) &&
+    /contents were withheld from you/.test(lastAgent(d, "claude").text),
+    lastAgent(d, "claude").text.slice(0, 500));
+
+  // Retry delivers it after all, so the record of it never arriving has to go.
+  await api("POST", "/api/rooms", { name: "cancelretry" });
+  await useFakes("cancelretry");
+  const retrySummaries = await watchRoomSummaries("cancelretry");
+  await say("cancelretry", "@claude SLEEP:2400 SAY:RETRYHOLD");
+  await sleep(200);
+  await say("cancelretry", "@claude SLEEP:2400 SAY:RETRYBODY");
+  const retryQueue = (await room("cancelretry")).room.queue;
+  await api("POST", "/api/queue/cancel", { room: "cancelretry", groupId: retryQueue[0].queueGroupId });
+  const retrySource = String(retryQueue[0].sourceN);
+  const cancelSyncUntil = Date.now() + 1200;
+  while (!retrySummaries.seen.some((s) =>
+    (s.cancelledDeliveries?.[retrySource] || []).includes("claude") && s.busy.includes("claude")) &&
+      Date.now() < cancelSyncUntil) await sleep(25);
+  ok("cancelling broadcasts the withheld receipt state while the current response is still running",
+    retrySummaries.seen.some((s) =>
+      (s.cancelledDeliveries?.[retrySource] || []).includes("claude") && s.busy.includes("claude")),
+    JSON.stringify(retrySummaries.seen.map((s) => ({ busy: s.busy, cancelled: s.cancelledDeliveries }))));
+  d = await idle("cancelretry");
+  const summariesBeforeRetry = retrySummaries.seen.length;
+  const cancelRetried = await api("POST", "/api/retry", { room: "cancelretry" });
+  ok("a cancelled message can be retried", cancelRetried.status === 200, JSON.stringify(cancelRetried.data));
+  await waitRoom("cancelretry", (x) => x.room.busy.includes("claude"), "retried delivery running");
+  const retrySyncUntil = Date.now() + 900;
+  while (!retrySummaries.seen.slice(summariesBeforeRetry).some((s) => !s.cancelledDeliveries?.[retrySource]) &&
+      Date.now() < retrySyncUntil) await sleep(25);
+  ok("Retry broadcasts the cleared withdrawal before the retried response finishes",
+    retrySummaries.seen.slice(summariesBeforeRetry).some((s) => !s.cancelledDeliveries?.[retrySource]) &&
+      (await room("cancelretry")).room.busy.includes("claude"),
+    JSON.stringify(retrySummaries.seen.slice(summariesBeforeRetry)
+      .map((s) => ({ busy: s.busy, cancelled: s.cancelledDeliveries }))));
+  d = await idle("cancelretry");
+  await retrySummaries.stop();
+  ok("…and Retry actually delivers it", texts(d).includes("RETRYBODY"), JSON.stringify(texts(d)));
+  ok("…leaving no withdrawal marker behind",
+    !(JSON.parse(fs.readFileSync(path.join(ROOT, "cancelretry", "state.json"), "utf8"))
+      .cancelledDeliveries || {})[String(retryQueue[0].sourceN)]);
+  // Claude's own cursor has moved past it now, so ask the seat that still has
+  // it unseen: its delta is where a stale withdrawal marker would show up.
+  await say("cancelretry", "@codex ACTIVITY");
+  d = await idle("cancelretry");
+  const afterRetry = lastAgent(d, "codex").text;
+  ok("…so later history stops claiming it was never delivered",
+    !/cancelled/.test(afterRetry) && !/withheld/.test(afterRetry), afterRetry.slice(0, 500));
+  ok("…and it reads as an ordinary delivered message from then on",
+    /RETRYBODY/.test(afterRetry), afterRetry.slice(0, 500));
+
+  // The other seat is told who never got it, without being told to ignore it.
+  await api("POST", "/api/rooms", { name: "cancelother" });
+  await useFakes("cancelother");
+  await say("cancelother", "@claude SLEEP:2400 SAY:OTHERHOLD");
+  await sleep(200);
+  await say("cancelother", "@claude SAY:OTHERWITHDRAWN");
+  const otherQueue = (await room("cancelother")).room.queue;
+  await api("POST", "/api/queue/cancel", { room: "cancelother", groupId: otherQueue[0].queueGroupId });
+  d = await idle("cancelother");
+  await say("cancelother", "@codex ACTIVITY");
+  d = await idle("cancelother");
+  const otherSaw = lastAgent(d, "codex").text;
+  const otherActivity = JSON.parse(otherSaw.replace(/^ACTIVITY /, ""));
+  const otherMessageLine = otherActivity.split(/\r?\n/).find((line) => /OTHERWITHDRAWN/.test(line)) || "";
+  ok("the other seat is told who never received it, not told to ignore it",
+    /cancelled delivery of this message to claude before it started/.test(otherMessageLine) &&
+    !/withheld from you/.test(otherMessageLine), otherMessageLine);
+  ok("…and still receives the body, because nothing was withheld from it",
+    /OTHERWITHDRAWN/.test(otherMessageLine), otherMessageLine);
+
+  // A queued pair turn is one cycle owed to both seats, so cancelling it
+  // withdraws it from both — and pair Retry has to clear both again, or the
+  // seats that just did the work still read "withheld from you" afterwards.
+  await api("POST", "/api/rooms", { name: "pairretrycancel" });
+  await useFakes("pairretrycancel");
+  const pairState = () => JSON.parse(
+    fs.readFileSync(path.join(ROOT, "pairretrycancel", "state.json"), "utf8"));
+  await say("pairretrycancel", "/pair start @claude");
+  await say("pairretrycancel", "SLEEP:1500 SAY:PAIRWORK");
+  await sleep(300);
+  await say("pairretrycancel", "SAY:PAIRQUEUED");
+  const pairQueue = (await room("pairretrycancel")).room.queue;
+  ok("a pair turn waits as one whole cycle, not per seat",
+    pairQueue.length === 1 && pairQueue[0].kind === "cycle" && pairQueue[0].agents.length === 2,
+    JSON.stringify(pairQueue));
+  await api("POST", "/api/queue/cancel", { room: "pairretrycancel", groupId: pairQueue[0].queueGroupId });
+  const pairSourceN = String(pairQueue[0].sourceN);
+  ok("cancelling it withdraws the message from both seats",
+    (pairState().cancelledDeliveries[pairSourceN] || []).slice().sort().join() === "claude,codex",
+    JSON.stringify(pairState().cancelledDeliveries));
+  d = await idle("pairretrycancel");
+  const pairRetried = await api("POST", "/api/retry", { room: "pairretrycancel" });
+  ok("a cancelled pair turn can be retried", pairRetried.status === 200, JSON.stringify(pairRetried.data));
+  d = await idle("pairretrycancel");
+  ok("…and pair Retry clears the withdrawal for both seats",
+    !pairState().cancelledDeliveries[pairSourceN], JSON.stringify(pairState().cancelledDeliveries));
+  ok("…having actually run the retried cycle", texts(d).includes("PAIRQUEUED"), JSON.stringify(texts(d)));
+
+  // A follow-up answers the reply that mentioned it, not the user's message —
+  // which is exactly when the quote header earns its space.
+  await api("POST", "/api/rooms", { name: "replyref" });
+  await useFakes("replyref");
+  await say("replyref", "@claude TAG:codex"); // the @tag appears in the reply, not the message
+  d = await idle("replyref");
+  const refUser = d.entries.find((e) => e.kind === "user");
+  const refTrigger = d.entries.find((e) => e.kind === "agent" && e.author === "claude");
+  const refHop = d.entries.find((e) => e.kind === "agent" && e.author === "codex");
+  ok("a follow-up records the reply it answered and the root it hangs off",
+    !!refHop && !!refTrigger && refHop.meta.replyTo === refTrigger.n &&
+    refHop.meta.replyRoot === refUser.n,
+    JSON.stringify(refHop && refHop.meta));
 
   if (process.env.PARLEY_SKIP_NATIVE_KILL !== "1") {
     await api("POST", "/api/rooms", { name: "stoptree" });
@@ -2593,7 +3346,7 @@ async function main() {
     await say("stoptree", "@claude SPAWNCHILD:STOPTREE SLEEP:5000");
     await waitFile(childReady, "fake CLI descendant to start");
     const stopped = await api("POST", "/api/stop", { room: "stoptree" });
-    ok("Stop reports the running CLI", stopped.status === 200 && stopped.data.stopped === 1,
+    ok("Stop reports the running CLI", stopped.status === 200 && stopped.data.count === 1,
       JSON.stringify(stopped.data));
     await idle("stoptree");
     await sleep(1300);

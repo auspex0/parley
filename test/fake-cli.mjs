@@ -9,6 +9,9 @@
  *
  * The reply is driven by directives in the prompt, so tests stay declarative:
  *   SAY:<TOKEN>     reply with exactly TOKEN
+ *   SAWWHAT         reply with {briefing, prompt} as JSON (covers the briefing,
+ *                   which is where a session reset replays room history)
+ *   ACTIVITY        reply with the room-activity block verbatim, as JSON
  *   RECALL          reply with every ALLCAPS token seen in the room-activity
  *                   block (proves the delta protocol relayed the other agent)
  *   LURKARGS        expose argv from a listener turn
@@ -200,6 +203,19 @@ if (isReview) {
   })));
 } else if (has("ARGS")) {
   reply = "ARGV " + argv.join(" ");
+} else if (has("SAWWHAT")) {
+  // Everything Parley handed this invocation, briefing included — the briefing
+  // is where a session reset replays history, so it is the only place a
+  // recovery-path leak would show up.
+  const sep = ["", "", "---", "", ""].join("\n");
+  const briefingText = codexMode
+    ? (rawInput.includes(sep) ? rawInput.slice(0, rawInput.indexOf(sep)) : "")
+    : (arg("--append-system-prompt") || "");
+  reply = "SAWJSON " + JSON.stringify({ briefing: briefingText, prompt });
+} else if (has("ACTIVITY")) {
+  // The room-activity block verbatim, so a test can assert how an entry was
+  // relayed and not merely that some token survived.
+  reply = "ACTIVITY " + JSON.stringify(activity);
 } else if (has("RECALL")) {
   const tokens = [...new Set((activity.match(/\b[A-Z]{4,}\b/g) || []))]
     .filter((t) => !["RECALL", "ARGS", "CHIME", "NEEDSFIX", "ARGV"].includes(t));
