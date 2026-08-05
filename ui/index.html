@@ -112,6 +112,7 @@
   .pill.codex b { color: var(--codex); font-weight: 600; }
   .pill.linked .st { background: var(--user); }
   .pill.busy .st { background: #ffd479; animation: pulse 1s infinite; }
+  .hdot.withheld { background: none; border: 1px solid var(--danger); opacity: .75; position: relative; }
   .pill.bad .st { background: var(--danger); }
   .pill .ear { font-size: 13px; line-height: 1; padding: 0 1px; opacity: .25; filter: grayscale(1); transition: opacity .15s, filter .15s; }
   .pill .ear.on { opacity: 1; filter: none; }
@@ -325,6 +326,71 @@
   #stopMenu button { width: 100%; padding: 8px 10px; border-radius: 7px; text-align: left; color: var(--text-dim); }
   #stopMenu button:hover { background: var(--panel); color: var(--text); }
   #stopMenu button.stop-all { color: var(--danger); border-top: 1px solid var(--border); border-radius: 0 0 7px 7px; margin-top: 4px; padding-top: 9px; }
+  #stopMenu button.stop-scope { color: var(--text-dim); }
+  #stopMenu button .sm-sub { display: block; font-size: 10.5px; opacity: .62; margin-top: 1px; }
+
+  /* quote header: what a reply is answering. Lives between .meta and .bubble
+     so copying a message never picks up the quoted text. */
+  .quote-ref {
+    display: flex; gap: 7px; align-items: stretch; width: 100%; text-align: left;
+    margin: 0 0 4px 0; padding: 5px 8px; border-radius: 8px 8px 4px 4px;
+    background: var(--panel); border: 1px solid var(--border); cursor: pointer;
+    font-size: 11.5px; color: var(--text-dim); overflow: hidden;
+  }
+  .quote-ref:hover { background: var(--panel2); color: var(--text); }
+  .quote-ref .qr-bar { width: 2px; border-radius: 2px; background: currentColor; opacity: .5; flex-shrink: 0; }
+  .quote-ref .qr-body { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+  .quote-ref .qr-head { display: flex; gap: 6px; font-size: 10.5px; opacity: .75; }
+  .quote-ref .qr-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: .9; }
+
+  @keyframes jumpflash { 0%,100% { background: transparent } 25%,60% { background: rgba(122,162,247,.22) } }
+  .jump-flash { animation: jumpflash 1.6s ease-in-out; border-radius: 10px; }
+
+  /* composer strip: the same provenance, but only while its bubble is off-screen */
+  #busyStrip { display: none; flex-direction: column; gap: 4px; margin-bottom: 7px; }
+  #busyStrip button {
+    display: flex; align-items: center; gap: 6px; width: 100%; text-align: left;
+    padding: 5px 9px; border-radius: 9px; background: var(--panel); border: 1px solid var(--border);
+    font-size: 11.5px; color: var(--text-dim); overflow: hidden;
+  }
+  #busyStrip button:hover { background: var(--panel2); color: var(--text); }
+  #busyStrip .bs-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; animation: pulse 1s infinite; }
+  #busyStrip .bs-agent { font-weight: 600; flex-shrink: 0; }
+  #busyStrip .bs-verb, #busyStrip .bs-time { flex-shrink: 0; opacity: .8; }
+  #busyStrip .bs-snip { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: .72; }
+  #busyStrip .bs-more { justify-content: center; opacity: .8; }
+
+  /* queue popover */
+  #queueWrap { position: relative; display: inline-flex; }
+  #queueBadge {
+    display: none; align-items: center; gap: 5px; color: #e8b45c; font-size: 12px;
+    padding: 2px 7px; border-radius: 8px; border: 1px solid rgba(232,180,92,.32);
+  }
+  #queueBadge:hover { background: rgba(232,180,92,.12); }
+  #queuePop {
+    position: absolute; left: 0; bottom: calc(100% + 8px); display: none; width: 330px;
+    max-height: 320px; overflow-y: auto; padding: 7px; background: var(--panel2);
+    border: 1px solid var(--border2); border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,.5); z-index: 36;
+  }
+  #queueWrap.open #queuePop { display: block; }
+  .qp-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 3px 5px 7px; font-size: 11.5px; color: var(--text-faint); }
+  .qp-head button { color: var(--danger); font-size: 11.5px; padding: 2px 6px; border-radius: 6px; }
+  .qp-head button:hover { background: rgba(242,109,109,.14); }
+  .qp-card { padding: 7px 8px; border-radius: 9px; background: var(--panel); border: 1px solid var(--border); margin-bottom: 6px; }
+  .qp-card:last-child { margin-bottom: 0; }
+  .qp-top { display: flex; align-items: flex-start; gap: 6px; }
+  .qp-src { flex: 1; min-width: 0; text-align: left; color: var(--text-dim); font-size: 12px; }
+  .qp-src:hover { color: var(--text); }
+  .qp-src .qp-snip { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .qp-src .qp-meta { display: block; font-size: 10.5px; opacity: .62; margin-top: 1px; }
+  .qp-x { flex-shrink: 0; color: var(--text-faint); width: 20px; height: 20px; border-radius: 6px; }
+  .qp-x:hover { color: var(--danger); background: rgba(242,109,109,.14); }
+  .qp-rows { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 5px; font-size: 11px; color: var(--text-faint); }
+  .qp-row { display: inline-flex; align-items: center; gap: 5px; }
+  .qp-row .bs-dot { width: 6px; height: 6px; border-radius: 50%; }
+  .qp-row.running .bs-dot { animation: pulse 1s infinite; }
+  .qp-empty { padding: 10px; text-align: center; font-size: 12px; color: var(--text-faint); }
+
   .hint { text-align: center; font-size: 11.5px; color: var(--text-faint); margin-top: 8px; }
   .hint code { font-family: var(--mono); font-size: 11px; background: var(--panel); padding: 1px 5px; border-radius: 4px; }
 
@@ -487,9 +553,13 @@
           <button class="chip active" data-t="auto">Auto</button>
           <span id="seatChips" style="display:contents"></span>
           <button class="chip" data-t="both">@both</button>
-          <span id="queueBadge" style="display:none;color:#e8b45c;font-size:12px"></span>
+          <span id="queueWrap">
+            <button id="queueBadge" aria-haspopup="dialog" aria-expanded="false" title="See what's waiting"></button>
+            <div id="queuePop" role="dialog" aria-label="Queued work"></div>
+          </span>
           <span id="routeHint"></span>
         </div>
+        <div id="busyStrip" aria-live="polite"></div>
         <div id="draftImages" aria-label="Attachments ready to send"></div>
         <div class="box">
           <input id="fileInput" type="file" multiple hidden aria-label="Choose files to attach">
@@ -571,6 +641,10 @@ const state = {
   es: null,
   live: {},          // agent -> { el, mode:"think"|"stream", startedAt, text }
   streamTimer: {},   // agent -> throttle timer
+  queue: [],         // queue snapshot rows: one per still-pending delivery
+  // agent -> is its live bubble considered on screen. Undefined until the
+  // observer has measured it; only an explicit false shows the composer strip.
+  liveVisible: {},
   renderFromN: null, // first entry shown by the lazy initial transcript render
   expandedMessages: new Set(),
   expandedActivity: new Set(),
@@ -593,7 +667,7 @@ function toast(msg, isErr) {
 // This blocks blind/cross-origin requests; it is not a secret from local
 // processes, which can fetch the public page and read the embedded token.
 const TOKEN = (document.querySelector('meta[name="parley-token"]') || {}).content || "";
-const REQUIRED_RUNTIME_PROTOCOL = "4";
+const REQUIRED_RUNTIME_PROTOCOL = "5";
 const PAGE_RUNTIME_PROTOCOL = (document.querySelector('meta[name="parley-runtime-protocol"]') || {}).content || "";
 const withToken = (url) => url + (url.includes("?") ? "&" : "?") +
   "token=" + encodeURIComponent(TOKEN) + "&protocol=" + encodeURIComponent(REQUIRED_RUNTIME_PROTOCOL);
@@ -919,6 +993,7 @@ document.addEventListener("click", (e) => {
     $("stopWrap").classList.remove("open");
     $("stopBtn").setAttribute("aria-expanded", "false");
   }
+  if (!e.target.closest("#queueWrap")) closeQueuePop();
 });
 window.addEventListener("focus", () => { document.title = "Parley"; });
 
@@ -939,7 +1014,19 @@ $("jump").onclick = () => scrollBottom(true);
 
 // Receipt dots: for each participant other than the author, show whether they
 // heard this message live, lurked it, caught up later, or haven't seen it.
+// Withheld beats every other signal. A later high-water receipt spans a
+// withdrawn entry, and the seat's cursor moves past it too, so asking about
+// receipts or cursors first would report that the agent caught up on a message
+// it was never shown. Retry clears the record, and the dot goes back to normal.
+function withheldFrom(a, n) {
+  const map = (state.summary && state.summary.cancelledDeliveries) || {};
+  const seats = map[String(n)];
+  return Array.isArray(seats) && seats.includes(a);
+}
 function computeHeard(a, e) {
+  if (withheldFrom(a, e.n)) {
+    return { cls: "withheld", title: `${a} · you cancelled this before it was delivered — never shown to ${a}` };
+  }
   const r = state.receipts.find((x) => x.agent === a && x.from < e.n && e.n <= x.upTo);
   if (r) {
     const live = e.n >= r.turn; // heard as part of the exchange that delivered it
@@ -1028,6 +1115,7 @@ function entryEl(e) {
   const av = e.kind === "user" ? "" : `<span class="avatar">${esc((state.providers[e.author] && state.providers[e.author].avatar) || e.author[0].toUpperCase())}</span>`;
   div.innerHTML = `<div class="meta">${av}<span class="who">${label}</span><span>${hhmm(e.ts)}${dur}${tok}</span>` +
     `<button class="cpy" title="Copy message">📋</button></div>` +
+    entryQuoteHTML(e) +
     `<div class="bubble">${renderMD(e.text)}</div>` + heardHTML(e);
   renderEntryAttachments(e, div.querySelector(".bubble"));
   if ((e.text || "").length > 2500) {
@@ -1137,6 +1225,77 @@ function expandHistory() {
   chatWrap.style.scrollBehavior = behavior;
 }
 
+// ------------------------------------------------------- provenance + jumping
+// state.entries is kept sorted by turn number, so the lookup a quote header
+// needs on every render is a binary search rather than a scan.
+function entryIndexOf(n) {
+  let lo = 0, hi = state.entries.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const v = state.entries[mid].n;
+    if (v === n) return mid;
+    if (v < n) lo = mid + 1; else hi = mid - 1;
+  }
+  return -1;
+}
+function entryByN(n) {
+  const i = entryIndexOf(n);
+  return i < 0 ? null : state.entries[i];
+}
+function snippet(text, max = 160) {
+  const s = String(text || "").replace(/\s+/g, " ").trim();
+  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+}
+// The same shape the server sends in busyInfo, rebuilt from a local entry so
+// live bubbles and finished ones render through one code path.
+function refFromN(n) {
+  const e = entryByN(n);
+  if (!e) return null;
+  return { n: e.n, kind: e.kind, author: e.author, target: e.target || null, ts: e.ts, text: snippet(e.text) };
+}
+function refWho(src) {
+  return src.kind === "user" ? "you" : seatLabel(src.author);
+}
+
+function quoteRefHTML(src) {
+  if (!src || src.n === undefined || src.n === null) return "";
+  return `<button class="quote-ref" data-jump-n="${esc(String(src.n))}" title="Jump to this message">` +
+    `<span class="qr-bar"></span><span class="qr-body">` +
+    `<span class="qr-head"><span>↩ replying to ${esc(refWho(src))}</span><span>${esc(hhmm(src.ts))}</span></span>` +
+    `<span class="qr-text">${esc(src.text || "")}</span>` +
+    `</span></button>`;
+}
+
+// A finished reply keeps the reference its live bubble showed, always — that
+// is the whole point of putting the quote in the bubble rather than in a
+// transient strip, and it is what makes an old exchange readable months later.
+function entryQuoteHTML(e) {
+  if (e.kind !== "agent" || !e.meta || e.meta.replyTo === undefined || e.meta.replyTo === null) return "";
+  return quoteRefHTML(refFromN(e.meta.replyTo));
+}
+
+// Expanding first is not an optimisation. A target sitting in collapsed
+// scrollback has no element to find, and that is exactly when someone clicks a
+// quote — so without this the jump silently does nothing in the one case it
+// was built for.
+function jumpToEntry(n) {
+  expandHistory();
+  const el = chat.querySelector(`[data-n="${String(n).replace(/"/g, "")}"]`);
+  if (!el) return toast("That message isn't part of this conversation any more.", true);
+  el.scrollIntoView({ block: "center", behavior: "smooth" });
+  el.classList.remove("jump-flash");
+  void el.offsetWidth; // restart the highlight when the same entry is re-targeted
+  el.classList.add("jump-flash");
+  setTimeout(() => el.classList.remove("jump-flash"), 1800);
+  setTimeout(() => { $("jump").style.display = nearBottom() ? "none" : "block"; }, 400);
+}
+document.addEventListener("click", (e) => {
+  const target = e.target.closest("[data-jump-n]");
+  if (!target) return;
+  closeQueuePop();
+  jumpToEntry(Number(target.dataset.jumpN));
+});
+
 function renderAll({ stickToBottom = true, preserveTransient = true } = {}) {
   const oldTop = chatWrap.scrollTop;
   // Re-rendering the durable transcript must not erase a whisper or a local
@@ -1223,20 +1382,138 @@ function ensureLive(agent, startedAt, label) {
   if (state.live[agent]) return state.live[agent];
   const div = document.createElement("div");
   div.className = "msg agent " + agent;
+  div.dataset.liveAgent = agent;
   div.innerHTML = `<div class="meta"><span class="avatar">${esc((state.providers[agent] && state.providers[agent].avatar) || agent[0].toUpperCase())}</span>` +
     `<span class="who">${agent.charAt(0).toUpperCase() + agent.slice(1)}</span>` +
     `<span class="live-label">${label || "is thinking"} <span class="elapsed"></span></span></div>` +
+    `<div class="quote-slot"></div>` +
     `<div class="bubble"><span class="thinking-dots"><i></i><i></i><i></i></span></div>`;
   chat.appendChild(div);
   state.live[agent] = { el: div, mode: "think", startedAt: startedAt || Date.now(), text: "" };
+  liveObserver.observe(div);
+  applyLiveRef(agent);
   scrollBottom();
+  scheduleVisibility();
   return state.live[agent];
 }
 function removeLive(agent) {
   const l = state.live[agent];
-  if (l) { l.el.remove(); delete state.live[agent]; }
+  if (l) { liveObserver.unobserve(l.el); l.el.remove(); delete state.live[agent]; }
+  delete state.liveVisible[agent];
   if (state.streamTimer[agent]) { clearTimeout(state.streamTimer[agent]); delete state.streamTimer[agent]; }
+  renderBusyStrip();
 }
+
+// ---- provenance while busy ----
+// One source of truth for both surfaces: the quote header inside the live
+// bubble (primary, and it becomes scrollback once the reply lands) and the
+// composer strip (fallback, only while that bubble is off-screen).
+function busyInfoFor(agent) {
+  const list = (state.summary && state.summary.busyInfo) || [];
+  return list.find((b) => b.agent === agent) || null;
+}
+function applyLiveRef(agent) {
+  const l = state.live[agent];
+  if (!l) return;
+  const slot = l.el.querySelector(".quote-slot");
+  if (!slot) return;
+  const info = busyInfoFor(agent);
+  const src = info && info.source ? info.source : null;
+  const html = src ? quoteRefHTML(src) : "";
+  if (slot.innerHTML !== html) slot.innerHTML = html;
+}
+function applyLiveRefs() {
+  for (const agent of Object.keys(state.live)) applyLiveRef(agent);
+}
+
+const PHASE_VERB = {
+  start: "replying to", hop: "replying to", retrying: "replying to",
+  listening: "listening in on", review: "reviewing", fix: "fixing after",
+};
+const RUNNING_VERB = {
+  start: "responding", hop: "responding", retrying: "responding",
+  listening: "listening", review: "reviewing", fix: "fixing",
+};
+
+// Hysteresis, not a boolean. Showing the strip the instant the bubble's last
+// pixel leaves and hiding it the instant the first returns makes it blink
+// while you scroll past the boundary; fully-gone to show, half-back to hide.
+//
+// "Half back" is measured against whichever is smaller, the bubble or the
+// viewport. An observer threshold cannot express that: thresholds are ratios
+// of the *target*, so a reply three viewports tall tops out around 0.33 and
+// would never cross 0.5 — the strip would sit there covering a bubble that
+// fills the screen. So the observer is only the nudge; the rects decide.
+function measureLiveVisibility() {
+  const root = chatWrap.getBoundingClientRect();
+  for (const [agent, l] of Object.entries(state.live)) {
+    const r = l.el.getBoundingClientRect();
+    const shown = Math.max(0, Math.min(r.bottom, root.bottom) - Math.max(r.top, root.top));
+    const half = Math.min(r.height, root.height) * 0.5;
+    if (shown <= 0) state.liveVisible[agent] = false;
+    else if (half > 0 && shown >= half) state.liveVisible[agent] = true;
+    else if (state.liveVisible[agent] === undefined) state.liveVisible[agent] = true;
+    // Anything between the two edges keeps whatever it already was — that gap
+    // is the hysteresis.
+  }
+}
+let visibilityFrame = 0;
+function scheduleVisibility() {
+  if (visibilityFrame) return;
+  const run = () => {
+    visibilityFrame = 0;
+    measureLiveVisibility();
+    renderBusyStrip();
+  };
+  visibilityFrame = typeof requestAnimationFrame === "function"
+    ? requestAnimationFrame(run) : setTimeout(run, 16);
+}
+// The observer catches what scrolling does not: the bubble growing as a reply
+// streams in, the composer resizing, the window changing shape.
+const liveObserver = typeof IntersectionObserver === "function"
+  ? new IntersectionObserver(scheduleVisibility, { root: chatWrap, threshold: [0, 0.25, 0.5, 0.75, 1] })
+  // Without it the scroll handler still measures; only layout changes that
+  // move nothing would be missed. One optional surface must not be able to
+  // take the whole page down.
+  : { observe() {}, unobserve() {} };
+chatWrap.addEventListener("scroll", scheduleVisibility);
+
+function stripRowHTML(b) {
+  const src = b.source;
+  const verb = PHASE_VERB[b.phase] || "replying to";
+  return `<button class="bs-row"${src ? ` data-jump-n="${esc(String(src.n))}" title="Jump to this message"` : ""}>` +
+    `<span class="bs-dot" style="background:${esc(seatColor(b.agent))}"></span>` +
+    `<span class="bs-agent">${esc(seatLabel(b.agent))}</span>` +
+    `<span class="bs-verb">→ ${esc(verb)}${src ? ` ${esc(refWho(src))}` : ""}</span>` +
+    (src ? `<span class="bs-time">· ${esc(hhmm(src.ts))}</span>` +
+      `<span class="bs-snip">· “${esc(src.text || "")}”</span>` : "") +
+    `</button>`;
+}
+
+const STRIP_ROW_CAP = 2;
+function renderBusyStrip() {
+  const strip = $("busyStrip");
+  if (!strip) return;
+  const info = (state.summary && state.summary.busyInfo) || [];
+  // Fallback only: while the bubble is on screen its own quote header is
+  // already saying this, and two copies of one line is worse than none.
+  const rows = info.filter((b) => state.liveVisible[b.agent] === false);
+  if (!rows.length) {
+    strip.style.display = "none";
+    strip.innerHTML = "";
+    return;
+  }
+  const shown = rows.slice(0, STRIP_ROW_CAP);
+  const rest = rows.length - shown.length;
+  strip.style.display = "flex";
+  strip.innerHTML = shown.map(stripRowHTML).join("") +
+    (rest > 0 ? `<button class="bs-more" data-scroll-live="1">+${rest} more</button>` : "");
+}
+$("busyStrip").addEventListener("click", (e) => {
+  if (!e.target.closest("[data-scroll-live]")) return;
+  const first = Object.values(state.live)[0];
+  if (first) first.el.scrollIntoView({ block: "center", behavior: "smooth" });
+});
 function clearLive() {
   for (const agent of Object.keys(state.live)) removeLive(agent);
 }
@@ -1366,6 +1643,7 @@ function isConservative(mode) {
 }
 function applySummary(s) {
   s.busy = s.busy || [];
+  s.busyInfo = s.busyInfo || [];
   for (const agent of Object.keys(state.live)) {
     if (!s.busy.includes(agent)) removeLive(agent);
   }
@@ -1445,7 +1723,9 @@ function applySummary(s) {
     ? `Linked project — open ${s.cfg.projectDir}`
     : `This room's own scratch folder — open ${s.workspace}`;
   for (const a of s.busy) ensureLive(a);
-  setQueue(s.queued || 0);
+  applyLiveRefs();
+  renderBusyStrip();
+  setQueue(s.queued || 0, s.queue, s.queuedDispatches);
   refreshHeard(0, Infinity); // busy/cursor changes can flip pending/unheard dots
   updateBusyUI();
   updateRouteHint();
@@ -1486,7 +1766,9 @@ const stopIsChoice = (s) => (s.busy || []).length > 1 || s.queued > 0 ||
 function updateBusyUI() {
   const summary = state.summary;
   const active = summary ? summary.busy : [];
-  const visible = !!summary && (active.length > 0 || summary.working);
+  // Queued-but-idle counts: the queue is work the user asked for, and the menu
+  // is where they cancel it without touching anything that is running.
+  const visible = !!summary && (active.length > 0 || summary.working || (summary.queued || 0) > 0);
   const wrap = $("stopWrap");
   wrap.style.display = visible ? "block" : "none"; // sending stays allowed — messages queue
   if (!visible) {
@@ -1498,15 +1780,130 @@ function updateBusyUI() {
   $("stopBtn").title = choose ? "Choose which response to stop" :
     active.length === 1 ? `Stop ${seatLabel(active[0])}` :
       summary.workingPair ? "Stop the pair cycle" : "Stop the exchange";
-  $("stopMenu").innerHTML = active.map((a) =>
-    `<button role="menuitem" data-stop-agent="${esc(a)}">■ Stop ${esc(seatLabel(a))}</button>`).join("") +
-    (choose ? `<button role="menuitem" class="stop-all" data-stop-agent="">■ Stop all</button>` : "");
+  // Five explicit intentions instead of one button and a guess: each seat on
+  // its own, the actives without the queue, the queue without the actives, and
+  // the blunt everything. Each entry says what survives it.
+  // Deliveries are what the lanes owe; messages are what the user sent. One
+  // @both held for both seats is two deliveries and one message — so labels
+  // count dispatches, never rows.
+  const queued = summary.queued || 0;
+  const queuedMessages = summary.queuedDispatches === undefined
+    ? queued : summary.queuedDispatches;
+  const rows = active.map((a) =>
+    `<button role="menuitem" class="stop-scope" data-stop-scope="seat" data-stop-agent="${esc(a)}">` +
+    `■ Stop ${esc(seatLabel(a))}'s current response</button>`);
+  if (active.length) {
+    rows.push(`<button role="menuitem" class="stop-scope" data-stop-scope="active">` +
+      `■ Stop current responses<span class="sm-sub">keeps queued work</span></button>`);
+  }
+  if (queued > 0) {
+    rows.push(`<button role="menuitem" class="stop-scope" data-stop-scope="queue">` +
+      `✕ Cancel ${queuedMessages} queued message${queuedMessages === 1 ? "" : "s"}` +
+      `<span class="sm-sub">keeps active responses</span></button>`);
+  }
+  rows.push(`<button role="menuitem" class="stop-all" data-stop-scope="all">` +
+    `■ Stop everything<span class="sm-sub">responses, pair cycle, hops, lurkers and queue</span></button>`);
+  $("stopMenu").innerHTML = rows.join("");
 }
-function setQueue(n) {
+
+// ---- queued work ----
+function setQueue(n, items, dispatches) {
+  if (items) state.queue = items;
+  if (state.summary) {
+    state.summary.queued = n;
+    if (dispatches !== undefined) state.summary.queuedDispatches = dispatches;
+  }
+  const shown = dispatches === undefined ? n : dispatches;
   const b = $("queueBadge");
-  b.style.display = n > 0 ? "inline" : "none";
-  b.textContent = `⏳ ${n} queued`;
+  b.style.display = n > 0 ? "inline-flex" : "none";
+  b.textContent = `⏳ ${shown} queued`;
+  if (n <= 0) closeQueuePop();
+  else if ($("queueWrap").classList.contains("open")) renderQueuePop();
+  // The Stop menu offers "cancel the queue" and counts what it would drop, so
+  // it goes stale the moment the queue moves — including when the queue drains
+  // on its own, with no status or summary event behind it.
+  updateBusyUI();
 }
+function closeQueuePop() {
+  const wrap = $("queueWrap");
+  if (!wrap.classList.contains("open")) return;
+  wrap.classList.remove("open");
+  $("queueBadge").setAttribute("aria-expanded", "false");
+}
+// One card per dispatch, never per source message: a message that produced a
+// second batch owes two independent things, and a single ✕ over both would
+// cancel more than the user pointed at. Repeat dispatches from one message
+// therefore render as sibling cards with the same snippet.
+function queueGroups() {
+  const groups = [], byKey = new Map();
+  for (const item of state.queue || []) {
+    const key = item.queueGroupId || `seq:${item.seq}`;
+    let g = byKey.get(key);
+    if (!g) {
+      g = {
+        key, groupId: item.queueGroupId, sourceN: item.sourceN,
+        text: item.text, ts: item.ts, target: item.target, rows: [],
+      };
+      byKey.set(key, g);
+      groups.push(g);
+    }
+    for (const a of item.agents) {
+      g.rows.push({ agent: a, pos: (item.positions || {})[a] || 0, kind: item.kind });
+    }
+  }
+  return groups;
+}
+function queueCardHTML(g) {
+  // Whatever this dispatch's source already has running belongs on the same
+  // card — the point of the view is the whole life of one thing you sent.
+  // Match on the dispatch, not the source message: two dispatches from one
+  // message share a rootN, and matching on that would let both cards claim the
+  // same running seat. Older runs without an id simply do not match.
+  const running = ((state.summary && state.summary.busyInfo) || [])
+    .filter((b) => !!g.groupId && b.queueGroupId === g.groupId);
+  const runRows = running.map((b) =>
+    `<span class="qp-row running"><i class="bs-dot" style="background:${esc(seatColor(b.agent))}"></i>` +
+    `${esc(seatLabel(b.agent))} ${esc(RUNNING_VERB[b.phase] || "responding")}</span>`);
+  const waitRows = g.rows.map((r) =>
+    `<span class="qp-row"><i class="bs-dot" style="background:${esc(seatColor(r.agent))}"></i>` +
+    `${esc(seatLabel(r.agent))} ${r.kind === "cycle" ? "pair cycle queued" : "queued"}` +
+    `${r.pos ? ` #${r.pos}` : ""}</span>`);
+  const meta = [hhmm(g.ts), g.target ? `@${g.target}` : ""].filter(Boolean).join(" · ");
+  return `<div class="qp-card">` +
+    `<div class="qp-top">` +
+    `<button class="qp-src"${g.sourceN === null || g.sourceN === undefined ? "" : ` data-jump-n="${esc(String(g.sourceN))}"`} title="Jump to this message">` +
+    `<span class="qp-snip">${esc(g.text || "(no text)")}</span><span class="qp-meta">${esc(meta)}</span></button>` +
+    (g.groupId ? `<button class="qp-x" data-cancel-group="${esc(g.groupId)}" ` +
+      `title="Cancel everything this message still has waiting — anything already running continues">✕</button>` : "") +
+    `</div><div class="qp-rows">${runRows.join("")}${waitRows.join("")}</div></div>`;
+}
+function renderQueuePop() {
+  const groups = queueGroups();
+  $("queuePop").innerHTML = groups.length
+    ? `<div class="qp-head"><span>Queued work</span>` +
+      `<button data-cancel-group="" title="Drop everything still waiting; running responses continue">Cancel all queued</button></div>` +
+      groups.map(queueCardHTML).join("")
+    : `<div class="qp-empty">Nothing is waiting.</div>`;
+}
+$("queueBadge").onclick = (e) => {
+  e.stopPropagation();
+  const wrap = $("queueWrap");
+  const open = !wrap.classList.contains("open");
+  wrap.classList.toggle("open", open);
+  $("queueBadge").setAttribute("aria-expanded", String(open));
+  if (open) renderQueuePop();
+};
+$("queuePop").addEventListener("click", async (e) => {
+  const btn = e.target.closest("[data-cancel-group]");
+  if (!btn) return;
+  const groupId = btn.dataset.cancelGroup;
+  try {
+    const r = await api("/api/queue/cancel", { room: state.room, ...(groupId ? { groupId } : {}) });
+    // Already drained is not a failure: what the user asked to be gone is gone.
+    toast(r.cancelled ? `Cancelled ${r.cancelled} queued deliver${r.cancelled === 1 ? "y" : "ies"}.`
+      : "That was already out of the queue.");
+  } catch (err) { toast(err.message, true); }
+});
 function guessTextTarget(raw) {
   const text = raw.trim();
   if (!text || !state.summary) return null;
@@ -1599,8 +1996,7 @@ function connect(resyncOnOpen = false) {
     if (msg.type === "entry") addEntry(msg.entry);
     else if (msg.type === "receipt") addReceipt(msg.receipt);
     else if (msg.type === "queue") {
-      if (state.summary) state.summary.queued = msg.size;
-      setQueue(msg.size);
+      setQueue(msg.size, msg.items, msg.dispatches);
     }
     else if (msg.type === "lurk") whisper(msg.agent, msg.error, msg.hop, msg.skipped);
     else if (msg.type === "status") {
@@ -1608,6 +2004,22 @@ function connect(resyncOnOpen = false) {
         const b = state.summary.busy || [];
         if (msg.phase === "done") state.summary.busy = b.filter((x) => x !== msg.agent);
         else if (!b.includes(msg.agent)) b.push(msg.agent);
+        // busyInfo tracks the same set with the provenance attached, so it has
+        // to move in step or the quote header outlives the run it describes.
+        const info = (state.summary.busyInfo || []).filter((x) => x.agent !== msg.agent);
+        if (msg.phase !== "done") {
+          info.push({
+            agent: msg.agent, runId: msg.runId || null, phase: msg.phase,
+            startedAt: msg.startedAt,
+            rootN: msg.rootN === undefined ? null : msg.rootN,
+            sourceN: msg.sourceN === undefined ? null : msg.sourceN,
+            // Without this a delayed delivery could not show as "responding"
+            // on its own queue card until the next full room summary.
+            queueGroupId: msg.queueGroupId || null,
+            source: msg.source || null,
+          });
+        }
+        state.summary.busyInfo = info;
         const pill = $("pill_" + msg.agent);
         if (pill) pill.classList.toggle("busy", state.summary.busy.includes(msg.agent));
         updateBusyUI();
@@ -1621,6 +2033,9 @@ function connect(resyncOnOpen = false) {
         const l = ensureLive(msg.agent);
         l.el.querySelector(".live-label").innerHTML = 'is restoring its session <span class="elapsed"></span>';
       } else if (msg.phase === "done") removeLive(msg.agent);
+      applyLiveRef(msg.agent);
+      renderBusyStrip();
+      if ($("queueWrap").classList.contains("open")) renderQueuePop();
     }
     else if (msg.type === "stream") liveStream(msg.agent, msg.text);
     else if (msg.type === "room") {
@@ -1633,6 +2048,9 @@ function connect(resyncOnOpen = false) {
       clearLive();
       state.entries = [];
       state.receipts = [];
+      state.queue = [];
+      state.liveVisible = {};
+      closeQueuePop();
       state.renderFromN = null;
       state.expandedMessages.clear();
       state.expandedActivity.clear();
@@ -1678,8 +2096,11 @@ async function loadRoom(name) {
   const validChips = new Set(["auto", "both", ...(data.room.seats || [])]);
   if (!validChips.has(state.chip)) state.chip = "auto";
   clearLive();
+  closeQueuePop();
   state.entries = data.entries;
   state.receipts = data.receipts || [];
+  state.queue = data.room.queue || [];
+  state.liveVisible = {};
   state.expandedMessages.clear();
   state.expandedActivity.clear();
   state.renderFromN = state.entries.length > INITIAL_ENTRY_LIMIT
@@ -2048,24 +2469,49 @@ window.addEventListener("drop", (e) => {
   if (state.sending) return toast("Wait for the current message to finish sending.", true);
   addDraftFiles(files);
 });
-async function stopResponses(agent) {
+// Naming the run pins the click to the response the user was looking at, so a
+// slow click can never land on the next one. If that response has already
+// ended the server says so and this returns quietly — an error toast there is
+// exactly what makes someone press Stop a second time.
+async function stopResponses(scope, agent) {
   $("stopWrap").classList.remove("open");
   $("stopBtn").setAttribute("aria-expanded", "false");
+  const info = agent ? busyInfoFor(agent) : null;
+  // "Stop the current responses" means the ones on screen when it was clicked.
+  // Between the click and the request landing, a run can finish and the queue
+  // can start the next one in that seat; unpinned, that is what would die.
+  const pinned = scope === "active"
+    ? ((state.summary && state.summary.busyInfo) || [])
+      .filter((b) => b.runId).map((b) => ({ agent: b.agent, runId: b.runId }))
+    : null;
   try {
-    await api("/api/stop", { room: state.room, ...(agent ? { agent } : {}) });
+    const r = await api("/api/stop", {
+      room: state.room, scope,
+      ...(agent ? { agent } : {}),
+      ...(info && info.runId ? { runId: info.runId } : {}),
+      ...(pinned ? { runs: pinned } : {}),
+    });
+    if (r && r.stale) return; // already over; the user's intent already holds
+    if (scope === "queue") {
+      toast(r && r.cancelled
+        ? `Cancelled ${r.cancelled} queued deliver${r.cancelled === 1 ? "y" : "ies"} — running responses continue.`
+        : "Nothing was left in the queue.");
+    }
   } catch (e) { toast(e.message, true); }
 }
 $("stopBtn").onclick = () => {
   if (!state.summary) return;
   const active = state.summary.busy || [];
-  if (!stopIsChoice(state.summary)) return stopResponses(active[0] || null);
+  if (!stopIsChoice(state.summary)) {
+    return active.length === 1 ? stopResponses("seat", active[0]) : stopResponses("all", null);
+  }
   const wrap = $("stopWrap");
   const open = wrap.classList.toggle("open");
   $("stopBtn").setAttribute("aria-expanded", String(open));
 };
 $("stopMenu").onclick = (e) => {
-  const choice = e.target.closest("[data-stop-agent]");
-  if (choice) stopResponses(choice.dataset.stopAgent || null);
+  const choice = e.target.closest("[data-stop-scope]");
+  if (choice) stopResponses(choice.dataset.stopScope, choice.dataset.stopAgent || null);
 };
 input.addEventListener("keydown", (e) => {
   if (mentionKeydown(e)) return;
