@@ -14,7 +14,9 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import crypto from "node:crypto";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import vm from "node:vm";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const SERVER = path.join(here, "..", "parley.mjs");
@@ -32,7 +34,7 @@ function ok(name, cond, detail) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 let TOKEN = ""; // read out of the served page, exactly as the browser does
-const RUNTIME_PROTOCOL = "1";
+const RUNTIME_PROTOCOL = "4";
 
 async function api(method, route, body) {
   const res = await fetch(base + route, method === "GET"
@@ -310,6 +312,684 @@ async function checkUiSnapshot() {
   try { fs.rmSync(fixture, { recursive: true, force: true }); } catch { /* best effort */ }
 }
 
+async function bootAuxServer(entry, root, extraEnv = {}) {
+  const proc = spawn(process.execPath, [entry, "--no-open", "--port", "0", "--root", root], {
+    env: { ...process.env, ...extraEnv },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let log = "";
+  proc.stdout.on("data", (chunk) => { log += chunk.toString(); });
+  proc.stderr.on("data", (chunk) => { log += chunk.toString(); });
+
+  let auxBase = null;
+  const until = Date.now() + 8000;
+  while (Date.now() < until) {
+    const match = /UI:\s+(http:\/\/127\.0\.0\.1:\d+)/.exec(log);
+    if (match) { auxBase = match[1]; break; }
+    if (proc.exitCode !== null) break;
+    await sleep(50);
+  }
+  if (!auxBase) {
+    try { proc.kill(); } catch { /* already gone */ }
+    throw new Error(`auxiliary server did not start (exit=${proc.exitCode}): ${log.slice(-500)}`);
+  }
+
+  const page = await fetch(auxBase + "/").then((r) => r.text());
+  const token = (/name="parley-token" content="([^"]+)"/.exec(page) || [])[1] || "";
+  const request = async (method, route, body) => {
+    const res = await fetch(auxBase + route, method === "GET" ? {
+      headers: { "X-Parley-Token": token, "X-Parley-Runtime-Protocol": RUNTIME_PROTOCOL },
+    } : {
+      method,
+      headers: {
+        "Content-Type": "application/json",
+        "X-Parley-Token": token,
+        "X-Parley-Runtime-Protocol": RUNTIME_PROTOCOL,
+      },
+      body: JSON.stringify(body || {}),
+    });
+    return { status: res.status, data: await res.json().catch(() => ({})) };
+  };
+  const stop = async () => {
+    if (proc.exitCode === null) {
+      try { proc.kill(); } catch { /* already gone */ }
+      await Promise.race([new Promise((resolve) => proc.once("close", resolve)), sleep(2000)]);
+    }
+  };
+  return { proc, request, stop, log: () => log };
+}
+
+async function waitAuxRoom(aux, name, predicate, ms = 8000) {
+  const until = Date.now() + ms;
+  let latest = null;
+  while (Date.now() < until) {
+    latest = (await aux.request("GET", `/api/room?name=${encodeURIComponent(name)}`)).data;
+    if (predicate(latest)) return latest;
+    await sleep(80);
+  }
+  return latest;
+}
+
+// A bare command must honor PATH directory order. The npm shim comes first;
+// a later executable with the same name must not replace it merely because it
+// has an .exe extension.
+async function checkWindowsCommandPrecedence() {
+  if (process.platform !== "win32") return;
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "parley-path-order-"));
+  const early = path.join(fixture, "early");
+  const late = path.join(fixture, "late");
+  const auxRoot = path.join(fixture, "rooms");
+  const command = "parley-path-probe";
+  fs.mkdirSync(early);
+  fs.mkdirSync(late);
+  fs.copyFileSync(FAKE, path.join(early, "fake-cli.mjs"));
+  fs.writeFileSync(path.join(early, command + ".cmd"), '@ECHO off\r\n"%dp0%\\fake-cli.mjs" %*\r\n');
+  fs.copyFileSync(path.join(process.env.SystemRoot || "C:\\Windows", "System32", "where.exe"),
+    path.join(late, command + ".exe"));
+
+  let aux = null;
+  try {
+    aux = await bootAuxServer(SERVER, auxRoot, {
+      PATH: [early, late, process.env.PATH || ""].join(path.delimiter),
+      FAKE_DELAY_MS: "10",
+    });
+    await aux.request("POST", "/api/rooms", { name: "pathorder" });
+    await aux.request("POST", "/api/config", {
+      room: "pathorder",
+      config: { agents: { claude: { command: FAKE }, codex: { command } } },
+    });
+    await aux.request("POST", "/api/message", { room: "pathorder", text: "@codex SAY:SHIM_WON", target: "auto" });
+    const d = await waitAuxRoom(aux, "pathorder", (roomData) => roomData && roomData.entries.some((e) =>
+      (e.kind === "agent" && e.author === "codex") || (e.kind === "system" && e.meta && e.meta.error)));
+    const reply = d && [...d.entries].reverse().find((e) => e.kind === "agent" && e.author === "codex");
+    const providerError = d && d.entries.find((e) => e.kind === "system" && e.meta && e.meta.error);
+    ok("Windows command resolution preserves PATH directory order",
+      !!reply && reply.text === "SHIM_WON" && !providerError,
+      providerError ? providerError.text : aux.log().slice(-300));
+  } catch (e) {
+    ok("Windows command resolution preserves PATH directory order", false, e.message);
+  } finally {
+    if (aux) await aux.stop();
+    try { fs.rmSync(fixture, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
+}
+
+// Node can throw from spawn() synchronously (Windows EPERM is one example).
+// Force that edge so it remains a normal provider launch error rather than a
+// raw exception escaping the process runner.
+async function checkSynchronousSpawnFailure() {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "parley-sync-spawn-"));
+  const auxRoot = path.join(fixture, "rooms");
+  const marker = path.join(fixture, "forced-spawn-error");
+  const wrapper = path.join(fixture, "server-wrapper.mjs");
+  fs.writeFileSync(marker, "not an executable\n");
+  fs.writeFileSync(wrapper, `
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+const realSpawn = childProcess.spawn;
+const marker = process.env.PARLEY_SYNC_THROW_MARKER;
+childProcess.spawn = function(command, args, options) {
+  if (String(command) === marker) {
+    const error = new Error("forced spawn EPERM");
+    error.code = "EPERM";
+    throw error;
+  }
+  return realSpawn(command, args, options);
+};
+syncBuiltinESMExports();
+await import(${JSON.stringify(pathToFileURL(SERVER).href)});
+`);
+
+  let aux = null;
+  try {
+    aux = await bootAuxServer(wrapper, auxRoot, { PARLEY_SYNC_THROW_MARKER: marker });
+    await aux.request("POST", "/api/rooms", { name: "syncspawn" });
+    await aux.request("POST", "/api/config", {
+      room: "syncspawn",
+      config: { agents: { claude: { command: FAKE }, codex: { command: marker } } },
+    });
+    await aux.request("POST", "/api/message", { room: "syncspawn", text: "@codex hello", target: "auto" });
+    const d = await waitAuxRoom(aux, "syncspawn", (roomData) => roomData && roomData.entries.some((e) =>
+      e.kind === "system" && e.meta && e.meta.agent === "codex" && e.meta.error));
+    const errorEntry = d && [...d.entries].reverse().find((e) =>
+      e.kind === "system" && e.meta && e.meta.agent === "codex" && e.meta.error);
+    const stillAlive = (await aux.request("GET", "/api/rooms")).status === 200 && aux.proc.exitCode === null;
+    ok("synchronous spawn failures become actionable provider errors",
+      stillAlive && !!errorEntry && errorEntry.text.includes("could not launch codex") &&
+        errorEntry.text.includes("forced spawn EPERM"),
+      errorEntry ? errorEntry.text : aux.log().slice(-300));
+  } catch (e) {
+    ok("synchronous spawn failures become actionable provider errors", false, e.message);
+  } finally {
+    if (aux) await aux.stop();
+    try { fs.rmSync(fixture, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
+}
+
+// Browse… was dead because every folder-picker failure resolved as "cancelled"
+// and the UI does nothing on a cancel. Each way the dialog can end must be
+// distinguishable, and a chatty picker must not deadlock on its own stderr.
+async function checkFolderPicker() {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "parley-pickfolder-"));
+  const auxRoot = path.join(fixture, "rooms");
+  const picker = path.join(fixture, "fake-picker.mjs");
+  const wrapper = path.join(fixture, "server-wrapper.mjs");
+  const chosen = path.join(fixture, "chosen-project");
+  fs.mkdirSync(chosen);
+
+  // Stands in for powershell/osascript/zenity: a real child with real pipes,
+  // so exit codes, stderr pressure and kills behave the way they do in life.
+  fs.writeFileSync(picker, `
+const mode = process.argv[2];
+const chosen = process.argv[3];
+if (mode === "ok") { process.stdout.write(chosen + "\\n"); process.exit(0); }
+if (mode === "cancel") process.exit(0);
+if (mode === "fail") { process.stderr.write("Add-Type : dialog unavailable\\nat line 2\\n"); process.exit(3); }
+if (mode === "noisy") {
+  process.stderr.write("x".repeat(400000));   // far past the 64 KB pipe buffer
+  process.stdout.write(chosen + "\\n");
+  process.exit(0);
+}
+// osascript and zenity report a *user cancel* with a non-zero exit.
+if (mode === "maccancel") { process.stderr.write("0:35: execution error: User canceled. (-128)\\n"); process.exit(1); }
+if (mode === "macfail") { process.stderr.write("0:0: execution error: no window server (-1728)\\n"); process.exit(1); }
+if (mode === "zenitycancel") process.exit(1);
+// GTK chatters on stderr during perfectly ordinary runs; exit 1 is still a cancel.
+if (mode === "zenitywarncancel") { process.stderr.write("Gtk-Message: Failed to load module \\"canberra-gtk-module\\"\\n"); process.exit(1); }
+if (mode === "zenityfail") { process.stderr.write("Gtk: cannot open display\\n"); process.exit(255); }
+// Printed a path, then died: not an answer the user confirmed.
+if (mode === "printthenfail") {
+  process.stdout.write(chosen + "\\n");
+  process.stderr.write("picker crashed after printing\\n");
+  process.exit(3);
+}
+if (mode === "printthenhang") { process.stdout.write(chosen + "\\n"); setInterval(() => {}, 1000); }
+setInterval(() => {}, 1000); // "hang": wait for the timeout to kill us
+`);
+  fs.writeFileSync(wrapper, `
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+// The picker Parley reaches for is chosen by platform, so exercising the macOS
+// and Linux cancel conventions means telling the server it is on one.
+const forced = process.env.PARLEY_TEST_PLATFORM;
+if (forced) Object.defineProperty(process, "platform", { value: forced, configurable: true });
+const realSpawn = childProcess.spawn;
+const PICKERS = new Set(["powershell.exe", "osascript", "zenity"]);
+childProcess.spawn = function(command, args, options) {
+  if (!PICKERS.has(String(command))) return realSpawn(command, args, options);
+  const mode = process.env.PARLEY_TEST_PICKER || "cancel";
+  if (mode === "throw") {
+    const error = new Error("forced picker EPERM");
+    error.code = "EPERM";
+    throw error;
+  }
+  return realSpawn(process.execPath,
+    [process.env.PARLEY_TEST_PICKER_SCRIPT, mode, process.env.PARLEY_TEST_PICKER_PATH], options);
+};
+syncBuiltinESMExports();
+await import(${JSON.stringify(pathToFileURL(SERVER).href)});
+`);
+
+  // A forced platform only changes which command name is spawned and how a
+  // cancel is read. Anything that has to be *killed* runs natively, because
+  // killTree's POSIX process-group path can't reap a real Windows child.
+  const cases = [
+    ["a chosen folder comes back as a path", "ok", null, (d) => d.path === chosen],
+    ["a cancelled dialog stays silent", "cancel", null, (d) => d.cancelled === true && !d.error],
+    ["a picker that won't spawn reports an error", "throw", null,
+      (d) => !d.cancelled && /forced picker EPERM/.test(d.error || "")],
+    ["a failing picker reports its exit code and stderr", "fail", null,
+      (d) => !d.cancelled && /exit 3/.test(d.error || "") && /dialog unavailable/.test(d.error || "")],
+    ["a picker left open times out distinctly", "hang", null,
+      (d) => !d.cancelled && /still open/.test(d.error || "")],
+    ["heavy stderr doesn't deadlock the picker", "noisy", null, (d) => d.path === chosen],
+    ["a macOS cancel is a cancel, not an error", "maccancel", "darwin",
+      (d) => d.cancelled === true && !d.error],
+    ["a macOS failure is still an error", "macfail", "darwin",
+      (d) => !d.cancelled && /no window server/.test(d.error || "")],
+    ["a zenity cancel is a cancel, not an error", "zenitycancel", "linux",
+      (d) => d.cancelled === true && !d.error],
+    ["a GTK warning does not turn a zenity cancel into an error", "zenitywarncancel", "linux",
+      (d) => d.cancelled === true && !d.error],
+    ["a zenity failure is still an error", "zenityfail", "linux",
+      (d) => !d.cancelled && /exit 255/.test(d.error || "")],
+    ["a path printed before a crash is not accepted", "printthenfail", null,
+      (d) => !d.path && !d.cancelled && /exit 3/.test(d.error || "")],
+    ["a path printed before a hang is not accepted", "printthenhang", null,
+      (d) => !d.path && !d.cancelled && /still open/.test(d.error || "")],
+  ];
+
+  for (const [name, mode, platform, check] of cases) {
+    let aux = null;
+    try {
+      aux = await bootAuxServer(wrapper, auxRoot, {
+        PARLEY_TEST_PICKER: mode,
+        PARLEY_TEST_PICKER_SCRIPT: picker,
+        PARLEY_TEST_PICKER_PATH: chosen,
+        PARLEY_PICKER_MS: "1500", // the real 5 min would stall the suite
+        ...(platform ? { PARLEY_TEST_PLATFORM: platform } : {}),
+      });
+      const { data } = await aux.request("POST", "/api/pickfolder", { start: null });
+      ok("folder picker: " + name, check(data), JSON.stringify(data));
+    } catch (e) {
+      ok("folder picker: " + name, false, e.message);
+    } finally {
+      if (aux) await aux.stop();
+    }
+  }
+  try { fs.rmSync(fixture, { recursive: true, force: true }); } catch { /* best effort */ }
+}
+
+// Static picker guarantees stay testable even when a restricted runner skips
+// the native lifecycle fixture because it cannot kill the deliberately hung
+// fake picker.
+function checkFolderPickerSource() {
+  // The Windows script's own failure mode: without a terminating preference a
+  // broken cmdlet writes to stderr, runs on, and exits 0 — a silent cancel.
+  const serverSource = fs.readFileSync(SERVER, "utf8");
+  ok("folder picker: the Windows script fails loudly rather than exiting clean",
+    serverSource.includes("$ErrorActionPreference = 'Stop'"));
+  const popupLookup = serverSource.indexOf("GetWindow(owner, GW_ENABLEDPOPUP)");
+  const inputAttach = serverSource.indexOf("AttachThreadInput(popupThread, foregroundThread, true)");
+  const popupActivate = serverSource.indexOf("SetForegroundWindow(popup)");
+  const popupRaise = serverSource.indexOf("SetWindowPos(popup, HWND_TOPMOST");
+  const timerStart = serverSource.indexOf("$timer.Start()");
+  const showDialog = serverSource.indexOf("$dlg.ShowDialog($owner)");
+  ok("folder picker: the Windows script uses foreground-thread activation with a taskbar fallback",
+    popupLookup >= 0 && inputAttach > popupLookup && popupActivate > inputAttach && popupRaise > popupActivate &&
+    timerStart >= 0 && showDialog > timerStart && serverSource.includes("$owner.ShowInTaskbar = $true") &&
+    serverSource.includes("AttachThreadInput(popupThread, foregroundThread, false)") &&
+    serverSource.includes("$timer.Stop(); $timer.Dispose(); $dlg.Dispose(); $owner.Close(); $owner.Dispose()"));
+  ok("folder picker: failed foreground activation stops retrying before the five-minute dialog timeout",
+    serverSource.includes("$owner.Tag = 0") &&
+    serverSource.includes("$owner.Tag = [int]$owner.Tag + 1") &&
+    serverSource.includes("[int]$owner.Tag -ge 40"));
+}
+
+// The folder dialog is not modal to this page, so the form that opened it can
+// be submitted or reset while it is still open. That is a DOM-lifetime problem,
+// not a string in the source: it needs the page's own handlers run against a
+// document where writing an element's text really does destroy its children.
+async function checkFolderPickerUi() {
+  const src = fs.readFileSync(path.join(here, "..", "ui", "index.html"), "utf8");
+  const body = src.slice(src.indexOf("<script>") + "<script>".length);
+  const script = body.slice(0, body.indexOf("// ---------------- boot".replace("----------------", "-".repeat(60))));
+
+  const noop = () => {};
+  const byId = new Map();
+  const destroyed = new Set();
+  class El {
+    constructor(id, attrs) {
+      this.id = id || null;
+      this.attrs = attrs || {};
+      this.children = [];
+      this.listeners = {};
+      this._text = "";
+      this.value = ""; this.innerText = ""; this.disabled = false; this.hidden = false; this.files = [];
+      this.style = {}; this.dataset = {};
+      const classes = new Set();
+      this.classList = {
+        add: (...names) => names.forEach((name) => classes.add(name)),
+        remove: (...names) => names.forEach((name) => classes.delete(name)),
+        toggle: (name, force) => {
+          const on = force === undefined ? !classes.has(name) : !!force;
+          if (on) classes.add(name); else classes.delete(name);
+          return on;
+        },
+        contains: (name) => classes.has(name),
+      };
+    }
+    get textContent() { return this._text; }
+    set textContent(v) {
+      // The behaviour under test: assigning text replaces every child, so
+      // anything still holding one of them by id is holding nothing.
+      for (const c of this.children) if (c.id) { byId.delete(c.id); destroyed.add(c.id); }
+      this.children = [];
+      this._text = String(v);
+    }
+    get innerHTML() { return this._text; }
+    set innerHTML(v) { this.textContent = v; }
+    querySelector(sel) {
+      const attr = /^\[([^\]=]+)]$/.exec(sel);
+      return attr ? (this.children.find((c) => attr[1] in c.attrs) || null) : null;
+    }
+    querySelectorAll() { return []; }
+    appendChild(c) { this.children.push(c); if (c.id) byId.set(c.id, c); return c; }
+    append(...children) { children.forEach((child) => this.appendChild(child)); }
+    addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); }
+    click() { this.clicked = (this.clicked || 0) + 1; return this.onclick && this.onclick({ target: this }); }
+    removeEventListener() {} setAttribute() {} removeAttribute() {}
+    getAttribute() { return null; } closest() { return null; }
+    focus() {} blur() {} remove() {} scrollTo() {}
+    getBoundingClientRect() { return { top: 0, bottom: 0, left: 0, right: 0, width: 0, height: 0 }; }
+  }
+  const el = (id, attrs) => { const e = new El(id, attrs); if (id) byId.set(id, e); return e; };
+  // The picker buttons keep their real shape: a label span the "Choosing…"
+  // swap may touch, and — on the new-room button — a live value span that
+  // other code writes to while the dialog is open.
+  const newRoomProj = el("newRoomProj");
+  newRoomProj.appendChild(new El(null, { "data-picker-label": "" }));
+  newRoomProj.appendChild(el("newRoomProjVal"));
+  el("s_browse").appendChild(new El(null, { "data-picker-label": "" }));
+  const chips = ["auto", "claude", "codex", "both"].map((target) => {
+    const chip = new El(null); chip.dataset.t = target;
+    if (target === "auto") chip.classList.add("active");
+    return chip;
+  });
+
+  class TestURL extends URL {}
+  let blobSeq = 0;
+  TestURL.createObjectURL = () => `blob:smoke-${++blobSeq}`;
+  TestURL.revokeObjectURL = noop;
+  class TestFileReader {
+    readAsDataURL(file) {
+      this.result = `data:${file.type};base64,${file.data}`;
+      queueMicrotask(() => this.onload && this.onload());
+    }
+  }
+
+  let nextFetch = () => new Promise(() => {}); // a dialog that never comes back
+  const windowListeners = {};
+  const sandbox = {
+    console, setTimeout, clearTimeout, setInterval, clearInterval, queueMicrotask,
+    URL: TestURL, URLSearchParams, TextDecoder, AbortController, FileReader: TestFileReader,
+    crypto: { randomUUID: () => `draft-${++blobSeq}` },
+    fetch: (...a) => nextFetch(...a),
+    confirm: () => true, prompt: () => null, alert: noop,
+    window: {
+      addEventListener(type, fn) { (windowListeners[type] ||= []).push(fn); },
+      removeEventListener() {},
+    },
+    navigator: { clipboard: { writeText: () => Promise.resolve() } },
+    history: { replaceState: noop },
+    location: { search: "", pathname: "/", href: "http://127.0.0.1/" },
+    EventSource: class { constructor() { this.url = ""; } close() {} },
+    document: {
+      getElementById(id) {
+        if (destroyed.has(id)) return null; // destroyed by a textContent write
+        if (!byId.has(id)) byId.set(id, new El(id));
+        return byId.get(id);
+      },
+      querySelector(sel) {
+        if (sel.includes("parley-token")) return { content: "smoke-token-0123456789abcdef" };
+        if (sel.includes("parley-runtime-protocol")) return { content: RUNTIME_PROTOCOL };
+        return null;
+      },
+      querySelectorAll: (sel) => sel === ".chip" ? chips : [],
+      createElement: (tag) => { const node = new El(null); node.tagName = String(tag || "").toUpperCase(); return node; },
+      createDocumentFragment: () => new El(null),
+      addEventListener: noop,
+      body: new El(null), head: new El(null), title: "", hidden: false,
+    },
+  };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  vm.runInContext(`${script}
+;globalThis.__probe = {
+  openPicker: $("newRoomProj").onclick,
+  resetForm: $("addRoomBtn").onclick,
+  send,
+  choose(target) { state.chipRevision++; selectChip(target); },
+  get chip() { return state.chip; },
+  activeChip() { return ([...document.querySelectorAll(".chip")].find((c) => c.classList.contains("active")) || {}).dataset?.t; },
+  get draftCount() { return state.draftImages.length; },
+  get draftFileCount() { return state.draftFiles.length; },
+  get draftAttachmentCount() { return draftAttachmentCount(); },
+  paste(event) { return ($("input").listeners.paste || [])[0](event); },
+  chooseFiles(files) {
+    const picker = $("fileInput");
+    picker.files = files;
+    return (picker.listeners.change || [])[0]({ target: picker });
+  },
+  drag(type, event) { return (globalThis.__windowListeners[type] || [])[0](event); },
+  clearDrafts() { clearDraftAttachments(); },
+  renderAttachments(entry) {
+    const bubble = document.createElement("div");
+    renderEntryAttachments(entry, bubble);
+    return bubble;
+  },
+  set text(value) { $("input").value = value; },
+  get projectDir() { return newRoomProjectDir; },
+};`, Object.assign(sandbox, { __windowListeners: windowListeners }), { filename: "parley-ui.js" });
+
+  const probe = sandbox.__probe;
+  const ok200 = (data) => ({
+    ok: true, status: 200, statusText: "OK",
+    headers: { get: () => RUNTIME_PROTOCOL },
+    json: async () => data,
+  });
+
+  // Reset the form while the dialog is still open. The button's own contents
+  // must survive, or clearing the form dereferences an element that is gone.
+  let crash = null;
+  const openWhileReset = probe.openPicker();
+  try { probe.resetForm(); } catch (e) { crash = e; }
+  ok("folder picker UI: resetting the form mid-pick doesn't destroy the button's contents",
+    !crash, crash && crash.message);
+
+  // …and the result that finally arrives belongs to a form the user has left.
+  let settle;
+  nextFetch = () => new Promise((r) => { settle = r; });
+  const stale = probe.openPicker();
+  await sleep(0);
+  probe.resetForm();
+  settle(ok200({ path: "D:\\stale-project" }));
+  await stale;
+  ok("folder picker UI: a result arriving after the form was reset is discarded",
+    probe.projectDir === null, String(probe.projectDir));
+  await Promise.race([openWhileReset, sleep(0)]);
+
+  // Inline routing wins on the server. Once that answer comes back, the chip
+  // must follow it so the next untagged send does not accidentally stay @both.
+  let sentBody = null;
+  probe.choose("both");
+  probe.text = "@claude SAY:SYNC";
+  nextFetch = async (_url, opts) => {
+    sentBody = JSON.parse(opts.body);
+    return ok200({ ok: true, target: "claude", explicit: true });
+  };
+  await probe.send();
+  ok("target chip: a successful inline @tag follows the server-resolved target",
+    sentBody && sentBody.target === "both" && probe.chip === "claude" && probe.activeChip() === "claude",
+    JSON.stringify({ sentBody, chip: probe.chip, active: probe.activeChip() }));
+
+  let settleSend;
+  probe.choose("both");
+  probe.text = "@claude SAY:STALE";
+  nextFetch = () => new Promise((resolve) => { settleSend = resolve; });
+  const staleSend = probe.send();
+  await sleep(0);
+  probe.choose("codex");
+  settleSend(ok200({ ok: true, target: "claude", explicit: true }));
+  await staleSend;
+  ok("target chip: an older send response cannot overwrite a newer manual choice",
+    probe.chip === "codex" && probe.activeChip() === "codex", probe.chip);
+
+  const pngData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+  const pastedFile = { name: "clipboard.png", type: "image/png", size: Buffer.from(pngData, "base64").length, data: pngData };
+  let prevented = false;
+  probe.paste({
+    clipboardData: { items: [{ kind: "file", type: "image/png", getAsFile: () => pastedFile }] },
+    preventDefault() { prevented = true; },
+  });
+  ok("image paste UI: an image paste is captured and previewed", prevented && probe.draftCount === 1);
+  probe.text = "";
+  sentBody = null;
+  nextFetch = async (_url, opts) => {
+    sentBody = JSON.parse(opts.body);
+    return ok200({ ok: true, target: "codex", explicit: false });
+  };
+  await probe.send();
+  ok("image paste UI: an image-only send carries base64 and clears after success",
+    sentBody && sentBody.text === "" && sentBody.images.length === 1 &&
+    sentBody.images[0].data === pngData && probe.draftCount === 0,
+    JSON.stringify(sentBody));
+
+  probe.paste({
+    clipboardData: { items: [{ kind: "file", type: "image/png", getAsFile: () => pastedFile }] },
+    preventDefault: noop,
+  });
+  probe.text = "keep me";
+  nextFetch = async () => ({
+    ok: false, status: 400, statusText: "Bad Request",
+    headers: { get: () => RUNTIME_PROTOCOL }, json: async () => ({ error: "forced failure" }),
+  });
+  await probe.send();
+  ok("image paste UI: a failed send preserves the pasted image for retry", probe.draftCount === 1);
+  probe.paste({
+    clipboardData: { items: [{ kind: "file", type: "image/png", getAsFile: () => ({
+      name: "five-megabytes.png", type: "image/png", size: 5 * 1024 * 1024, data: pngData,
+    }) }] },
+    preventDefault: noop,
+  });
+  probe.paste({
+    clipboardData: { items: [{ kind: "file", type: "image/png", getAsFile: () => ({
+      name: "over-total.png", type: "image/png", size: 2 * 1024 * 1024, data: pngData,
+    }) }] },
+    preventDefault: noop,
+  });
+  ok("image paste UI: aggregate image drafts are capped below Claude's stdin limit",
+    probe.draftCount === 2, String(probe.draftCount));
+  let textPrevented = false;
+  probe.paste({
+    clipboardData: { items: [{ kind: "string", type: "text/plain", getAsFile: () => null }] },
+    preventDefault() { textPrevented = true; },
+  });
+  ok("image paste UI: ordinary text paste remains native", textPrevented === false);
+
+  probe.clearDrafts();
+  probe.text = "";
+  const diffText = "diff --git a/a.txt b/a.txt\n+review me\n";
+  const diffData = Buffer.from(diffText).toString("base64");
+  const diffFile = {
+    name: "review.diff", type: "text/x-diff", size: Buffer.byteLength(diffText), data: diffData,
+  };
+  let dragPrevented = false;
+  const dragTransfer = { types: ["Files"], files: [], dropEffect: "none" };
+  probe.drag("dragover", {
+    dataTransfer: dragTransfer,
+    preventDefault() { dragPrevented = true; },
+  });
+  let dropPrevented = false;
+  probe.drag("drop", {
+    dataTransfer: { types: ["Files"], files: [diffFile] },
+    preventDefault() { dropPrevented = true; },
+  });
+  ok("file attachment UI: dragging a file cannot navigate the page and adds the same draft card",
+    dragPrevented && dropPrevented && dragTransfer.dropEffect === "copy" &&
+      probe.draftFileCount === 1 && probe.draftAttachmentCount === 1);
+  probe.clearDrafts();
+  let textDropPrevented = false;
+  probe.drag("drop", {
+    dataTransfer: { types: ["text/plain"], files: [] },
+    preventDefault() { textDropPrevented = true; },
+  });
+  ok("file attachment UI: ordinary text drops retain native textarea behaviour",
+    textDropPrevented === false && probe.draftAttachmentCount === 0);
+
+  probe.chooseFiles([diffFile]);
+  const draftFileCard = sandbox.document.getElementById("draftImages").children.find((child) =>
+    child.className === "draft-file" && child.title === "review.diff");
+  const cardReady = probe.draftFileCount === 1 && probe.draftAttachmentCount === 1 &&
+    sandbox.document.getElementById("fileInput").value === "" && draftFileCard &&
+    typeof draftFileCard.children.at(-1).onclick === "function";
+  draftFileCard.children.at(-1).onclick();
+  const cardRemoved = probe.draftAttachmentCount === 0;
+  probe.chooseFiles([diffFile]);
+  ok("file attachment UI: the multiple-file picker adds a removable filename/size card",
+    cardReady && cardRemoved && probe.draftFileCount === 1 && probe.draftAttachmentCount === 1,
+    JSON.stringify({ files: probe.draftFileCount, total: probe.draftAttachmentCount }));
+
+  sentBody = null;
+  nextFetch = async (_url, opts) => {
+    sentBody = JSON.parse(opts.body);
+    return ok200({ ok: true, target: "codex", explicit: false });
+  };
+  await probe.send();
+  ok("file attachment UI: a file-only send carries generic base64 separately and clears after success",
+    sentBody && sentBody.text === "" && sentBody.images.length === 0 && sentBody.files.length === 1 &&
+      sentBody.files[0].name === "review.diff" && sentBody.files[0].mime === "text/x-diff" &&
+      sentBody.files[0].data === diffData && probe.draftAttachmentCount === 0,
+    JSON.stringify(sentBody));
+
+  probe.chooseFiles([diffFile]);
+  probe.text = "keep the file";
+  nextFetch = async () => ({
+    ok: false, status: 400, statusText: "Bad Request",
+    headers: { get: () => RUNTIME_PROTOCOL }, json: async () => ({ error: "forced file failure" }),
+  });
+  await probe.send();
+  ok("file attachment UI: a failed send preserves the chosen file for retry", probe.draftFileCount === 1);
+
+  probe.clearDrafts();
+  probe.text = "";
+  probe.chooseFiles([{ name: "too-large.bin", type: "application/octet-stream",
+    size: 5 * 1024 * 1024 + 1, data: "eA==" }]);
+  ok("file attachment UI: each attachment is capped at 5 MB", probe.draftAttachmentCount === 0);
+  probe.chooseFiles(Array.from({ length: 9 }, (_, i) => ({
+    name: `tiny-${i}.txt`, type: "text/plain", size: 1, data: "eA==",
+  })));
+  ok("file attachment UI: images and files share an eight-attachment cap", probe.draftAttachmentCount === 8);
+
+  probe.clearDrafts();
+  probe.chooseFiles([
+    { name: "five.bin", type: "application/octet-stream", size: 5 * 1024 * 1024, data: "eA==" },
+    { name: "two.png", type: "image/png", size: 2 * 1024 * 1024, data: pngData },
+  ]);
+  ok("file attachment UI: images and files share the 6 MB aggregate budget",
+    probe.draftFileCount === 1 && probe.draftCount === 0 && probe.draftAttachmentCount === 1);
+
+  probe.clearDrafts();
+  probe.chooseFiles(Array.from({ length: 5 }, (_, i) => ({
+    name: `image-${i}.png`, type: "image/png", size: 1, data: pngData,
+  })));
+  ok("file attachment UI: choosing files preserves the four-native-image cap",
+    probe.draftCount === 4 && probe.draftFileCount === 0);
+  probe.clearDrafts();
+
+  probe.chooseFiles([{ name: "extension-only.png", type: "", size: 1, data: pngData }]);
+  probe.text = "extension fallback";
+  sentBody = null;
+  nextFetch = async (_url, opts) => {
+    sentBody = JSON.parse(opts.body);
+    return ok200({ ok: true, target: "codex", explicit: false });
+  };
+  await probe.send();
+  ok("file attachment UI: a supported image extension fills in a missing browser MIME",
+    sentBody && sentBody.images.length === 1 && sentBody.images[0].mime === "image/png" && sentBody.files.length === 0,
+    JSON.stringify(sentBody));
+
+  let attachmentRequest = null;
+  nextFetch = async (url, opts) => {
+    attachmentRequest = { url, opts };
+    return {
+      ok: true, status: 200, statusText: "OK",
+      headers: { get: () => RUNTIME_PROTOCOL },
+      blob: async () => ({ bytes: diffText }),
+    };
+  };
+  const fileBubble = probe.renderAttachments({ meta: { attachments: [{
+    id: "file-ref", kind: "file", name: "review.diff", mime: "text/x-diff", size: Buffer.byteLength(diffText),
+  }] } });
+  const fileGallery = fileBubble.children[0];
+  const fileCard = fileGallery && fileGallery.children[0];
+  await fileCard.onclick();
+  const download = sandbox.document.body.children.at(-1);
+  ok("file attachment UI: transcript file cards download through the authenticated attachment endpoint",
+    fileCard && fileCard.className.includes("attachment-file") && attachmentRequest &&
+      attachmentRequest.url.includes("/api/attachment?room=default&id=file-ref") &&
+      attachmentRequest.opts.headers["X-Parley-Token"] === "smoke-token-0123456789abcdef" &&
+      download && download.download === "review.diff" && download.clicked === 1,
+    JSON.stringify({ className: fileCard && fileCard.className, request: attachmentRequest && attachmentRequest.url }));
+
+  const imageBubble = probe.renderAttachments({ meta: { attachments: [{
+    id: "image-ref", kind: "image", name: "clipboard.png", mime: "image/png", size: 1,
+  }] } });
+  const imageCard = imageBubble.children[0] && imageBubble.children[0].children[0];
+  ok("file attachment UI: transcript images keep their existing image-card rendering",
+    imageCard && imageCard.className === "attachment" && imageCard.children[0].tagName === "IMG");
+}
+
 async function main() {
   console.log(`\nParley smoke test — server at ${base}\n`);
 
@@ -343,6 +1023,17 @@ async function main() {
   const safeTableHTML = renderMarkdown && renderMarkdown("| Value |\n|---|\n| <img src=x onerror=alert(1)> |");
   ok("markdown table cells remain HTML-escaped",
     safeTableHTML && safeTableHTML.includes("&lt;img src=x onerror=alert(1)&gt;") && !safeTableHTML.includes("<img"));
+  // Agents write numbered steps with a blank line between them; closing the
+  // list on that blank line restarted every item at "1.".
+  const listHTML = renderMarkdown && renderMarkdown(
+    "1. **Adopt.** Say the word.\n\n1. **Buy the domain.**\n   DNS takes a day.\n\n1. **Deploy from main.**",
+  );
+  ok("blank-line-separated numbered items stay one list and keep counting",
+    listHTML && (listHTML.match(/<ol/g) || []).length === 1 &&
+    (listHTML.match(/<li>/g) || []).length === 3 &&
+    listHTML.includes("DNS takes a day") &&
+    renderMarkdown("3. three\n4. four").startsWith('<ol start="3">') &&
+    renderMarkdown("- a\n- b\n\nA new paragraph.").endsWith("<p>A new paragraph.</p>"));
   const pairLabelSource = (page.match(/function pairRoundsLabel\(rounds\) \{[\s\S]*?\n\}/) || [])[0];
   let pairLabel = null;
   try { pairLabel = pairLabelSource ? Function(`${pairLabelSource}; return pairRoundsLabel;`)() : null; } catch { /* reported below */ }
@@ -356,8 +1047,27 @@ async function main() {
     page.includes('<option value="bypassPermissions">full access') &&
     page.includes("Give Claude Full access in this room?") &&
     page.includes("Full access includes protected paths such as .git"));
+  const stopChoiceSource = (page.match(/const stopIsChoice = [\s\S]*?;\r?\n/) || [])[0];
+  let stopChoice = null;
+  try { stopChoice = stopChoiceSource ? Function(`${stopChoiceSource}; return stopIsChoice;`)() : null; }
+  catch { /* reported below */ }
+  // `working` covers ordinary exchanges too, so the remaining half of @both
+  // still opens a per-seat chooser; `workingPair` is only wording.
+  ok("Stop treats a pair cycle and an ordinary exchange differently",
+    typeof stopChoice === "function" &&
+    stopChoice({ busy: ["claude"], queued: 0, working: true, workingPair: null }) === true &&
+    stopChoice({ busy: [], queued: 0, working: false, workingPair: null }) === false &&
+    page.includes('summary.workingPair ? "Stop the pair cycle" : "Stop the exchange"') &&
+    !/const choose = active\.length > 1 \|\| state\.summary\.queued > 0/.test(page));
+  ok("folder picker UI names the taskbar fallback that now exists",
+    page.includes("Parley — Choose a project folder") &&
+    page.includes("from the taskbar"));
+  // A folder dialog outlives the form or room it was opened from.
+  ok("both folder pickers drop a result that arrives after they were retired",
+    page.includes("pick !== newRoomPick") &&
+    page.includes("pick !== settingsPick || state.room !== openedFor"));
   ok("the page blocks controls when an older backend is still running",
-    page.includes('meta name="parley-runtime-protocol" content="1"') &&
+    page.includes(`meta name="parley-runtime-protocol" content="${RUNTIME_PROTOCOL}"`) &&
     page.includes("PAGE_RUNTIME_PROTOCOL") && page.includes("Restart Parley"));
   TOKEN = (/name="parley-token" content="([^"]+)"/.exec(page) || [])[1] || "";
   ok("the page carries a session token", TOKEN.length > 20);
@@ -365,7 +1075,7 @@ async function main() {
     headers: { "X-Parley-Token": TOKEN, "X-Parley-Runtime-Protocol": RUNTIME_PROTOCOL },
   });
   ok("the API identifies its runtime protocol",
-    runtimeResponse.headers.get("x-parley-runtime-protocol") === "1");
+    runtimeResponse.headers.get("x-parley-runtime-protocol") === RUNTIME_PROTOCOL);
   const noProtocol = await fetch(base + "/api/rooms", { headers: { "X-Parley-Token": TOKEN } });
   ok("the API refuses an older UI without its runtime protocol", noProtocol.status === 403);
   const staleEvents = await fetch(`${base}/api/events?room=default&token=${encodeURIComponent(TOKEN)}`);
@@ -413,10 +1123,21 @@ async function main() {
 
   await checkMissingOpener();
   await checkUiSnapshot();
+  await checkWindowsCommandPrecedence();
+  await checkSynchronousSpawnFailure();
+  checkFolderPickerSource();
+  // Some restricted runners deny terminating the deliberately hung fake
+  // native picker. CI and normal `npm test` keep this on; the opt-out lets such
+  // a runner execute the rest of the suite without orphaning its fixture.
+  if (process.env.PARLEY_SKIP_NATIVE_PICKER !== "1") await checkFolderPicker();
+  await checkFolderPickerUi();
 
   console.log("routing & the delta protocol");
   await useFakes("default");
-  await say("default", "@claude SAY:MANGO");
+  const routedMango = await say("default", "@claude SAY:MANGO", "both");
+  ok("the message response reports the server-resolved inline target",
+    routedMango.status === 200 && routedMango.data.target === "claude" && routedMango.data.explicit === true,
+    JSON.stringify(routedMango.data));
   let d = await idle("default");
   ok("addressed agent replies", lastAgent(d, "claude") && lastAgent(d, "claude").text === "MANGO",
     lastAgent(d, "claude") && lastAgent(d, "claude").text);
@@ -450,6 +1171,315 @@ async function main() {
   ok("the dual-tag user entry records both", d.entries.slice(beforeDualTag).some((e) => e.kind === "user" && e.target === "both"));
 
   ok("receipts recorded", (d.receipts || []).length > 0 && d.receipts.every((r) => r.upTo > r.from));
+
+  console.log("\nclipboard image attachments");
+  await api("POST", "/api/rooms", { name: "images" });
+  await useFakes("images");
+  await cfg("images", { maxHops: 0, agents: { claude: { lurk: false }, codex: { lurk: false } } });
+  const pngBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+  const pngBytes = Buffer.from(pngBase64, "base64");
+  const pngHash = crypto.createHash("sha256").update(pngBytes).digest("hex");
+  const attached = await api("POST", "/api/message", {
+    room: "images", text: "@both IMAGEINFO", target: "auto",
+    images: [{ name: "..\\clipboard.png", mime: "image/png", data: pngBase64 }],
+  });
+  ok("image API: a valid image message is accepted", attached.status === 200, JSON.stringify(attached.data));
+  let imagesRoom = await idle("images", 30000);
+  const imageReplies = imagesRoom.entries.filter((e) => e.kind === "agent" && e.text.startsWith("IMAGEJSON "));
+  const parsedImages = imageReplies.map((e) => {
+    try { return { author: e.author, images: JSON.parse(e.text.slice("IMAGEJSON ".length)) }; }
+    catch { return { author: e.author, images: [] }; }
+  });
+  ok("image delivery: both native CLIs receive the same bytes",
+    parsedImages.length === 2 && parsedImages.every((reply) =>
+      reply.images.length === 1 && reply.images[0].size === pngBytes.length && reply.images[0].sha256 === pngHash),
+    JSON.stringify(parsedImages));
+  ok("image delivery: Claude receives a structured image block and Codex receives --image",
+    parsedImages.some((reply) => reply.author === "claude" && reply.images[0].mime === "image/png") &&
+    parsedImages.some((reply) => reply.author === "codex" &&
+      /parley-codex-input-[^\\/]+[\\/][0-9a-f-]+\.png$/i.test(reply.images[0].path || "")),
+    JSON.stringify(parsedImages));
+  ok("image delivery: Codex keeps stdin as the prompt instead of consuming '-' as an image",
+    parsedImages.some((reply) => reply.author === "codex" && reply.images.length === 1 &&
+      reply.images[0].promptOnStdin === true && reply.images[0].path !== "-" && !reply.images[0].swallowedPrompt),
+    JSON.stringify(parsedImages));
+  const imageEntry = imagesRoom.entries.find((e) => e.kind === "user" && e.text === "@both IMAGEINFO");
+  const imageRef = imageEntry && imageEntry.meta && imageEntry.meta.attachments && imageEntry.meta.attachments[0];
+  ok("image storage: transcript metadata is safe and does not retain a client path",
+    imageRef && imageRef.name === "clipboard.png" && !imageRef.path && !imageRef.data &&
+    fs.existsSync(path.join(ROOT, "images", "attachments", `${imageRef.id}.png`)),
+    JSON.stringify(imageRef));
+  const imageResponse = await fetch(base + `/api/attachment?room=images&id=${encodeURIComponent(imageRef.id)}`, {
+    headers: { "X-Parley-Token": TOKEN, "X-Parley-Runtime-Protocol": RUNTIME_PROTOCOL },
+  });
+  const servedImage = Buffer.from(await imageResponse.arrayBuffer());
+  ok("image retrieval: authenticated chat rendering gets exact bytes and MIME",
+    imageResponse.status === 200 && imageResponse.headers.get("content-type") === "image/png" &&
+    servedImage.equals(pngBytes) && imageResponse.headers.get("x-content-type-options") === "nosniff");
+  const imageWithoutToken = await fetch(base + `/api/attachment?room=images&id=${encodeURIComponent(imageRef.id)}`, {
+    headers: { "X-Parley-Runtime-Protocol": RUNTIME_PROTOCOL },
+  });
+  ok("image retrieval: attachment bytes require the page token", imageWithoutToken.status === 403);
+
+  const paddedPng = (size) => Buffer.concat([pngBytes, Buffer.alloc(size - pngBytes.length)]);
+  const oldLargeBytes = paddedPng(4 * 1024 * 1024);
+  const currentLargeBytes = paddedPng(3 * 1024 * 1024);
+  const overBudget = await api("POST", "/api/message", {
+    room: "images", text: "too many bytes", target: "claude",
+    images: [
+      { name: "four.png", mime: "image/png", data: oldLargeBytes.toString("base64") },
+      { name: "three.png", mime: "image/png", data: currentLargeBytes.toString("base64") },
+    ],
+  });
+  ok("image validation: aggregate bytes stay below Claude's piped-input ceiling",
+    overBudget.status === 413 && /6 MB/.test(overBudget.data.error || ""), JSON.stringify(overBudget.data));
+
+  await api("POST", "/api/message", {
+    room: "images", text: "@codex SAY:OLDERIMAGE", target: "auto",
+    images: [{ name: "older.png", mime: "image/png", data: oldLargeBytes.toString("base64") }],
+  });
+  await idle("images", 30000);
+  const currentLargeHash = crypto.createHash("sha256").update(currentLargeBytes).digest("hex");
+  await api("POST", "/api/message", {
+    room: "images", text: "@claude IMAGEINFO", target: "auto",
+    images: [{ name: "current.png", mime: "image/png", data: currentLargeBytes.toString("base64") }],
+  });
+  imagesRoom = await idle("images", 30000);
+  const budgetReply = [...imagesRoom.entries].reverse().find((e) =>
+    e.author === "claude" && e.text.startsWith("IMAGEJSON "));
+  const budgetInfo = budgetReply ? JSON.parse(budgetReply.text.slice("IMAGEJSON ".length)) : [];
+  ok("image delivery: the current root wins Claude's bounded native-image budget",
+    budgetInfo.length === 1 && budgetInfo[0].size === currentLargeBytes.length &&
+      budgetInfo[0].sha256 === currentLargeHash,
+    JSON.stringify(budgetInfo));
+
+  const beforeBadImage = imagesRoom.entries.length;
+  const badImage = await api("POST", "/api/message", {
+    room: "images", text: "bad image", target: "claude",
+    images: [{ name: "fake.png", mime: "image/png", data: Buffer.from("not a png").toString("base64") }],
+  });
+  imagesRoom = await room("images");
+  ok("image validation: MIME spoofing is rejected without a transcript entry",
+    badImage.status === 400 && imagesRoom.entries.length === beforeBadImage,
+    JSON.stringify(badImage.data));
+
+  const imageOnly = await api("POST", "/api/message", {
+    room: "images", text: "", target: "claude",
+    images: [{ name: "only.png", mime: "image/png", data: pngBase64 }],
+  });
+  imagesRoom = await idle("images", 30000);
+  ok("image API: an image can be sent without placeholder text",
+    imageOnly.status === 200 && imagesRoom.entries.some((e) =>
+      e.kind === "user" && e.text === "" && e.meta && e.meta.attachments && e.meta.attachments.length === 1));
+
+  const retryImage = await api("POST", "/api/message", {
+    room: "images", text: "@codex FAILONCE:IMGRETRY IMAGEINFO", target: "auto",
+    images: [{ name: "retry.png", mime: "image/png", data: pngBase64 }],
+  });
+  await idle("images", 30000);
+  const retryAccepted = await api("POST", "/api/retry", { room: "images" });
+  imagesRoom = await idle("images", 30000);
+  const retryImageReply = [...imagesRoom.entries].reverse().find((e) => e.author === "codex" && e.text.startsWith("IMAGEJSON "));
+  const retryInfo = retryImageReply ? JSON.parse(retryImageReply.text.slice("IMAGEJSON ".length)) : [];
+  const retryRoot = [...imagesRoom.entries].reverse().find((e) =>
+    e.kind === "user" && e.text.includes("FAILONCE:IMGRETRY"));
+  const retryRef = retryRoot && retryRoot.meta && retryRoot.meta.attachments && retryRoot.meta.attachments[0];
+  ok("image Retry: the authoritative user entry reattaches the original image",
+    retryImage.status === 200 && retryAccepted.status === 200 && retryRef &&
+    retryInfo.some((image) => image.sha256 === pngHash && String(image.path || "").includes(retryRef.id)),
+    JSON.stringify({ retry: retryAccepted.data, retryInfo }));
+
+  await api("POST", "/api/rooms", { name: "image-argv" });
+  await useFakes("image-argv");
+  await cfg("image-argv", { maxHops: 0, agents: { claude: { lurk: false }, codex: { lurk: false } } });
+  const imageArgMessage = () => api("POST", "/api/message", {
+    room: "image-argv", text: "@codex ARGJSON", target: "auto",
+    images: [{ name: "argv.png", mime: "image/png", data: pngBase64 }],
+  });
+  await imageArgMessage();
+  let imageArgRoom = await idle("image-argv", 30000);
+  const freshImageArgs = argvFrom(lastAgent(imageArgRoom, "codex"));
+  const freshExec = freshImageArgs.indexOf("exec");
+  const freshImageFlag = freshImageArgs.lastIndexOf("--image");
+  const freshJsonFlag = freshImageArgs.indexOf("--json");
+  ok("Codex image argv: fresh exec terminates variadic --image before the stdin prompt",
+    freshExec > 0 && freshImageArgs[freshExec + 1] !== "resume" &&
+      freshImageArgs[0] === "--add-dir" && freshImageFlag >= 0 &&
+      freshImageFlag + 1 < freshJsonFlag && freshImageArgs[freshImageFlag + 1] !== "-" &&
+      freshImageArgs.at(-1) === "-",
+    JSON.stringify(freshImageArgs));
+  await imageArgMessage();
+  imageArgRoom = await idle("image-argv", 30000);
+  const resumedImageArgs = argvFrom(lastAgent(imageArgRoom, "codex"));
+  const resumedExec = resumedImageArgs.indexOf("exec");
+  const resumedImageFlag = resumedImageArgs.lastIndexOf("--image");
+  const resumedJsonFlag = resumedImageArgs.indexOf("--json");
+  ok("Codex image argv: resumed exec keeps the same unambiguous ordering",
+    resumedExec > 0 && resumedImageArgs[resumedExec + 1] === "resume" &&
+      resumedImageArgs[0] === "--add-dir" && resumedImageFlag >= 0 &&
+      resumedImageFlag + 1 < resumedJsonFlag && resumedImageArgs[resumedImageFlag + 1] !== "-" &&
+      resumedImageArgs.at(-1) === "-",
+    JSON.stringify(resumedImageArgs));
+
+  console.log("\ngeneric file attachments");
+  await api("POST", "/api/rooms", { name: "files" });
+  await useFakes("files");
+  await cfg("files", { maxHops: 0, agents: { claude: { lurk: false }, codex: { lurk: false } } });
+  const diffText = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n+ATTACHED_FILE_TOKEN\n";
+  const diffBytes = Buffer.from(diffText, "utf8");
+  const diffBase64 = diffBytes.toString("base64");
+  const diffHash = crypto.createHash("sha256").update(diffBytes).digest("hex");
+  const fileMessage = await api("POST", "/api/message", {
+    room: "files", text: "@both FILEINFO", target: "auto",
+    files: [{ name: "..\\review-α.diff", mime: "text/x-diff", data: diffBase64 }],
+  });
+  ok("file API: a valid generic attachment is accepted", fileMessage.status === 200,
+    JSON.stringify(fileMessage.data));
+  let filesRoom = await idle("files", 30000);
+  const fileReplies = filesRoom.entries.filter((e) => e.kind === "agent" && e.text.startsWith("FILEJSON "));
+  const parsedFiles = fileReplies.map((e) => {
+    try { return { author: e.author, files: JSON.parse(e.text.slice("FILEJSON ".length)) }; }
+    catch { return { author: e.author, files: [] }; }
+  });
+  ok("file delivery: both CLIs read identical bytes from isolated staging copies",
+    parsedFiles.length === 2 && parsedFiles.every((reply) => reply.files.length === 1 &&
+      reply.files[0].size === diffBytes.length && reply.files[0].sha256 === diffHash &&
+      !reply.files[0].missing && reply.files[0].addDir === path.dirname(reply.files[0].path)),
+    JSON.stringify(parsedFiles));
+  ok("file delivery: small text-like files are included directly in the prompt",
+    parsedFiles.every((reply) => reply.files[0].inline === true), JSON.stringify(parsedFiles));
+  ok("file staging: disposable provider copies are gone after each invocation",
+    parsedFiles.every((reply) => !fs.existsSync(reply.files[0].path) &&
+      !fs.existsSync(reply.files[0].addDir)), JSON.stringify(parsedFiles));
+
+  const fileEntry = filesRoom.entries.find((e) => e.kind === "user" && e.text === "@both FILEINFO");
+  const fileRef = fileEntry && fileEntry.meta && fileEntry.meta.attachments && fileEntry.meta.attachments[0];
+  const canonicalFile = fileRef && path.join(ROOT, "files", "attachments", `${fileRef.id}.blob`);
+  ok("file storage: only sanitized metadata is retained in the transcript entry",
+    fileRef && fileRef.kind === "file" && fileRef.name === "review-α.diff" &&
+      fileRef.mime === "text/x-diff" && fileRef.size === diffBytes.length &&
+      !fileRef.path && !fileRef.data && canonicalFile && fs.readFileSync(canonicalFile).equals(diffBytes),
+    JSON.stringify(fileRef));
+  const transcript = fs.readFileSync(path.join(ROOT, "files", "transcript.md"), "utf8");
+  ok("file transcript: the durable attachment link is relative",
+    transcript.includes(`[Attachment: review-α.diff](attachments/${fileRef.id}.blob)`));
+
+  const fileResponse = await fetch(base + `/api/attachment?room=files&id=${encodeURIComponent(fileRef.id)}`, {
+    headers: { "X-Parley-Token": TOKEN, "X-Parley-Runtime-Protocol": RUNTIME_PROTOCOL },
+  });
+  const servedFile = Buffer.from(await fileResponse.arrayBuffer());
+  const disposition = fileResponse.headers.get("content-disposition") || "";
+  ok("file retrieval: downloads use exact bytes, an inert MIME, and a safe filename",
+    fileResponse.status === 200 && fileResponse.headers.get("content-type") === "application/octet-stream" &&
+      servedFile.equals(diffBytes) && fileResponse.headers.get("x-content-type-options") === "nosniff" &&
+      disposition.includes("attachment;") && disposition.includes("filename*=UTF-8''review-%CE%B1.diff"),
+    JSON.stringify({ status: fileResponse.status, disposition }));
+  const fileWithoutToken = await fetch(base + `/api/attachment?room=files&id=${encodeURIComponent(fileRef.id)}`, {
+    headers: { "X-Parley-Runtime-Protocol": RUNTIME_PROTOCOL },
+  });
+  ok("file retrieval: generic bytes require the page token", fileWithoutToken.status === 403);
+
+  const beforeBadFile = filesRoom.entries.length;
+  const badFile = await api("POST", "/api/message", {
+    room: "files", text: "bad file", target: "claude",
+    files: [{ name: "bad.txt", mime: "text/plain", data: "not canonical base64" }],
+  });
+  filesRoom = await room("files");
+  ok("file validation: malformed base64 is rejected without a transcript entry",
+    badFile.status === 400 && filesRoom.entries.length === beforeBadFile, JSON.stringify(badFile.data));
+
+  const imageInFileField = await api("POST", "/api/message", {
+    room: "files", text: "wrong field", target: "claude",
+    files: [{ name: "wrong.png", mime: "image/png", data: pngBase64 }],
+  });
+  ok("file validation: supported images cannot bypass native image validation and limits",
+    imageInFileField.status === 400 && /image field/.test(imageInFileField.data.error || ""),
+    JSON.stringify(imageInFileField.data));
+
+  const tooManyFiles = await api("POST", "/api/message", {
+    room: "files", text: "too many", target: "claude",
+    files: Array.from({ length: 9 }, (_, i) => ({
+      name: `tiny-${i}.txt`, mime: "text/plain", data: Buffer.from(String(i)).toString("base64"),
+    })),
+  });
+  ok("file validation: images and files share the eight-attachment count cap",
+    tooManyFiles.status === 413 && /at most 8/.test(tooManyFiles.data.error || ""),
+    JSON.stringify(tooManyFiles.data));
+
+  const mixedBudget = await api("POST", "/api/message", {
+    room: "files", text: "mixed budget", target: "claude",
+    images: [{ name: "four.png", mime: "image/png", data: oldLargeBytes.toString("base64") }],
+    files: [{ name: "three.bin", mime: "application/octet-stream", data: currentLargeBytes.toString("base64") }],
+  });
+  ok("file validation: images and files share the 6 MB byte cap",
+    mixedBudget.status === 413 && /6 MB/.test(mixedBudget.data.error || ""),
+    JSON.stringify(mixedBudget.data));
+
+  const fileOnly = await api("POST", "/api/message", {
+    room: "files", text: "", target: "claude",
+    files: [{ name: "only.txt", mime: "text/plain", data: Buffer.from("only file").toString("base64") }],
+  });
+  filesRoom = await idle("files", 30000);
+  ok("file API: a generic file can be sent without placeholder text",
+    fileOnly.status === 200 && filesRoom.entries.some((e) => e.kind === "user" && e.text === "" &&
+      e.meta && e.meta.attachments && e.meta.attachments.some((ref) => ref.kind === "file")));
+
+  const retryFile = await api("POST", "/api/message", {
+    room: "files", text: "@codex FAILONCE:FILERETRY FILEINFO", target: "auto",
+    files: [{ name: "retry.diff", mime: "text/x-diff", data: diffBase64 }],
+  });
+  await idle("files", 30000);
+  const retryFileAccepted = await api("POST", "/api/retry", { room: "files" });
+  filesRoom = await idle("files", 30000);
+  const retryFileReply = [...filesRoom.entries].reverse().find((e) =>
+    e.author === "codex" && e.text.startsWith("FILEJSON "));
+  const retryFileInfo = retryFileReply ? JSON.parse(retryFileReply.text.slice("FILEJSON ".length)) : [];
+  const retryFileRoot = [...filesRoom.entries].reverse().find((e) =>
+    e.kind === "user" && e.text.includes("FAILONCE:FILERETRY"));
+  const retryFileRef = retryFileRoot && retryFileRoot.meta && retryFileRoot.meta.attachments &&
+    retryFileRoot.meta.attachments[0];
+  ok("file Retry: the authoritative user entry restages the original bytes",
+    retryFile.status === 200 && retryFileAccepted.status === 200 && retryFileRef &&
+      retryFileInfo.some((file) => file.sha256 === diffHash && String(file.path || "").includes(retryFileRef.id) &&
+        !fs.existsSync(file.path)),
+    JSON.stringify({ retry: retryFileAccepted.data, retryFileInfo }));
+
+  await api("POST", "/api/rooms", { name: "file-argv" });
+  await useFakes("file-argv");
+  await cfg("file-argv", { maxHops: 0, agents: { claude: { lurk: false }, codex: { lurk: false } } });
+  const fileArgMessage = () => api("POST", "/api/message", {
+    room: "file-argv", text: "@codex ARGJSON", target: "auto",
+    files: [{ name: "argv.diff", mime: "text/x-diff", data: diffBase64 }],
+  });
+  await fileArgMessage();
+  let fileArgRoom = await idle("file-argv", 30000);
+  const freshFileArgs = argvFrom(lastAgent(fileArgRoom, "codex"));
+  const freshFileExec = freshFileArgs.indexOf("exec");
+  const freshInputDir = argValue(freshFileArgs, "--add-dir");
+  ok("Codex file argv: fresh exec grants only the disposable staging directory",
+    freshFileArgs[0] === "--add-dir" && freshFileExec === 2 &&
+      freshFileArgs[freshFileExec + 1] !== "resume" && freshInputDir && !fs.existsSync(freshInputDir),
+    JSON.stringify(freshFileArgs));
+  await fileArgMessage();
+  fileArgRoom = await idle("file-argv", 30000);
+  const resumedFileArgs = argvFrom(lastAgent(fileArgRoom, "codex"));
+  const resumedFileExec = resumedFileArgs.indexOf("exec");
+  const resumedInputDir = argValue(resumedFileArgs, "--add-dir");
+  ok("Codex file argv: resume keeps --add-dir in the required global position",
+    resumedFileArgs[0] === "--add-dir" && resumedFileExec === 2 &&
+      resumedFileArgs[resumedFileExec + 1] === "resume" && resumedInputDir &&
+      !fs.existsSync(resumedInputDir), JSON.stringify(resumedFileArgs));
+  await api("POST", "/api/message", {
+    room: "file-argv", text: "@claude ARGJSON", target: "auto",
+    files: [{ name: "claude-argv.diff", mime: "text/x-diff", data: diffBase64 }],
+  });
+  fileArgRoom = await idle("file-argv", 30000);
+  const claudeFileArgs = argvFrom(lastAgent(fileArgRoom, "claude"));
+  const claudeInputDir = argValue(claudeFileArgs, "--add-dir");
+  ok("Claude file argv: variadic --add-dir is terminated by a known option",
+    claudeFileArgs[0] === "-p" && claudeFileArgs[1] === "--add-dir" && claudeFileArgs[2] === claudeInputDir &&
+      claudeFileArgs[3] === "--output-format" && claudeInputDir && !fs.existsSync(claudeInputDir),
+    JSON.stringify(claudeFileArgs));
 
   console.log("\nsessions & per-seat flags");
   await say("default", "@claude ARGS");
@@ -591,6 +1621,582 @@ async function main() {
   ok("a positive hop limit caps the exchange",
     limitedHopEntries.filter((e) => e.kind === "agent" && e.meta && e.meta.hop).length === 1 &&
     limitedHopEntries.some((e) => e.kind === "system" && /Agent-hop budget reached \(1\)/i.test(e.text)));
+
+  // @both used to queue whole whenever either seat was busy, so one slow agent
+  // silenced the other. Delivery is now per seat: the free one answers now.
+  console.log("\nsplit @both delivery");
+  await api("POST", "/api/rooms", { name: "splitboth" });
+  await useFakes("splitboth");
+  await cfg("splitboth", { maxHops: 0, agents: { claude: { lurk: false }, codex: { lurk: false } } });
+  await say("splitboth", "@codex SLEEP:2500 SAY:SLOWFIRST");
+  await waitRoom("splitboth", (x) => x.room.busy.includes("codex"), "codex to start");
+  const split = await say("splitboth", "@both SAY:SPLIT");
+  ok("a message to both seats is accepted while one is busy",
+    split.status === 200 && split.data.ok === true && !split.data.queued,
+    JSON.stringify(split.data));
+  ok("the busy seat is reported as a deferred delivery",
+    Array.isArray(split.data.deferred) && split.data.deferred.join() === "codex",
+    JSON.stringify(split.data));
+  const early = await waitRoom("splitboth", (x) =>
+    x.entries.some((e) => e.author === "claude" && e.text === "SPLIT"), "the free seat to answer first");
+  ok("the free seat answers without waiting for the busy one",
+    !early.entries.some((e) => e.author === "codex" && e.text === "SPLIT"));
+  d = await idle("splitboth", 40000);
+  const splitUser = d.entries.filter((e) => e.kind === "user" && e.text === "@both SAY:SPLIT");
+  ok("the user's message is recorded exactly once", splitUser.length === 1, String(splitUser.length));
+  ok("the one entry still addresses both seats",
+    splitUser[0] && splitUser[0].target === "both" &&
+    splitUser[0].meta.audience.addressed.join() === "claude,codex",
+    JSON.stringify(splitUser[0] && splitUser[0].meta));
+  const late = d.entries.find((e) => e.author === "codex" && e.text === "SPLIT");
+  ok("the busy seat is delivered to once it frees", !!late);
+  ok("a late reply is badged as deferred rather than duplicated",
+    !!late && late.meta.deferred === true &&
+    d.entries.filter((e) => e.author === "codex" && e.text === "SPLIT").length === 1,
+    JSON.stringify(late && late.meta));
+  ok("the deferred seat finished after its earlier work",
+    !!late && d.entries.findIndex((e) => e.text === "SLOWFIRST") < d.entries.indexOf(late));
+
+  // Splitting must not reorder anything. A seat with a message already queued
+  // still answers that message first; splitting only changes *when* each seat
+  // is reached, never the order it is reached in.
+  await api("POST", "/api/rooms", { name: "splitfifo" });
+  await useFakes("splitfifo");
+  await cfg("splitfifo", { maxHops: 0, agents: { claude: { lurk: false }, codex: { lurk: false } } });
+  await say("splitfifo", "@codex SLEEP:2500 SAY:FIFOBUSY");
+  await waitRoom("splitfifo", (x) => x.room.busy.includes("codex"), "codex to start");
+  const aheadOfSplit = await say("splitfifo", "@codex SAY:FIFOQUEUED");
+  ok("a direct message to a busy seat is held for that lane",
+    aheadOfSplit.status === 200 && (aheadOfSplit.data.deferred || []).join() === "codex",
+    JSON.stringify(aheadOfSplit.data));
+  const splitPastQueue = await say("splitfifo", "@both SAY:FIFOSPLIT");
+  ok("@both still splits when the busy seat has a message queued ahead of it",
+    splitPastQueue.status === 200 && !splitPastQueue.data.queued &&
+    (splitPastQueue.data.deferred || []).join() === "codex",
+    JSON.stringify(splitPastQueue.data));
+  await waitRoom("splitfifo", (x) => x.entries.some((e) => e.author === "claude" && e.text === "FIFOSPLIT"),
+    "the free seat to answer past the queue");
+  d = await idle("splitfifo", 40000);
+  const codexLane = d.entries.filter((e) => e.author === "codex" && e.kind === "agent").map((e) => e.text);
+  ok("the busy seat answers in the order the user sent, split half last",
+    codexLane.join() === "FIFOBUSY,FIFOQUEUED,FIFOSPLIT", JSON.stringify(codexLane));
+
+  // Every accepted turn is appended and snapshotted where the user sent it. A
+  // message held as raw text and appended on dispatch would land *after* later
+  // messages, and would take the retry slot with it when it did.
+  await api("POST", "/api/rooms", { name: "splitorder" });
+  await useFakes("splitorder");
+  await cfg("splitorder", { maxHops: 0, agents: { claude: { lurk: false }, codex: { lurk: false } } });
+  await say("splitorder", "@codex SLEEP:2500 SAY:ORDERBUSY");
+  await waitRoom("splitorder", (x) => x.room.busy.includes("codex"), "codex to start");
+  await say("splitorder", "@codex SAY:ORDEREARLY");   // held for codex
+  await say("splitorder", "@both SAY:ORDERLATE");     // claude answers now
+  const ordered = await room("splitorder");
+  const userOrder = texts(ordered, "user");
+  // A leading single-seat tag is stripped from the stored text; @both is not.
+  ok("a held message keeps its place in the transcript",
+    userOrder.join("|") === "SLEEP:2500 SAY:ORDERBUSY|SAY:ORDEREARLY|@both SAY:ORDERLATE",
+    JSON.stringify(userOrder));
+  ok("the last thing the user sent owns the retry slot",
+    ordered.room.lastAddressed === "both", ordered.room.lastAddressed);
+  d = await idle("splitorder", 40000);
+  ok("every held message was answered",
+    ["ORDERBUSY", "ORDEREARLY", "ORDERLATE"].every((t) => texts(d).includes(t)), JSON.stringify(texts(d)));
+
+  // A @both sent while *both* seats are busy still splits: each seat answers as
+  // it frees, rather than the pair of them waiting for the slower one.
+  await api("POST", "/api/rooms", { name: "splitbothbusy" });
+  await useFakes("splitbothbusy");
+  await cfg("splitbothbusy", { maxHops: 0, agents: { claude: { lurk: false }, codex: { lurk: false } } });
+  await say("splitbothbusy", "@claude SLEEP:1200 SAY:FASTSEAT");
+  await say("splitbothbusy", "@codex SLEEP:3500 SAY:SLOWSEAT");
+  await waitRoom("splitbothbusy", (x) => x.room.busy.length === 2, "both seats to start");
+  const bothBusy = await say("splitbothbusy", "@both SAY:BOTHBUSY");
+  ok("a @both sent while both seats are busy is still accepted, not queued whole",
+    bothBusy.status === 200 && !bothBusy.data.queued &&
+    (bothBusy.data.deferred || []).slice().sort().join() === "claude,codex",
+    JSON.stringify(bothBusy.data));
+  const firstFree = await waitRoom("splitbothbusy", (x) =>
+    x.entries.some((e) => e.author === "claude" && e.text === "BOTHBUSY"),
+    "the first seat to free to answer", 20000);
+  ok("the seat that frees first answers without waiting for the other",
+    !firstFree.entries.some((e) => e.author === "codex" && e.text === "BOTHBUSY"));
+  d = await idle("splitbothbusy", 40000);
+  ok("the slower seat still gets the same message, once",
+    d.entries.filter((e) => e.author === "codex" && e.text === "BOTHBUSY").length === 1 &&
+    d.entries.filter((e) => e.kind === "user" && e.text === "@both SAY:BOTHBUSY").length === 1);
+
+  // Accepted user work outranks agent-to-agent follow-ups. A hop that finds the
+  // seat free must still wait for anything the user has queued for it.
+  await api("POST", "/api/rooms", { name: "lanepriority" });
+  await useFakes("lanepriority");
+  await cfg("lanepriority", { maxHops: 4, agents: { claude: { lurk: false }, codex: { lurk: false } } });
+  await say("lanepriority", "@codex SLEEP:2000 SAY:LANEBUSY");
+  await waitRoom("lanepriority", (x) => x.room.busy.includes("codex"), "codex to start");
+  await say("lanepriority", "@codex SAY:USERFIRST");          // queued behind it
+  await say("lanepriority", "@claude TAG:codex");             // free seat, hops at codex
+  // A waiting hop leaves the room briefly idle between polls, so wait for the
+  // hop itself to land rather than for quiet.
+  await waitRoom("lanepriority", (x) =>
+    x.entries.some((e) => e.author === "codex" && e.meta && e.meta.hop), "the delayed hop to land", 20000);
+  d = await idle("lanepriority", 40000);
+  const priorityLane = d.entries.filter((e) => e.author === "codex" && e.kind === "agent");
+  const userItem = priorityLane.findIndex((e) => e.text === "USERFIRST");
+  const hopItem = priorityLane.findIndex((e) => e.meta && e.meta.hop);
+  ok("a hop cannot overtake a message the user already queued for that seat",
+    userItem >= 0 && hopItem >= 0 && userItem < hopItem,
+    JSON.stringify(priorityLane.map((e) => ({ text: e.text, hop: !!(e.meta && e.meta.hop) }))));
+
+  // The deferred seat reads the early seat's reply in its own delta and answers
+  // it there. Replaying that same reply as a hop would be one agent answering
+  // one message twice.
+  await api("POST", "/api/rooms", { name: "splitdup" });
+  await useFakes("splitdup");
+  await cfg("splitdup", { maxHops: 4, agents: { claude: { lurk: false }, codex: { lurk: false } } });
+  await say("splitdup", "@codex SLEEP:2500 SAY:DUPBUSY");
+  await waitRoom("splitdup", (x) => x.room.busy.includes("codex"), "codex to start");
+  await say("splitdup", "@both TAG:codex");
+  d = await idle("splitdup", 40000);
+  const dupLane = d.entries.filter((e) => e.author === "codex" && e.kind === "agent" && e.text !== "DUPBUSY");
+  ok("a tag the deferred seat already read in its delta is not replayed as a hop",
+    dupLane.length === 1 && !!(dupLane[0].meta && dupLane[0].meta.deferred) &&
+    !dupLane.some((e) => e.meta && e.meta.hop),
+    JSON.stringify(dupLane.map((e) => ({ text: e.text, hop: !!(e.meta && e.meta.hop), deferred: !!(e.meta && e.meta.deferred) }))));
+
+  // …but suppression is scoped to what that seat actually saw. A reply it has
+  // not read still earns the ordinary hop.
+  await api("POST", "/api/rooms", { name: "splitunseen" });
+  await useFakes("splitunseen");
+  await cfg("splitunseen", { maxHops: 4, agents: { claude: { lurk: false }, codex: { lurk: false } } });
+  await say("splitunseen", "@codex SLEEP:2500 SAY:UNSEENBUSY");
+  await waitRoom("splitunseen", (x) => x.room.busy.includes("codex"), "codex to start");
+  await say("splitunseen", "@both TAG:claude"); // codex's late reply tags claude, who hasn't read it
+  d = await idle("splitunseen", 40000);
+  ok("a reply the other seat has not read still triggers its hop",
+    d.entries.some((e) => e.author === "claude" && e.kind === "agent" && e.meta && e.meta.hop),
+    JSON.stringify(d.entries.filter((e) => e.kind === "agent").map((e) => ({ who: e.author, hop: !!(e.meta && e.meta.hop) }))));
+
+  // Stop must close the chain out, not leave it waiting on a turn that will
+  // never run — and a pair cycle still claims both seats whole.
+  await api("POST", "/api/rooms", { name: "splitstop" });
+  await useFakes("splitstop");
+  await say("splitstop", "@codex SLEEP:4000 SAY:STOPSLOW");
+  await waitRoom("splitstop", (x) => x.room.busy.includes("codex"), "codex to start");
+  await say("splitstop", "@both SAY:STOPSPLIT");
+  await waitRoom("splitstop", (x) => x.room.queued > 0, "the held delivery to be counted");
+  await api("POST", "/api/stop", { room: "splitstop" });
+  const afterStop = await idle("splitstop", 15000);
+  ok("stop drops a held delivery and releases the room",
+    afterStop.room.queued === 0 && afterStop.room.busy.length === 0 &&
+    !afterStop.entries.some((e) => e.author === "codex" && e.text === "STOPSPLIT"));
+
+  // Retry launches straight into a seat instead of going through the lane, so
+  // it has to refuse while that lane still owes the user something.
+  await api("POST", "/api/rooms", { name: "splitretry" });
+  await useFakes("splitretry");
+  await cfg("splitretry", { maxHops: 0, agents: { claude: { lurk: false }, codex: { lurk: false } } });
+  await say("splitretry", "@claude SLEEP:2500 SAY:RETRYBLOCK");
+  await waitRoom("splitretry", (x) => x.room.busy.includes("claude"), "claude to start");
+  await say("splitretry", "@both FAIL"); // codex's half fails now, claude's is held
+  await waitRoom("splitretry", (x) => x.entries.some((e) =>
+    e.kind === "system" && e.meta && e.meta.error && e.meta.agent === "codex"), "codex's half to fail");
+  const retryBusy = await api("POST", "/api/retry", { room: "splitretry" });
+  ok("retry refuses while a lane still owes the user a delivery",
+    retryBusy.status === 409, JSON.stringify({ status: retryBusy.status, data: retryBusy.data }));
+  d = await idle("splitretry", 40000);
+  ok("…and works once that lane is clear",
+    (await api("POST", "/api/retry", { room: "splitretry" })).status === 200);
+  await idle("splitretry", 40000);
+
+  // Stop all is a line in time. A message sent immediately afterwards must not
+  // clear it and let the stopped chain wake up and hop.
+  await api("POST", "/api/rooms", { name: "stopresume" });
+  await useFakes("stopresume");
+  await cfg("stopresume", { maxHops: 4, agents: { claude: { lurk: false }, codex: { lurk: false } } });
+  await say("stopresume", "@codex SLEEP:2500 SAY:STOPBUSY");
+  await waitRoom("stopresume", (x) => x.room.busy.includes("codex"), "codex to start");
+  await say("stopresume", "@claude TAG:codex");   // claude replies, then wants to hop at codex
+  await waitRoom("stopresume", (x) => x.entries.some((e) => e.author === "claude" && e.kind === "agent"),
+    "claude's reply, so a hop is pending");
+  await api("POST", "/api/stop", { room: "stopresume" });
+  await say("stopresume", "@claude SAY:AFTERSTOP");  // resets nothing: the stop stands
+  d = await idle("stopresume", 40000);
+  ok("a message after Stop does not revive the stopped chain's hop",
+    !d.entries.some((e) => e.author === "codex" && e.meta && e.meta.hop),
+    JSON.stringify(d.entries.filter((e) => e.kind === "agent").map((e) => ({ who: e.author, hop: !!(e.meta && e.meta.hop) }))));
+  ok("the message sent after Stop is still answered",
+    d.entries.some((e) => e.author === "claude" && e.text === "AFTERSTOP"));
+
+  // A @both in a work room is a discussion. Switching Talk→Work mid-exchange
+  // makes that true of an exchange that began without it, and every process
+  // launched afterwards must carry the boundary — otherwise it gets work-mode
+  // write permissions with nothing holding it back.
+  await api("POST", "/api/rooms", { name: "scopeflip" });
+  await useFakes("scopeflip");
+  // Asserted on Claude: its boundary is a real flag (Plan instead of work-mode
+  // acceptEdits), whereas Codex's is a prompt instruction inside its existing
+  // sandboxed thread and so leaves no trace in argv.
+  await cfg("scopeflip", { mode: "talk", maxHops: 0, agents: { claude: { lurk: false }, codex: { lurk: false } } });
+  await say("scopeflip", "@claude SLEEP:2500 SAY:SCOPEBUSY");
+  await waitRoom("scopeflip", (x) => x.room.busy.includes("claude"), "claude to start");
+  await say("scopeflip", "@both ARGJSON");                 // claude's half is held
+  await waitRoom("scopeflip", (x) => x.room.queued > 0, "the held half");
+  await cfg("scopeflip", { mode: "work" });                // flips the exchange to a discussion
+  d = await idle("scopeflip", 40000);
+  const heldArgv = argvFrom([...d.entries].reverse()
+    .find((e) => e.author === "claude" && e.meta && e.meta.deferred));
+  ok("a held @both delivery picks up the no-edit boundary the mode switch created",
+    hasArg(heldArgv, "--permission-mode", "plan") &&
+    !hasArg(heldArgv, "--permission-mode", "acceptEdits"), JSON.stringify(heldArgv));
+
+  // A pair turn has no half to deliver, so its *cycle* waits — but the command
+  // itself is applied and the task appended on acceptance. Queueing the raw
+  // text instead left pair mode off (so the next untagged message ran as an
+  // ordinary turn) and appended the task after messages sent later.
+  // Stop all drops a queued pair cycle. Restoring its root as the retryable
+  // turn would rewind Retry past everything the user sent afterwards.
+  await api("POST", "/api/rooms", { name: "stoprewind" });
+  await useFakes("stoprewind");
+  await cfg("stoprewind", { maxHops: 0, agents: { claude: { lurk: false }, codex: { lurk: false } } });
+  await say("stoprewind", "@codex SLEEP:3000 SAY:REWINDBUSY");
+  await waitRoom("stoprewind", (x) => x.room.busy.includes("codex"), "codex to start");
+  await say("stoprewind", "/pair start @claude SAY:PAIRROOT"); // cycle waits for both seats
+  await waitRoom("stoprewind", (x) => !!x.room.pair, "pair mode to arm");
+  await say("stoprewind", "@codex SAY:REWINDASIDE");          // newer aside, held for codex
+  await waitRoom("stoprewind", (x) => x.room.queued >= 2, "both items waiting");
+  await api("POST", "/api/stop", { room: "stoprewind" });
+  const rewound = await idle("stoprewind", 20000);
+  ok("stop leaves the newest turn as the retryable one", rewound.room.canRetry === true);
+  const beforeRewindRetry = rewound.entries.length;
+  const rewindRetry = await api("POST", "/api/retry", { room: "stoprewind" });
+  ok("Retry accepts the newer turn after dropping the queued pair cycle",
+    rewindRetry.status === 200, JSON.stringify(rewindRetry.data));
+  d = await idle("stoprewind", 30000);
+  const rewindFresh = d.entries.slice(beforeRewindRetry);
+  ok("Retry after Stop does not rewind to the dropped pair cycle",
+    rewindFresh.some((e) => e.author === "codex" && e.text === "REWINDASIDE") &&
+    !rewindFresh.some((e) => e.text === "PAIRROOT") &&
+    !rewindFresh.some((e) => e.meta && e.meta.pair),
+    JSON.stringify(rewindFresh.map((e) => `${e.author}:${e.text}`.slice(0, 60))));
+  await say("stoprewind", "/pair end");
+
+  // The same rewind from the other direction: a cycle already running, waiting
+  // for a reviewer who is busy in the other lane. Stop must give up quietly —
+  // announcing an abandoned cycle and restoring its root would both contradict
+  // the user's own Stop and take the retry slot off a newer message.
+  await api("POST", "/api/rooms", { name: "stopwait" });
+  await useFakes("stopwait");
+  await cfg("stopwait", { maxHops: 0, agents: { claude: { lurk: false }, codex: { lurk: false } } });
+  await say("stopwait", "/pair start @claude SLEEP:1500 SAY:WAITROOT");
+  await say("stopwait", "@codex SLEEP:5000 SAY:SIDEASIDE"); // occupies the reviewer's lane
+  await waitRoom("stopwait", (x) => x.entries.some((e) => e.author === "claude" && e.text === "WAITROOT"),
+    "the worker to finish, so the cycle waits for the busy reviewer", 25000);
+  await waitRoom("stopwait", (x) => x.room.busy.includes("codex"), "the reviewer to still be busy");
+  const beforeWaitStop = (await room("stopwait")).entries.length;
+  await api("POST", "/api/stop", { room: "stopwait" });
+  const quiet = await idle("stopwait", 25000);
+  const quietStopEntries = quiet.entries.slice(beforeWaitStop);
+  ok("Stop during a pair wait gives up quietly instead of announcing an abandon",
+    !quiet.entries.some((e) => e.meta && e.meta.pairAbandoned),
+    JSON.stringify(texts(quiet, "system")));
+  ok("the interrupted seat is reported as stopped, not failed",
+    quietStopEntries.some((e) => e.meta && e.meta.agent === "codex" && e.meta.stopped === true) &&
+    !quietStopEntries.some((e) => e.meta && e.meta.agent === "codex" && e.meta.error === true),
+    JSON.stringify(quietStopEntries.filter((e) => e.kind === "system")));
+  const waitRetry = await api("POST", "/api/retry", { room: "stopwait" });
+  ok("Retry is accepted after that Stop", waitRetry.status === 200, JSON.stringify(waitRetry.data));
+  d = await idle("stopwait", 30000);
+  ok("Retry after that Stop resumes the newer aside, not the stopped cycle",
+    d.entries.some((e) => e.author === "codex" && e.text === "SIDEASIDE") &&
+    d.entries.filter((e) => e.author === "claude" && e.text === "WAITROOT").length === 1 &&
+    !d.entries.some((e) => e.meta && e.meta.pair === "review"),
+    JSON.stringify(texts(d)));
+  await say("stopwait", "/pair end");
+
+  // Continue restarts a cycle at its fix step. Stopping that fix must not be
+  // reported as a failed fix — HOP_FAILED is what an interrupted hop returns,
+  // and treating it as failure hands Retry back this cycle's root.
+  await api("POST", "/api/rooms", { name: "contstop" });
+  await useFakes("contstop");
+  await cfg("contstop", { pairRounds: 1, maxHops: 0, agents: { claude: { lurk: false }, codex: { lurk: false } } });
+  await say("contstop", "/pair start @claude SAY:CONTROOT NEVERHAPPY SLOWFIX");
+  await waitRoom("contstop", (x) => x.entries.some((e) =>
+    e.kind === "system" && e.meta && e.meta.pairContinue), "the round cap to offer Continue", 40000);
+  await idle("contstop", 20000);
+  await api("POST", "/api/pair/continue", { room: "contstop" });
+  await waitRoom("contstop", (x) => x.room.busy.includes("claude"), "the fix step to start", 20000);
+  await say("contstop", "@codex SLEEP:5000 SAY:CONTASIDE"); // newer turn, owns the retry slot
+  await waitRoom("contstop", (x) => x.room.busy.includes("codex"), "the newer aside to start", 20000);
+  const beforeContStop = (await room("contstop")).entries.length;
+  await api("POST", "/api/stop", { room: "contstop" });
+  const contStopped = await idle("contstop", 25000);
+  const contStopEntries = contStopped.entries.slice(beforeContStop);
+  ok("stopping a Continue fix does not report an abandoned or paused cycle",
+    !contStopped.entries.some((e) => e.meta && (e.meta.pairAbandoned || e.meta.pairPaused)),
+    JSON.stringify(texts(contStopped, "system")));
+  ok("the stopped Continue hop is neutral rather than a failed mention",
+    contStopEntries.some((e) => e.meta && e.meta.agent === "claude" && e.meta.stopped === true) &&
+    !contStopEntries.some((e) => e.meta && e.meta.agent === "claude" && e.meta.error === true),
+    JSON.stringify(contStopEntries.filter((e) => e.kind === "system")));
+  const beforeContRetry = contStopped.entries.length;
+  const contRetry = await api("POST", "/api/retry", { room: "contstop" });
+  ok("Retry is accepted after stopping a Continue", contRetry.status === 200, JSON.stringify(contRetry.data));
+  d = await idle("contstop", 30000);
+  const contFresh = d.entries.slice(beforeContRetry);
+  ok("…and replays the newer aside rather than the pair cycle",
+    contFresh.some((e) => e.author === "codex" && e.text === "CONTASIDE") &&
+    !contFresh.some((e) => e.meta && e.meta.pair),
+    JSON.stringify(contFresh.map((e) => `${e.author}:${e.text}`.slice(0, 40))));
+  await say("contstop", "/pair end");
+
+  // A named Stop does not bump the room-wide stop epoch. The interrupted pair
+  // step therefore needs its own stopped result; treating it as HOP_FAILED
+  // would pause the cycle and replace this newer aside in the Retry slot.
+  await api("POST", "/api/rooms", { name: "contseatstop" });
+  await useFakes("contseatstop");
+  await cfg("contseatstop", { pairRounds: 1, maxHops: 0, agents: { claude: { lurk: false }, codex: { lurk: false } } });
+  await say("contseatstop", "/pair start @claude SAY:SEATROOT NEVERHAPPY SLOWFIX");
+  await waitRoom("contseatstop", (x) => x.entries.some((e) =>
+    e.kind === "system" && e.meta && e.meta.pairContinue), "the round cap to offer Continue", 40000);
+  await idle("contseatstop", 20000);
+  const seatContinue = await api("POST", "/api/pair/continue", { room: "contseatstop" });
+  ok("the seat-stop continuation is accepted", seatContinue.status === 200, JSON.stringify(seatContinue.data));
+  await waitRoom("contseatstop", (x) => x.room.busy.includes("claude"), "the seat-stop fix to start", 20000);
+  await say("contseatstop", "@codex SLEEP:5000 SAY:SEATASIDE");
+  await waitRoom("contseatstop", (x) =>
+    x.room.busy.includes("claude") && x.room.busy.includes("codex"), "both lanes to be active", 20000);
+  const beforeSeatStop = (await room("contseatstop")).entries.length;
+  const seatStop = await api("POST", "/api/stop", { room: "contseatstop", agent: "claude" });
+  ok("a named Stop interrupts only the Continue worker",
+    seatStop.status === 200 && seatStop.data.stopped === 1 && seatStop.data.agent === "claude",
+    JSON.stringify(seatStop.data));
+  d = await idle("contseatstop", 30000);
+  const seatStopFresh = d.entries.slice(beforeSeatStop);
+  ok("the named Stop is neutral and does not pause the pair cycle",
+    seatStopFresh.some((e) => e.meta && e.meta.agent === "claude" && e.meta.stopped === true) &&
+    !seatStopFresh.some((e) => e.meta && e.meta.agent === "claude" && e.meta.error === true) &&
+    !seatStopFresh.some((e) => e.meta && (e.meta.pairPaused || e.meta.pairAbandoned)),
+    JSON.stringify(seatStopFresh.filter((e) => e.kind === "system")));
+  ok("…and the other lane finishes the newer aside without a pair replay",
+    seatStopFresh.some((e) => e.author === "codex" && e.text === "SEATASIDE") &&
+    !seatStopFresh.some((e) => e.meta && e.meta.pair),
+    JSON.stringify(seatStopFresh.map((e) => `${e.author}:${e.text}`.slice(0, 50))));
+  ok("the completed newer aside still owns the closed Retry slot", d.room.canRetry === false,
+    JSON.stringify(d.room));
+  const seatStopRetry = await api("POST", "/api/retry", { room: "contseatstop" });
+  ok("Retry cannot rewind to the selectively stopped pair root", seatStopRetry.status === 400,
+    JSON.stringify(seatStopRetry.data));
+  await say("contseatstop", "/pair end");
+
+  // The initial worker is a normal turn rather than a hop, but it belongs to
+  // the same pair cycle and has the same rule: a deliberate named Stop must not
+  // reconstruct an older root over a newer message.
+  await api("POST", "/api/rooms", { name: "pairworkstop" });
+  await useFakes("pairworkstop");
+  await cfg("pairworkstop", { maxHops: 0, agents: { claude: { lurk: false }, codex: { lurk: false } } });
+  await say("pairworkstop", "/pair start @claude SLEEP:5000 SAY:WORKROOT");
+  await waitRoom("pairworkstop", (x) => x.room.busy.includes("claude"), "the initial pair worker to start", 20000);
+  await say("pairworkstop", "@codex SLEEP:3000 SAY:WORKASIDE");
+  await waitRoom("pairworkstop", (x) =>
+    x.room.busy.includes("claude") && x.room.busy.includes("codex"), "both work-stop lanes to be active", 20000);
+  const beforeWorkStop = (await room("pairworkstop")).entries.length;
+  await api("POST", "/api/stop", { room: "pairworkstop", agent: "claude" });
+  d = await idle("pairworkstop", 30000);
+  const workStopFresh = d.entries.slice(beforeWorkStop);
+  ok("a named Stop of the initial pair worker is neutral",
+    workStopFresh.some((e) => e.meta && e.meta.agent === "claude" && e.meta.stopped === true) &&
+    !workStopFresh.some((e) => e.meta && e.meta.agent === "claude" && e.meta.error === true),
+    JSON.stringify(workStopFresh.filter((e) => e.kind === "system")));
+  ok("…and leaves the completed newer aside in charge of Retry",
+    workStopFresh.some((e) => e.author === "codex" && e.text === "WORKASIDE") &&
+    d.room.canRetry === false,
+    JSON.stringify(workStopFresh.map((e) => `${e.author}:${e.text}`.slice(0, 50))));
+  ok("Retry cannot rewind to the stopped initial pair work",
+    (await api("POST", "/api/retry", { room: "pairworkstop" })).status === 400);
+  await say("pairworkstop", "/pair end");
+
+  // Review is the one path where null means "silent approval", so its stopped
+  // result must be distinct and handled before either approval or failure.
+  await api("POST", "/api/rooms", { name: "pairreviewstop" });
+  await useFakes("pairreviewstop");
+  await cfg("pairreviewstop", { maxHops: 0, agents: { claude: { lurk: false }, codex: { lurk: false } } });
+  await say("pairreviewstop", "/pair start @claude SAY:REVIEWROOT SLOWREVIEW");
+  await waitRoom("pairreviewstop", (x) =>
+    x.entries.some((e) => e.author === "claude" && e.text.startsWith("REVIEWROOT")) && x.room.busy.includes("codex"),
+  "the pair reviewer to start", 20000);
+  // The reviewer is the escape-hatch seat while claude is the pair worker, so
+  // this is an ordinary aside held directly behind the review being stopped.
+  await say("pairreviewstop", "@codex SLEEP:3000 SAY:REVIEWASIDE");
+  await waitRoom("pairreviewstop", (x) =>
+    x.room.busy.includes("codex") && x.room.queued > 0, "the newer reviewer-side aside to queue", 20000);
+  const beforeReviewStop = (await room("pairreviewstop")).entries.length;
+  await api("POST", "/api/stop", { room: "pairreviewstop", agent: "codex" });
+  d = await idle("pairreviewstop", 30000);
+  const reviewStopFresh = d.entries.slice(beforeReviewStop);
+  ok("a named Stop of the reviewer is neutral, not failure or approval",
+    reviewStopFresh.some((e) => e.meta && e.meta.agent === "codex" && e.meta.stopped === true) &&
+    !reviewStopFresh.some((e) => e.meta && e.meta.agent === "codex" && e.meta.error === true) &&
+    !reviewStopFresh.some((e) => e.meta && e.meta.pairPaused) &&
+    !reviewStopFresh.some((e) => e.kind === "system" && /approved|nothing to flag/i.test(e.text)),
+    JSON.stringify(reviewStopFresh.filter((e) => e.kind === "system")));
+  ok("…and leaves the completed reviewer-side aside in charge of Retry",
+    reviewStopFresh.some((e) => e.author === "codex" && e.text === "REVIEWASIDE") &&
+    d.room.canRetry === false,
+    JSON.stringify(reviewStopFresh.map((e) => `${e.author}:${e.text}`.slice(0, 50))));
+  ok("Retry cannot rewind to the stopped review",
+    (await api("POST", "/api/retry", { room: "pairreviewstop" })).status === 400);
+  await say("pairreviewstop", "/pair end");
+
+  // The ordinary pair loop's fix step is separate from Continue's fix path;
+  // cover its stopped-result branch independently.
+  await api("POST", "/api/rooms", { name: "pairfixstop" });
+  await useFakes("pairfixstop");
+  await cfg("pairfixstop", { pairRounds: 2, maxHops: 0, agents: { claude: { lurk: false }, codex: { lurk: false } } });
+  await say("pairfixstop", "/pair start @claude SAY:FIXROOT NEVERHAPPY SLOWFIX");
+  await waitRoom("pairfixstop", (x) =>
+    x.entries.some((e) => e.meta && e.meta.pair === "review") && x.room.busy.includes("claude"),
+  "the ordinary pair fix to start", 30000);
+  await say("pairfixstop", "@codex SLEEP:3000 SAY:FIXASIDE");
+  await waitRoom("pairfixstop", (x) =>
+    x.room.busy.includes("claude") && x.room.busy.includes("codex"), "both fix-stop lanes to be active", 20000);
+  const beforeFixStop = (await room("pairfixstop")).entries.length;
+  await api("POST", "/api/stop", { room: "pairfixstop", agent: "claude" });
+  d = await idle("pairfixstop", 30000);
+  const fixStopFresh = d.entries.slice(beforeFixStop);
+  ok("a named Stop of an ordinary pair fix is neutral",
+    fixStopFresh.some((e) => e.meta && e.meta.agent === "claude" && e.meta.stopped === true) &&
+    !fixStopFresh.some((e) => e.meta && e.meta.agent === "claude" && e.meta.error === true) &&
+    !fixStopFresh.some((e) => e.meta && e.meta.pairPaused),
+    JSON.stringify(fixStopFresh.filter((e) => e.kind === "system")));
+  ok("…and leaves the completed fix-side aside in charge of Retry",
+    fixStopFresh.some((e) => e.author === "codex" && e.text === "FIXASIDE") &&
+    d.room.canRetry === false,
+    JSON.stringify(fixStopFresh.map((e) => `${e.author}:${e.text}`.slice(0, 50))));
+  ok("Retry cannot rewind to the selectively stopped ordinary fix",
+    (await api("POST", "/api/retry", { room: "pairfixstop" })).status === 400);
+  await say("pairfixstop", "/pair end");
+
+  // Rename moves the room's folder out from under any process the room might
+  // still launch, so it waits for the whole exchange — not just a busy seat.
+  await api("POST", "/api/rooms", { name: "renameguard" });
+  await useFakes("renameguard");
+  await cfg("renameguard", { maxHops: 0, agents: { claude: { lurk: false }, codex: { lurk: false } } });
+  await say("renameguard", "/pair start @claude"); // armed only, so Continue reaches its work guard
+  await say("renameguard", "@codex SLEEP:2500 SAY:RENBUSY");
+  await waitRoom("renameguard", (x) => x.room.busy.includes("codex"), "codex to start");
+  await say("renameguard", "@both SAY:RENSPLIT");
+  await waitRoom("renameguard", (x) => x.room.queued > 0, "the held half");
+  const renameBusy = await api("POST", "/api/room/rename", { room: "renameguard", to: "renameguard2" });
+  ok("rename is refused while an exchange still owes work", renameBusy.status === 409,
+    JSON.stringify(renameBusy.data));
+  const continueBusy = await api("POST", "/api/pair/continue", { room: "renameguard" });
+  ok("Continue is refused while an exchange still owes work", continueBusy.status === 409,
+    JSON.stringify(continueBusy.data));
+  await idle("renameguard", 40000);
+  const renameFree = await api("POST", "/api/room/rename", { room: "renameguard", to: "renameguard2" });
+  ok("…and the guard releases once the exchange is done", renameFree.status === 200,
+    JSON.stringify(renameFree.data));
+
+  // Once an exchange has the boundary it keeps it. Flipping the room back to
+  // Talk must not let a Retry of that same message come back full-access.
+  await api("POST", "/api/rooms", { name: "scopelatch" });
+  await useFakes("scopelatch");
+  await cfg("scopelatch", {
+    mode: "talk", maxHops: 0,
+    agents: { claude: { lurk: false, permissionMode: "bypassPermissions" }, codex: { lurk: false } },
+  });
+  await say("scopelatch", "@claude SLEEP:2500 SAY:LATCHBUSY");
+  await waitRoom("scopelatch", (x) => x.room.busy.includes("claude"), "claude to start");
+  // claude's half is held, and fails once when it runs — so it is the seat
+  // Retry targets, and its retry succeeds and reports the flags it ran with.
+  await say("scopelatch", "@both FAILONCESEAT:claude ARGJSON");
+  await waitRoom("scopelatch", (x) => x.room.queued > 0, "the held half");
+  await cfg("scopelatch", { mode: "work" });              // exchange acquires the boundary
+  await waitRoom("scopelatch", (x) => x.entries.some((e) =>
+    e.kind === "system" && e.meta && e.meta.agent === "claude" && e.meta.error), "claude's half to fail", 30000);
+  await idle("scopelatch", 40000);
+  await cfg("scopelatch", { mode: "talk" });              // …and must not lose it
+  ok("the failed half is retryable", (await room("scopelatch")).room.canRetry === true);
+  await api("POST", "/api/retry", { room: "scopelatch" });
+  d = await idle("scopelatch", 40000);
+  const latchedArgv = argvFrom(lastAgent(d, "claude"));
+  ok("a boundary acquired mid-exchange is latched against a later Work→Talk flip",
+    hasArg(latchedArgv, "--permission-mode", "plan") &&
+    !hasArg(latchedArgv, "--permission-mode", "bypassPermissions"), JSON.stringify(latchedArgv));
+
+  // Rooms written by 1.0.1 recorded the boundary only on the user entry. Retry
+  // has to read it from there, or a protected historical @both comes back with
+  // full access.
+  const legacyRoom = path.join(ROOT, "legacyscope2");
+  fs.mkdirSync(path.join(legacyRoom, "workspace"), { recursive: true });
+  fs.writeFileSync(path.join(legacyRoom, "room.json"), JSON.stringify({
+    defaultAgent: "claude", mode: "talk", maxHops: 0, pairRounds: 0,
+    projectDir: null, roomNote: null, timeoutMs: 900000,
+    agents: {
+      claude: { command: FAKE, model: null, effort: null, extraArgs: [], lurk: false, permissionMode: "bypassPermissions" },
+      codex: { command: FAKE, model: null, effort: null, sandbox: "read-only", extraArgs: [], lurk: false },
+    },
+  }, null, 2));
+  fs.writeFileSync(path.join(legacyRoom, "events.jsonl"),
+    JSON.stringify({
+      n: 1, kind: "user", author: "user", target: "both", text: "@both ARGJSON",
+      ts: new Date().toISOString(), meta: { audience: { addressed: ["claude", "codex"], lurking: [] }, discussion: true },
+    }) + "\n");
+  // lastUser as an older build wrote it: no `discussion` field at all.
+  fs.writeFileSync(path.join(legacyRoom, "state.json"), JSON.stringify({
+    agents: { claude: { sessionRef: null, cursor: 0 }, codex: { sessionRef: null, cursor: 0 } },
+    lastAddressed: "both", pair: null,
+    lastUser: { n: 1, text: "@both ARGJSON", target: "both", done: {}, pair: false },
+  }, null, 2));
+  const legacy = await room("legacyscope2");
+  ok("a legacy protected turn is still offered for retry", legacy.room.canRetry === true);
+  await api("POST", "/api/retry", { room: "legacyscope2" });
+  d = await idle("legacyscope2", 40000);
+  const legacyArgv = argvFrom(lastAgent(d, "claude"));
+  ok("retrying it recovers the boundary from the entry rather than going full-access",
+    hasArg(legacyArgv, "--permission-mode", "plan") &&
+    !hasArg(legacyArgv, "--permission-mode", "bypassPermissions"), JSON.stringify(legacyArgv));
+
+  await api("POST", "/api/rooms", { name: "splitpair" });
+  await useFakes("splitpair");
+  await say("splitpair", "@codex SLEEP:2500 SAY:PAIRBUSY");
+  await waitRoom("splitpair", (x) => x.room.busy.includes("codex"), "codex to start");
+  const pairQueued = await say("splitpair", "/pair start @claude SAY:PAIRWORK");
+  ok("a pair cycle waits as a unit rather than splitting",
+    pairQueued.data.queued === true && !pairQueued.data.deferred &&
+    pairQueued.data.target === "claude" && pairQueued.data.explicit === true,
+    JSON.stringify(pairQueued.data));
+  const armed = await room("splitpair");
+  ok("a queued pair turn arms pair mode immediately",
+    !!armed.room.pair && armed.room.pair.worker === "claude", JSON.stringify(armed.room.pair));
+  ok("…and announces it in the transcript straight away",
+    texts(armed, "system").some((t) => /Pair mode on/.test(t)), JSON.stringify(texts(armed, "system")));
+  ok("…and appends the task where the user sent it, not where it ran",
+    texts(armed, "user").join("|") === "SLEEP:2500 SAY:PAIRBUSY|SAY:PAIRWORK",
+    JSON.stringify(texts(armed, "user")));
+  ok("…and the waiting task owns the retry slot",
+    armed.room.lastAddressed === "claude", armed.room.lastAddressed);
+  d = await idle("splitpair", 40000);
+  ok("the queued cycle then runs as a pair cycle, reviewer and all",
+    d.entries.some((e) => e.author === "claude" && e.text === "PAIRWORK") &&
+    d.entries.some((e) => e.author === "codex" && e.meta && e.meta.pair === "review"),
+    JSON.stringify(d.entries.filter((e) => e.kind === "agent").map((e) => e.author + ":" + (e.meta && e.meta.pair || "turn"))));
+
+  // The next untagged message must be a pair turn too — pair mode was on from
+  // the moment the command was accepted, not from when its cycle got a seat.
+  await api("POST", "/api/rooms", { name: "pairarmed" });
+  await useFakes("pairarmed");
+  await say("pairarmed", "@codex SLEEP:2000 SAY:ARMBUSY");
+  await waitRoom("pairarmed", (x) => x.room.busy.includes("codex"), "codex to start");
+  await say("pairarmed", "/pair start @claude SAY:ARMFIRST");   // cycle waits
+  const followUp = await say("pairarmed", "SAY:ARMSECOND");     // untagged: must pair too
+  ok("an untagged message sent while a pair cycle waits is itself a pair turn",
+    followUp.data.queued === true, JSON.stringify(followUp.data));
+  d = await idle("pairarmed", 60000);
+  ok("both pair tasks were reviewed rather than run as ordinary turns",
+    d.entries.filter((e) => e.meta && e.meta.pair === "review").length === 2,
+    JSON.stringify(d.entries.filter((e) => e.kind === "agent").map((e) => e.author + ":" + (e.meta && e.meta.pair || "turn"))));
+  await say("pairarmed", "/pair end");
 
   console.log("\npair mode");
   await api("POST", "/api/rooms", { name: "pairroom" });
@@ -947,13 +2553,22 @@ async function main() {
   const r2 = await say("lanes", "@codex SAY:B");
   const r3 = await say("lanes", "@codex SAY:C");
   ok("different seats dispatch in parallel", r1.data.ok === true && r2.data.ok === true);
-  ok("same seat queues", r3.data.queued === true);
-  await sleep(150);
+  // Accepted straight away and held for the lane, rather than kept as raw text:
+  // the message is in the transcript in send order, only its delivery waits.
+  ok("a second message for the same seat is accepted and held for that lane",
+    r3.status === 200 && !r3.data.queued && (r3.data.deferred || []).join() === "codex",
+    JSON.stringify(r3.data));
+  const midOrder = await room("lanes");
+  ok("the held message is in the transcript in the order it was sent",
+    texts(midOrder, "user").join("|") === "SAY:A|SAY:B|SAY:C",
+    JSON.stringify(texts(midOrder, "user")));
   const mid = await room("lanes");
   ok("both lanes busy at once", mid.room.busy.length === 2, JSON.stringify(mid.room.busy));
   d = await idle("lanes");
-  ok("queued message runs after its lane frees", texts(d).includes("C"));
+  ok("held message runs after its lane frees", texts(d).includes("C"));
   ok("all three replies landed", ["A", "B", "C"].every((t) => texts(d).includes(t)));
+  ok("the held reply came after the one it waited on",
+    texts(d).indexOf("B") < texts(d).indexOf("C"));
 
   await api("POST", "/api/rooms", { name: "selectstop" });
   await useFakes("selectstop");
@@ -969,19 +2584,21 @@ async function main() {
   const badStop = await api("POST", "/api/stop", { room: "selectstop", agent: "nobody" });
   ok("seat-scoped Stop rejects unknown agents", badStop.status === 400);
 
-  await api("POST", "/api/rooms", { name: "stoptree" });
-  await useFakes("stoptree");
-  const stopWorkspace = path.join(ROOT, "stoptree", "workspace");
-  const childReady = path.join(stopWorkspace, ".fake-cli-child-ready-STOPTREE");
-  const childSurvived = path.join(stopWorkspace, ".fake-cli-child-survived-STOPTREE");
-  await say("stoptree", "@claude SPAWNCHILD:STOPTREE SLEEP:5000");
-  await waitFile(childReady, "fake CLI descendant to start");
-  const stopped = await api("POST", "/api/stop", { room: "stoptree" });
-  ok("Stop reports the running CLI", stopped.status === 200 && stopped.data.stopped === 1,
-    JSON.stringify(stopped.data));
-  await idle("stoptree");
-  await sleep(1300);
-  ok("Stop kills the CLI's descendant process too", !fs.existsSync(childSurvived), childSurvived);
+  if (process.env.PARLEY_SKIP_NATIVE_KILL !== "1") {
+    await api("POST", "/api/rooms", { name: "stoptree" });
+    await useFakes("stoptree");
+    const stopWorkspace = path.join(ROOT, "stoptree", "workspace");
+    const childReady = path.join(stopWorkspace, ".fake-cli-child-ready-STOPTREE");
+    const childSurvived = path.join(stopWorkspace, ".fake-cli-child-survived-STOPTREE");
+    await say("stoptree", "@claude SPAWNCHILD:STOPTREE SLEEP:5000");
+    await waitFile(childReady, "fake CLI descendant to start");
+    const stopped = await api("POST", "/api/stop", { room: "stoptree" });
+    ok("Stop reports the running CLI", stopped.status === 200 && stopped.data.stopped === 1,
+      JSON.stringify(stopped.data));
+    await idle("stoptree");
+    await sleep(1300);
+    ok("Stop kills the CLI's descendant process too", !fs.existsSync(childSurvived), childSurvived);
+  }
 
   console.log("\nwork mode & activity lines");
   await api("POST", "/api/rooms", { name: "workroom" });
@@ -1059,16 +2676,6 @@ async function main() {
   await say("claudefull", "@claude ARGJSON");
   d = await idle("claudefull");
   ok("Claude has a normal session before elevation", d.room.agents.claude.linked === true);
-
-  await say("claudefull", "@claude SLEEP:1200 ARGJSON");
-  await sleep(120);
-  const busyElevation = await cfg("claudefull", {
-    agents: { claude: { permissionMode: "bypassPermissions" } },
-  });
-  ok("Claude permission changes wait for a running turn", busyElevation.status === 409,
-    JSON.stringify(busyElevation.data));
-  await api("POST", "/api/stop", { room: "claudefull", agent: "claude" });
-  await idle("claudefull");
 
   const fullAccess = await cfg("claudefull", {
     agents: { claude: { permissionMode: "bypassPermissions" } },
@@ -1233,31 +2840,127 @@ async function main() {
     d.room.agents.claude.linked === false && migratedState.agents.claude.sessionRef === null &&
     migratedState.agents.claude.permissionScope === "plan");
 
+  // A settings change no longer waits for the room to go quiet. The running
+  // process keeps the flags it launched with — nothing can change those — but
+  // the session it produces is fenced off by the seat's config epoch and
+  // discarded, so the next turn re-briefs under the new setting.
   await api("POST", "/api/rooms", { name: "configrace" });
   await useFakes("configrace");
-  await say("configrace", "@codex SLEEP:1200 ARGJSON");
+  await say("configrace", "@codex SLEEP:1500 ARGJSON");
   await waitRoom("configrace", (x) => x.room.busy.includes("codex"), "codex to become busy");
   const busySandbox = await cfg("configrace", {
     agents: { codex: { sandbox: "danger-full-access" } },
   });
+  ok("a sandbox change lands immediately even while that seat is answering",
+    busySandbox.status === 200 &&
+    busySandbox.data.room.cfg.agents.codex.sandbox === "danger-full-access" &&
+    (busySandbox.data.runningInvocations || []).join() === "codex",
+    JSON.stringify(busySandbox.data.runningInvocations));
   const busyMode = await cfg("configrace", { mode: "work" });
-  ok("Codex sandbox and room-mode resets wait for its running turn",
-    busySandbox.status === 409 && busyMode.status === 409,
-    JSON.stringify({ sandbox: busySandbox.data, mode: busyMode.data }));
-  await api("POST", "/api/stop", { room: "configrace", agent: "codex" });
-  await idle("configrace");
+  ok("a room-mode change lands immediately too", busyMode.status === 200 &&
+    busyMode.data.room.cfg.mode === "work", JSON.stringify(busyMode.data.runningInvocations));
+  d = await idle("configrace", 20000);
+  ok("the interrupted seat still finishes its answer",
+    !!lastAgent(d, "codex") && argvFrom(lastAgent(d, "codex")).length > 0);
+  ok("the session that turn created is discarded rather than resumed",
+    d.room.agents.codex.linked === false, JSON.stringify(d.room.agents.codex));
+  // The promise is scoped to the CLI run, not the reply: a recovery retry
+  // inside the same reply relaunches under the new settings, so claiming "this
+  // reply keeps its old permissions" would be false exactly when one restarts.
+  ok("the mid-turn save is recorded, scoped to the run rather than the reply",
+    d.entries.some((e) => e.kind === "system" && /^⏳ Saved —/.test(e.text) &&
+      /already in progress keeps the previous permissions/.test(e.text) &&
+      /automatic retry if a session is lost/.test(e.text) &&
+      !/reply continues/.test(e.text)),
+    JSON.stringify(texts(d, "system")));
+  await say("configrace", "@codex ARGJSON");
+  d = await idle("configrace");
+  ok("the next turn runs under the newly saved settings",
+    hasArg(argvFrom(lastAgent(d, "codex")), "--sandbox", "danger-full-access"),
+    lastAgent(d, "codex").text);
 
-  await say("configrace", "@claude SLEEP:1200 ARGJSON");
+  // Only the seats a change actually restarts are fenced.
+  await api("POST", "/api/rooms", { name: "epochscope" });
+  await useFakes("epochscope");
+  await say("epochscope", "@claude SAY:LINKED");
+  await idle("epochscope");
+  await say("epochscope", "@codex SLEEP:1500 SAY:BUSYSEAT");
+  await waitRoom("epochscope", (x) => x.room.busy.includes("codex"), "codex to become busy");
+  await cfg("epochscope", { agents: { codex: { sandbox: "danger-full-access" } } });
+  d = await idle("epochscope", 20000);
+  ok("an unaffected seat keeps its session across another seat's reset",
+    d.room.agents.claude.linked === true && d.room.agents.codex.linked === false,
+    JSON.stringify(d.room.agents));
+
+  // The epoch is stamped per adapter attempt. A resume that fails *after* the
+  // change is retried under the new settings, so what the retry creates is new
+  // and must be kept — fencing the whole turn would throw it away every time.
+  await api("POST", "/api/rooms", { name: "epochretry" });
+  await useFakes("epochretry");
+  await say("epochretry", "@codex SAY:SEEDED");
+  d = await idle("epochretry");
+  ok("the retry room has a session to lose", d.room.agents.codex.linked === true);
+  await say("epochretry", "@codex MISSINGSESSION RESUMEDELAY:1500 ARGJSON");
+  await waitRoom("epochretry", (x) => x.room.busy.includes("codex"), "the resume attempt to start");
+  await cfg("epochretry", { agents: { codex: { sandbox: "workspace-write" } } });
+  d = await idle("epochretry", 20000);
+  const retryArgv = argvFrom(lastAgent(d, "codex"));
+  ok("the relaunched retry actually runs under the newly saved settings",
+    hasArg(retryArgv, "--sandbox", "workspace-write") &&
+    !hasArg(retryArgv, "--sandbox", "read-only"), JSON.stringify(retryArgv));
+  ok("a resume retry that starts after the change keeps the session it creates",
+    d.room.agents.codex.linked === true, JSON.stringify(d.room.agents.codex));
+
+  // Two refusals stay: a project change would put one exchange in two working
+  // directories, and a pair cycle's worker and reviewer must share a regime.
+  await say("configrace", "@claude SLEEP:1500 ARGJSON");
   await waitRoom("configrace", (x) => x.room.busy.includes("claude"), "claude to become busy");
   const busyProject = await cfg("configrace", { projectDir: ROOT });
-  ok("project-folder resets wait for an affected running turn", busyProject.status === 409,
+  ok("project-folder changes still wait for an affected running turn", busyProject.status === 409,
     JSON.stringify(busyProject.data));
   await api("POST", "/api/stop", { room: "configrace", agent: "claude" });
   await idle("configrace");
   d = await room("configrace");
-  ok("rejected reset changes leave the original config intact",
-    d.room.cfg.mode === "talk" && d.room.cfg.projectDir === null &&
-    d.room.cfg.agents.codex.sandbox === "read-only");
+  ok("a refused project change leaves the original config intact",
+    d.room.cfg.projectDir === null && d.room.cfg.agents.codex.sandbox === "danger-full-access");
+
+  // The two halves of one split @both must not straddle a project change. The
+  // guard asks seatOccupied, not busy, so a half that is owed but not yet
+  // started — the tick between a seat's release and its delivery — still counts.
+  await api("POST", "/api/rooms", { name: "splitproject" });
+  await useFakes("splitproject");
+  await say("splitproject", "@codex SLEEP:2500 SAY:PROJBUSY");
+  await waitRoom("splitproject", (x) => x.room.busy.includes("codex"), "codex to start");
+  await say("splitproject", "@both SAY:PROJSPLIT");
+  await waitRoom("splitproject", (x) => x.room.queued > 0, "the held half to be counted");
+  const splitProject = await cfg("splitproject", { projectDir: ROOT });
+  ok("a project change is refused while half of a split @both is still owed",
+    splitProject.status === 409 && /codex/.test(splitProject.data.error),
+    JSON.stringify(splitProject.data));
+  await idle("splitproject", 40000);
+  d = await room("splitproject");
+  ok("both halves of that turn ran in the same workspace", d.room.cfg.projectDir === null);
+  // The guard also counts whole exchanges, not just occupied seats, so a hop
+  // launched in a gap between turns can't land in a different folder. A counter
+  // that failed to unwind would lock project changes out for good.
+  const afterExchange = await cfg("splitproject", { projectDir: ROOT });
+  ok("the exchange guard releases once the chain is done",
+    afterExchange.status === 200 && afterExchange.data.room.cfg.projectDir === ROOT,
+    JSON.stringify(afterExchange.data.error || afterExchange.status));
+  ok("a chain still in flight is reported as working even between its turns",
+    (await room("splitproject")).room.working === false);
+
+  await api("POST", "/api/rooms", { name: "paircfg" });
+  await useFakes("paircfg");
+  await say("paircfg", "/pair start @claude SLEEP:1500 SAY:PAIRCFG");
+  await waitRoom("paircfg", (x) => x.room.working || x.room.busy.length > 0, "the pair cycle to start");
+  const pairCfg = await cfg("paircfg", { agents: { claude: { permissionMode: "plan" } } });
+  ok("an active pair cycle still refuses a session-restarting change",
+    pairCfg.status === 409 && /pair cycle/i.test(pairCfg.data.error), JSON.stringify(pairCfg.data));
+  await idle("paircfg", 40000);
+  d = await room("paircfg");
+  ok("the refused pair change left the config alone",
+    d.room.cfg.agents.claude.permissionMode === "auto");
 
   console.log("\nseats, notes & housekeeping");
   const made = await api("POST", "/api/rooms", { name: "swapped", seats: ["codex", "claude"] });

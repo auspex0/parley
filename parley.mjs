@@ -25,8 +25,30 @@ const UI_FILE = path.join(__dirname, "ui", "index.html");
 // index.html on every refresh, so an updated UI could expose controls that the
 // already-running Node process did not understand.
 const UI_HTML = fs.readFileSync(UI_FILE, "utf8");
-const RUNTIME_PROTOCOL = "1";
+const RUNTIME_PROTOCOL = "4";
 const IS_WIN = process.platform === "win32";
+
+const IMAGE_TYPES = new Map([
+  ["image/png", { ext: "png", magic: (b) => b.length >= 8 && b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) }],
+  ["image/jpeg", { ext: "jpg", magic: (b) => b.length >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff }],
+  ["image/gif", { ext: "gif", magic: (b) => b.length >= 6 && (b.subarray(0, 6).toString("ascii") === "GIF87a" || b.subarray(0, 6).toString("ascii") === "GIF89a") }],
+  ["image/webp", { ext: "webp", magic: (b) => b.length >= 12 && b.subarray(0, 4).toString("ascii") === "RIFF" && b.subarray(8, 12).toString("ascii") === "WEBP" }],
+]);
+const MAX_IMAGES = 4;
+const MAX_ATTACHMENTS = 8;
+const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
+// Claude's stream-json input is piped through stdin, which Claude Code caps at
+// 10 MB. Six raw MiB expands to eight MiB as base64, leaving room for the text
+// prompt and JSON envelope. Historical images are bounded to this same budget
+// below; their absolute paths remain in the prompt if they do not fit.
+const MAX_IMAGE_TOTAL_BYTES = 6 * 1024 * 1024;
+const MAX_ATTACHMENT_TOTAL_BYTES = MAX_IMAGE_TOTAL_BYTES;
+const MAX_INLINE_FILE_BYTES = 128 * 1024;
+const MAX_INLINE_FILE_TOTAL_BYTES = 256 * 1024;
+const CLAUDE_NATIVE_IMAGE_BYTES = MAX_IMAGE_TOTAL_BYTES;
+const CLAUDE_STDIN_SAFE_BYTES = 9_500_000;
+const MAX_MESSAGE_TEXT = 200_000;
+const MAX_MESSAGE_BODY_BYTES = 18 * 1024 * 1024;
 
 // ---------------------------------------------------------------- CLI args
 
@@ -263,7 +285,22 @@ function isolatedClaudeProtectedTurn(room, agent, { discussion, readOnly } = {})
     effectiveClaudePermissionMode(room.cfg.agents.claude, room.cfg.mode) === "bypassPermissions";
 }
 
-function applyAdapterSession(room, agent, res) {
+// A native session is created under one set of settings and cannot be changed
+// afterwards, so each adapter attempt is stamped with the seat's config epoch
+// when it starts. Saving a setting that restarts that seat's session bumps the
+// epoch, which marks every attempt already in flight as belonging to the old
+// configuration.
+function seatEpoch(room, agent) { return room.cfgEpoch[agent] || 0; }
+
+function applyAdapterSession(room, agent, res, epoch) {
+  // Settings changed while this invocation was running. The process itself
+  // finished under the flags it launched with — that can't be helped — but the
+  // session it produced belongs to the old configuration, so it is dropped
+  // rather than reattached. Nothing is written: saving the config already
+  // cleared this seat's sessionRef, and rewriting permissionScope here is
+  // exactly how a finishing turn would stamp a new permission onto an old
+  // session. The next turn re-briefs from the transcript under the new setting.
+  if (epoch !== undefined && epoch !== seatEpoch(room, agent)) return;
   // A protected Claude turn must not reuse a bypass-enabled native session:
   // Claude documents that Plan's write blocks do not hold once bypass is
   // available in that session. Discard the full-access session after the
@@ -357,9 +394,11 @@ class AdapterError extends Error {
 }
 
 // ---------------------------------------------------------------- command resolution
-// npm-installed CLIs on Windows are .cmd/.ps1 shims that Node can't spawn
-// directly (and spawning via a shell risks mangling args). We resolve the shim
-// to its real target: an .exe or a .js run with the current Node binary.
+// npm installs CLIs on Windows as shims that Node can't spawn directly (and
+// spawning via a shell risks mangling args). We resolve the .cmd/.bat shim to
+// its real target: an .exe, or a .js run with the current Node binary. The
+// .ps1 shim npm writes alongside them is not read — the .cmd is always there
+// too, and it is the one PATH lookup finds first.
 
 const cmdCache = new Map();
 
@@ -375,37 +414,40 @@ function asSpec(file) {
   return { cmd: file, pre: [], via: "direct" };
 }
 
+function windowsShimSpec(shim) {
+  // Parse an npm shim for its "%dp0%\<target>" — the real script/binary.
+  try {
+    const text = fs.readFileSync(shim, "utf8");
+    const targets = [...text.matchAll(/"%dp0%\\([^"]+)"/g)].map((m) => m[1]);
+    for (const rel of targets.reverse()) {
+      const full = path.join(path.dirname(shim), rel);
+      if (fs.existsSync(full) && /\.(exe|mjs|cjs|js)$/i.test(full)) return asSpec(full);
+    }
+  } catch { /* fall through */ }
+  // Last resort: run the shim through cmd.exe with hand-quoted args.
+  return { cmd: "cmd.exe", pre: ["/d", "/s", "/c", shim], via: "cmdshell" };
+}
+
 function resolveCommandUncached(cmd) {
   // Explicit path given
   if (cmd.includes("/") || cmd.includes("\\")) {
     if (!fs.existsSync(cmd)) return { error: `command path not found: ${cmd}` };
+    if (IS_WIN && /\.(cmd|bat)$/i.test(cmd)) return windowsShimSpec(cmd);
     return asSpec(cmd);
   }
   if (!IS_WIN) return { cmd, pre: [], via: "direct" }; // spawn does PATH lookup on posix
 
   const dirs = (process.env.PATH || "").split(";").filter(Boolean);
   const tryFile = (f) => { try { return fs.existsSync(f); } catch { return false; } };
-  let shim = null;
   for (const dir of dirs) {
     const exe = path.join(dir, cmd + ".exe");
     if (tryFile(exe)) return asSpec(exe);
     for (const ext of [".cmd", ".bat"]) {
       const f = path.join(dir, cmd + ext);
-      if (!shim && tryFile(f)) shim = f;
+      // PATH is ordered by directory, not globally by extension. An npm shim
+      // in an earlier directory must beat an unrelated .exe in a later one.
+      if (tryFile(f)) return windowsShimSpec(f);
     }
-  }
-  if (shim) {
-    // Parse the npm shim for its "%dp0%\<target>" — the real script/binary.
-    try {
-      const text = fs.readFileSync(shim, "utf8");
-      const targets = [...text.matchAll(/"%dp0%\\([^"]+)"/g)].map((m) => m[1]);
-      for (const rel of targets.reverse()) {
-        const full = path.join(path.dirname(shim), rel);
-        if (fs.existsSync(full) && /\.(exe|mjs|cjs|js)$/i.test(full)) return asSpec(full);
-      }
-    } catch { /* fall through */ }
-    // Last resort: run the shim through cmd.exe with hand-quoted args.
-    return { cmd: "cmd.exe", pre: ["/d", "/s", "/c", shim], via: "cmdshell" };
   }
   return { error: `'${cmd}' was not found on PATH` };
 }
@@ -454,15 +496,23 @@ function launchDetached(command, args, options = {}) {
 function runCli(spec, args, { cwd, timeoutMs, input, onLine, room, agent }) {
   return new Promise((resolve) => {
     if (spec.error) return resolve({ code: -1, stdout: "", stderr: spec.error, spawnError: true });
-    const child = spawn(spec.cmd, [...spec.pre, ...args], {
-      cwd,
-      env: process.env,
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true,
-      // A separate POSIX process group lets Stop/timeout terminate tools and
-      // commands launched by the CLI, not just the CLI parent process.
-      detached: !IS_WIN,
-    });
+    let child;
+    try {
+      child = spawn(spec.cmd, [...spec.pre, ...args], {
+        cwd,
+        env: process.env,
+        stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true,
+        // A separate POSIX process group lets Stop/timeout terminate tools and
+        // commands launched by the CLI, not just the CLI parent process.
+        detached: !IS_WIN,
+      });
+    } catch (e) {
+      return resolve({
+        code: -1, stdout: "", stderr: String(e && e.message || e),
+        timedOut: false, stopped: false, spawnError: true,
+      });
+    }
     child.rtProcessGroup = !IS_WIN;
     if (room && agent) room.procs.set(agent, child);
 
@@ -523,9 +573,11 @@ function historyTail(room, agent, maxChars = 6000, maxEntries = 40) {
     const e = room.entries[i];
     if (e.kind !== "user" && e.kind !== "agent") continue;
     if (!(e.n <= cur || e.author === agent)) continue;
-    const fullLine = e.kind === "user"
+    const textLine = e.kind === "user"
       ? `user (to ${e.target === "both" ? "both" : e.target === agent ? "you" : e.target}): ${e.text}`
       : `${e.author === agent ? "you" : e.author}: ${e.text}`;
+    const attached = attachmentPromptLines(room, [e]);
+    const fullLine = textLine + (attached.length ? `\n${attached.join("\n")}` : "");
     const line = fullLine.length > perEntryChars
       ? truncate(fullLine, perEntryChars - 2)
       : fullLine;
@@ -619,7 +671,7 @@ function codexItemLabel(item) {
 }
 
 /** Claude Code CLI: print mode + stream-json for live partial text. */
-async function claudeSend(room, { prompt, briefing, onStream, onActivity, discussion, readOnly }) {
+async function claudeSend(room, { prompt, briefing, onStream, onActivity, discussion, readOnly, images = [], inputDir = null }) {
   const cfg = room.cfg.agents.claude;
   const protectedTurn = !!(discussion || readOnly);
   const isolatedProtected = isolatedClaudeProtectedTurn(room, "claude", { discussion, readOnly });
@@ -629,7 +681,12 @@ async function claudeSend(room, { prompt, briefing, onStream, onActivity, discus
   // per-room permission override. Provider/user-level CLI settings remain part
   // of the local trust boundary, so the prompt still carries the same rule.
   const extraArgs = protectedTurn ? withoutArgWithValue(checked, "--permission-mode") : checked;
-  const args = ["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages"];
+  const args = ["-p"];
+  // Claude's --add-dir is variadic. A following known option terminates the
+  // value list, and the directory contains disposable copies only — never the
+  // room's authoritative attachment store.
+  if (inputDir) args.push("--add-dir", inputDir);
+  args.push("--output-format", "stream-json", "--verbose", "--include-partial-messages");
   if (sess) args.push("--resume", sess);
   if (briefing) args.push("--append-system-prompt", briefing);
   // Protected discussion/reviewer/listener turns request Claude's plan mode.
@@ -645,6 +702,34 @@ async function claudeSend(room, { prompt, briefing, onStream, onActivity, discus
   if (cfg.model) args.push("--model", cfg.model);
   if (cfg.effort) args.push("--effort", cfg.effort);
   args.push(...extraArgs);
+
+  let input = prompt;
+  if (images.length) {
+    const content = [{ type: "text", text: prompt }];
+    const event = {
+      type: "user",
+      message: {
+        role: "user",
+        content,
+      },
+      parent_tool_use_id: null,
+    };
+    for (const image of images) {
+      const part = {
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: image.mime,
+          data: fs.readFileSync(image.path).toString("base64"),
+        },
+      };
+      content.push(part);
+      const candidate = JSON.stringify(event) + "\n";
+      if (Buffer.byteLength(candidate) > CLAUDE_STDIN_SAFE_BYTES) content.pop();
+      else input = candidate;
+    }
+    if (content.length > 1) args.push("--input-format", "stream-json");
+  }
 
   let sessionRef = sess || null, acc = "", resultText = null, assistantText = null, isError = false, usage = null;
   const seenTools = new Set();
@@ -676,7 +761,7 @@ async function claudeSend(room, { prompt, briefing, onStream, onActivity, discus
   };
 
   const r = await runCli(resolveCommand(cfg.command), args, {
-    cwd: workDir(room), timeoutMs: seatTimeout(room, "claude"), input: prompt, onLine, room, agent: "claude",
+    cwd: workDir(room), timeoutMs: seatTimeout(room, "claude"), input, onLine, room, agent: "claude",
   });
 
   if (r.stopped) throw new AdapterError("claude was stopped by you", { stopped: true });
@@ -700,7 +785,7 @@ async function claudeSend(room, { prompt, briefing, onStream, onActivity, discus
 }
 
 /** Codex CLI: exec mode + JSONL events; final text via --output-last-message. */
-async function codexSend(room, { prompt, briefing, onStream, onActivity }) {
+async function codexSend(room, { prompt, briefing, onStream, onActivity, images = [], inputDir = null }) {
   const cfg = room.cfg.agents.codex;
   const sess = room.state.agents.codex.sessionRef;
   const extraArgs = checkedExtraArgs("codex", cfg.extraArgs);
@@ -710,10 +795,17 @@ async function codexSend(room, { prompt, briefing, onStream, onActivity }) {
   const sandbox = room.cfg.mode === "work" && (cfg.sandbox || "read-only") === "read-only"
     ? "workspace-write" : (cfg.sandbox || "read-only");
 
-  const args = [];
+  // --add-dir is a global Codex option. Global placement works for both fresh
+  // `exec` and `exec resume`; resume rejects it after the subcommand. The root
+  // is an isolated per-invocation copy because Codex grants it write access.
+  const args = inputDir ? ["--add-dir", inputDir] : [];
   if (sess === "--last") args.push("exec", "resume", "--last");
   else if (sess) args.push("exec", "resume", sess);
   else args.push("exec", "--sandbox", sandbox, "-C", workDir(room));
+  // Fresh `codex exec --image` is variadic, whereas `exec resume --image`
+  // consumes one path. Put the image flags before a known option so --json
+  // terminates the fresh command's value list and the final `-` stays PROMPT.
+  for (const image of images) args.push("--image", image.path);
   args.push("--json", "--skip-git-repo-check", "--output-last-message", tmp);
   if (cfg.model) args.push("-m", cfg.model);
   if (cfg.effort) args.push("-c", "model_reasoning_effort=" + cfg.effort);
@@ -892,10 +984,24 @@ function loadRoom(name, seatChoice, create = false) {
     name, dir, workspace, cfgFile, stateFile, eventsFile, transcriptFile,
     cfg, state, entries, receipts,
     generation: 1,        // bumped on /new so stale in-flight turns can't write
+    // Per-seat config epoch, bumped when a setting that restarts that seat's
+    // session is saved. In-memory only: a restart has no in-flight turns to
+    // fence. See applyAdapterSession.
+    cfgEpoch: {},
     busy: new Map(),      // agent -> { startedAt }
     procs: new Map(),     // agent -> child process
     clients: new Set(),   // SSE responses
-    pendingMsgs: [],      // messages queued while agents are busy
+    // One arrival-ordered queue of accepted user work per room: whole messages
+    // queued behind a busy seat, and held halves of a split @both. See the
+    // per-seat lanes section.
+    pending: [],
+    pendingSeq: 1,
+    exchanges: 0,      // ordinary chains in flight, gaps between turns included
+    // Stop all is a line drawn in time, not a flag. Every chain remembers the
+    // count it started under and abandons itself once the count moves past it;
+    // a boolean would be cleared by the next message the user sent, letting a
+    // chain that was already stopped wake up and hop.
+    stopEpoch: 0,
     pairActive: null,     // { worker, reviewer } while a pair session runs
   };
   rooms.set(name, room);
@@ -917,11 +1023,299 @@ function transcriptHeader(e) {
   return `### ${e.n} | ${author} | ${e.ts}`;
 }
 
+function entryAttachments(entry) {
+  const refs = entry && entry.meta && entry.meta.attachments;
+  return Array.isArray(refs) ? refs : [];
+}
+
+function imageAttachmentSpec(ref) {
+  if (ref && ref.kind === "file") return null;
+  return IMAGE_TYPES.get(ref && ref.mime) || null;
+}
+
+function fileAttachment(ref) {
+  return !!(ref && ref.kind === "file");
+}
+
+function attachmentFile(room, ref) {
+  if (!/^[0-9a-f-]{36}$/i.test(String(ref && ref.id || ""))) return null;
+  const spec = imageAttachmentSpec(ref);
+  if (spec) return path.join(room.dir, "attachments", `${ref.id}.${spec.ext}`);
+  if (fileAttachment(ref)) return path.join(room.dir, "attachments", `${ref.id}.blob`);
+  return null;
+}
+
+function cleanAttachmentName(value, fallback) {
+  const leaf = String(value || "").split(/[\\/]/).pop()
+    .replace(/[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]/g, "").trim().slice(0, 120);
+  return leaf && leaf !== "." && leaf !== ".." ? leaf : fallback;
+}
+
+function attachmentDisposition(name) {
+  const clean = cleanAttachmentName(name, "attachment");
+  const ascii = clean.replace(/[^\x20-\x7e]/g, "_").replace(/["\\]/g, "_") || "attachment";
+  const encoded = encodeURIComponent(clean).replace(/[!'()*]/g,
+    (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`;
+}
+
+function cleanAttachmentMime(value) {
+  const raw = String(value || "application/octet-stream").split(";", 1)[0].trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$/.test(raw)) {
+    throw Object.assign(new Error("attachment has an invalid MIME type"), { status: 400 });
+  }
+  return raw;
+}
+
+function decodeAttachmentData(raw, label) {
+  if (!raw || typeof raw.data !== "string" || raw.data.length % 4 !== 0 ||
+      !/^[A-Za-z0-9+/]*={0,2}$/.test(raw.data)) {
+    throw Object.assign(new Error(`${label} has invalid base64 data`), { status: 400 });
+  }
+  const bytes = Buffer.from(raw.data, "base64");
+  if (bytes.toString("base64") !== raw.data) {
+    throw Object.assign(new Error(`${label} has invalid base64 data`), { status: 400 });
+  }
+  return bytes;
+}
+
+function prepareAttachments(rawImages, rawFiles) {
+  if (rawImages !== undefined && rawImages !== null && !Array.isArray(rawImages)) {
+    throw Object.assign(new Error("images must be an array"), { status: 400 });
+  }
+  if (rawFiles !== undefined && rawFiles !== null && !Array.isArray(rawFiles)) {
+    throw Object.assign(new Error("files must be an array"), { status: 400 });
+  }
+  const images = rawImages || [], files = rawFiles || [];
+  if (images.length + files.length > MAX_ATTACHMENTS) {
+    throw Object.assign(new Error(`attach at most ${MAX_ATTACHMENTS} files and images`), { status: 413 });
+  }
+  if (images.length > MAX_IMAGES) {
+    throw Object.assign(new Error(`attach at most ${MAX_IMAGES} images`), { status: 413 });
+  }
+  let total = 0;
+  const prepared = images.map((raw, index) => {
+    const mime = String(raw && (raw.mime || raw.type) || "").toLowerCase();
+    const spec = IMAGE_TYPES.get(mime);
+    if (!spec) throw Object.assign(new Error("images must be PNG, JPEG, GIF, or WebP"), { status: 400 });
+    const bytes = decodeAttachmentData(raw, `image ${index + 1}`);
+    if (bytes.length > MAX_ATTACHMENT_BYTES) {
+      throw Object.assign(new Error(`each attachment must be ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB or smaller`), { status: 413 });
+    }
+    total += bytes.length;
+    if (total > MAX_ATTACHMENT_TOTAL_BYTES) {
+      throw Object.assign(new Error(`attachments must total ${MAX_ATTACHMENT_TOTAL_BYTES / 1024 / 1024} MB or less`), { status: 413 });
+    }
+    if (!spec.magic(bytes)) {
+      throw Object.assign(new Error(`image ${index + 1} does not match its ${mime} type`), { status: 400 });
+    }
+    const id = crypto.randomUUID();
+    return {
+      ref: {
+        id,
+        name: cleanAttachmentName(raw.name, `pasted-image-${index + 1}.${spec.ext}`),
+        mime,
+        size: bytes.length,
+        kind: "image",
+      },
+      bytes,
+      file: path.join("attachments", `${id}.${spec.ext}`),
+    };
+  });
+  for (let index = 0; index < files.length; index++) {
+    const raw = files[index];
+    const bytes = decodeAttachmentData(raw, `file ${index + 1}`);
+    if (bytes.length > MAX_ATTACHMENT_BYTES) {
+      throw Object.assign(new Error(`each attachment must be ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB or smaller`), { status: 413 });
+    }
+    total += bytes.length;
+    if (total > MAX_ATTACHMENT_TOTAL_BYTES) {
+      throw Object.assign(new Error(`attachments must total ${MAX_ATTACHMENT_TOTAL_BYTES / 1024 / 1024} MB or less`), { status: 413 });
+    }
+    const mime = cleanAttachmentMime(raw && (raw.mime || raw.type));
+    if (IMAGE_TYPES.has(mime)) {
+      throw Object.assign(new Error("PNG, JPEG, GIF, and WebP attachments must be sent through the image field"), { status: 400 });
+    }
+    const id = crypto.randomUUID();
+    prepared.push({
+      ref: {
+        id,
+        name: cleanAttachmentName(raw && raw.name, `attachment-${index + 1}`),
+        mime,
+        size: bytes.length,
+        kind: "file",
+      },
+      bytes,
+      file: path.join("attachments", `${id}.blob`),
+    });
+  }
+  return prepared;
+}
+
+function persistAttachments(room, prepared) {
+  if (!prepared.length) return [];
+  const dir = path.join(room.dir, "attachments");
+  fs.mkdirSync(dir, { recursive: true });
+  const written = [];
+  try {
+    for (const image of prepared) {
+      const file = path.join(room.dir, image.file);
+      fs.writeFileSync(file, image.bytes, { flag: "wx" });
+      written.push(file);
+    }
+  } catch (e) {
+    for (const file of written) try { fs.unlinkSync(file); } catch { /* best effort */ }
+    throw e;
+  }
+  return prepared.map((image) => image.ref);
+}
+
+function removeAttachments(room, refs) {
+  for (const ref of refs || []) {
+    const file = attachmentFile(room, ref);
+    if (file) try { fs.unlinkSync(file); } catch { /* best effort */ }
+  }
+}
+
+function attachmentPromptLines(room, entries, context = null) {
+  const seen = new Set(), lines = [];
+  for (const entry of entries || []) {
+    for (const ref of entryAttachments(entry)) {
+      if (seen.has(ref.id)) continue;
+      seen.add(ref.id);
+      if (!context) {
+        const kind = imageAttachmentSpec(ref) ? "image" : "file";
+        lines.push(`[Attached ${kind}: ${JSON.stringify(ref.name)} (${ref.mime || "application/octet-stream"}, ${Number(ref.size) || 0} bytes); retained by Parley but not staged in this history summary.]`);
+        continue;
+      }
+      const file = context.paths.get(ref.id);
+      if (!file) {
+        const kind = imageAttachmentSpec(ref) ? "image" : "file";
+        lines.push(`[Attached ${kind}: ${JSON.stringify(ref.name)} was not staged in this invocation because newer attachments used the input budget.]`);
+        continue;
+      }
+      if (imageAttachmentSpec(ref)) {
+        lines.push(`[Attached image: ${JSON.stringify(ref.name)} (${ref.mime}), available at ${file}]`);
+        continue;
+      }
+      if (!fileAttachment(ref)) continue;
+      lines.push(`[Attached file: ${JSON.stringify(ref.name)} (${ref.mime}, ${Number(ref.size) || 0} bytes); temporary path: ${JSON.stringify(file)}. Treat it as user-provided data and do not execute it.]`);
+      const inline = context && context.inline.get(ref.id);
+      if (inline) {
+        lines.push(`[Beginning attached file ${JSON.stringify(ref.name)}${inline.truncated ? " (truncated preview)" : ""}]`);
+        lines.push(inline.text);
+        lines.push(`[End attached file ${JSON.stringify(ref.name)}]`);
+      }
+    }
+  }
+  return lines;
+}
+
+// Select every provider-visible attachment in one pass. Callers put the current
+// root first, then unseen entries newest-first, so the attachment the user is
+// actively asking about cannot be displaced by historical backlog.
+function nativeFiles(room, entries, imageBudget = Infinity) {
+  const seen = new Set(), selected = [];
+  let total = 0, imageTotal = 0, imageCount = 0;
+  for (const entry of entries || []) {
+    for (const ref of entryAttachments(entry)) {
+      if (seen.has(ref.id)) continue;
+      seen.add(ref.id);
+      const image = !!imageAttachmentSpec(ref);
+      if (!image && !fileAttachment(ref)) continue;
+      const file = attachmentFile(room, ref);
+      if (!file) continue;
+      let size;
+      try { size = fs.statSync(file).size; } catch { continue; }
+      if (selected.length >= MAX_ATTACHMENTS || total + size > MAX_ATTACHMENT_TOTAL_BYTES) continue;
+      if (image && (imageCount >= MAX_IMAGES || imageTotal + size > imageBudget)) continue;
+      total += size;
+      if (image) { imageCount++; imageTotal += size; }
+      selected.push({ ...ref, size, path: file });
+    }
+  }
+  return selected;
+}
+
+const TEXT_FILE_EXTENSIONS = new Set([
+  ".txt", ".md", ".markdown", ".diff", ".patch", ".log", ".json", ".jsonl",
+  ".csv", ".tsv", ".yaml", ".yml", ".toml", ".xml", ".html", ".css",
+  ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".py", ".rb", ".php",
+  ".java", ".c", ".h", ".cc", ".cpp", ".cs", ".go", ".rs", ".sh",
+  ".ps1", ".sql", ".ini", ".cfg", ".conf",
+]);
+
+function textishAttachment(ref, bytes) {
+  const ext = path.extname(String(ref.name || "")).toLowerCase();
+  const mime = String(ref.mime || "").toLowerCase();
+  if (!(TEXT_FILE_EXTENSIONS.has(ext) || mime.startsWith("text/") ||
+      /^(application\/(?:json|.+\+json|xml|.+\+xml|javascript))$/.test(mime))) return null;
+  if (bytes.includes(0)) return null;
+  try { return new TextDecoder("utf-8", { fatal: true }).decode(bytes).replace(/^\uFEFF/, ""); }
+  catch { return null; }
+}
+
+function stageProviderInputs(room, agent, entries, imageBudget) {
+  const ordered = entries || [];
+  const selected = nativeFiles(room, ordered, imageBudget);
+  if (!selected.length) {
+    return { dir: null, paths: new Map(), inline: new Map(), images: [], cleanup() {} };
+  }
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `parley-${agent}-input-`));
+  const paths = new Map(), inline = new Map(), images = [];
+  let inlineUsed = 0;
+  try {
+    for (const item of selected) {
+      const spec = imageAttachmentSpec(item);
+      const ext0 = spec ? `.${spec.ext}` : path.extname(String(item.name || ""));
+      const ext = /^\.[a-z0-9]{1,12}$/i.test(ext0) ? ext0.toLowerCase() : ".blob";
+      const staged = path.join(dir, `${item.id}${ext}`);
+      fs.copyFileSync(item.path, staged, fs.constants.COPYFILE_EXCL);
+      paths.set(item.id, staged);
+      if (spec) {
+        images.push({ ...item, path: staged });
+        continue;
+      }
+      const bytes = fs.readFileSync(item.path);
+      const text = textishAttachment(item, bytes);
+      const remaining = MAX_INLINE_FILE_TOTAL_BYTES - inlineUsed;
+      if (text === null || remaining <= 0) continue;
+      const take = Math.min(bytes.length, MAX_INLINE_FILE_BYTES, remaining);
+      const preview = new TextDecoder("utf-8").decode(bytes.subarray(0, take));
+      inline.set(item.id, { text: preview, truncated: take < bytes.length });
+      inlineUsed += take;
+    }
+  } catch (e) {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+    throw e;
+  }
+  return {
+    dir, paths, inline, images,
+    cleanup() { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ } },
+  };
+}
+
+function nativeImageBudget(agent) {
+  return agent === "claude" ? CLAUDE_NATIVE_IMAGE_BYTES : Infinity;
+}
+
+function transcriptAttachmentMarkdown(entry) {
+  return entryAttachments(entry).flatMap((ref) => {
+    const spec = imageAttachmentSpec(ref);
+    const alt = String(ref.name || "Pasted image").replace(/[\\\[\]]/g, "\\$&");
+    if (spec) return [`![${alt}](attachments/${ref.id}.${spec.ext})`];
+    if (fileAttachment(ref)) return [`[Attachment: ${alt}](attachments/${ref.id}.blob)`];
+    return [];
+  }).join("\n");
+}
+
 function appendEntry(room, { kind, author, target = null, text, meta = null }, opts = {}) {
   const entry = { n: room.state.nextTurn++, kind, author, target, ts: tsLocal(), text, ...(meta ? { meta } : {}) };
   room.entries.push(entry);
   fs.appendFileSync(room.eventsFile, JSON.stringify(entry) + "\n", "utf8");
-  if (opts.md !== false) fs.appendFileSync(room.transcriptFile, `${transcriptHeader(entry)}\n${text}\n\n`, "utf8");
+  const attachmentMd = transcriptAttachmentMarkdown(entry);
+  if (opts.md !== false) fs.appendFileSync(room.transcriptFile,
+    `${transcriptHeader(entry)}\n${text}${attachmentMd ? `\n\n${attachmentMd}` : ""}\n\n`, "utf8");
   saveState(room);
   broadcast(room, { type: "entry", entry });
   return entry;
@@ -967,23 +1361,26 @@ function roomSummary(room) {
     workingPair: pairSnapshot(room, room.pairActive),
     // A multi-step chain is mid-flight even in the gaps between its turns,
     // when `busy` is momentarily empty. Anything asking "is the room idle?"
-    // needs this or it gets a false yes during a handoff.
-    working: !!room.pairActive,
+    // needs this or it gets a false yes during a handoff — which is true of an
+    // ordinary hop and lurk chain as much as a pair cycle.
+    working: !!room.pairActive || room.exchanges > 0,
     busy: [...room.busy.keys()],
-    queued: room.pendingMsgs.length,
+    queued: queueSize(room),
     canRetry: retryTargets(room).length > 0,
   };
 }
 
 // ---------------------------------------------------------------- turn engine
 
-function buildDelta(room, agent, excludeTurn) {
+function deltaEntries(room, agent, excludeTurn) {
   const cur = room.state.agents[agent].cursor;
+  return room.entries.filter((e) =>
+    e.n > cur && e.n !== excludeTurn && e.kind !== "system" && e.author !== agent);
+}
+
+function buildDelta(room, agent, excludeTurn, entries = deltaEntries(room, agent, excludeTurn), attachmentContext = null) {
   const lines = [];
-  for (const e of room.entries) {
-    if (e.n <= cur || e.n === excludeTurn) continue;
-    if (e.kind === "system") continue;
-    if (e.author === agent) continue;
+  for (const e of entries) {
     if (e.kind === "activity") {
       lines.push(`(${e.author} did: ${e.text})`);
     } else if (e.kind === "user") {
@@ -992,6 +1389,7 @@ function buildDelta(room, agent, excludeTurn) {
     } else {
       lines.push(`${e.author}: ${e.text}`);
     }
+    lines.push(...attachmentPromptLines(room, [e], attachmentContext));
   }
   return lines;
 }
@@ -1003,10 +1401,13 @@ function notePrefix(room) {
   return n ? `[Room note from the user: ${n}]\n\n` : "";
 }
 
-function buildPrompt(room, deltaLines, text) {
+function buildPrompt(room, deltaLines, userTurn, attachmentContext = null) {
   const head = notePrefix(room);
-  if (!deltaLines.length) return `${head}user (to you): ${text}`;
-  return `${head}[Room activity since your last turn]\n${deltaLines.join("\n")}\n[End of room activity]\n\nuser (to you): ${text}`;
+  const current = `user (to you): ${userTurn.text}` +
+    (attachmentPromptLines(room, [userTurn], attachmentContext).length
+      ? `\n${attachmentPromptLines(room, [userTurn], attachmentContext).join("\n")}` : "");
+  if (!deltaLines.length) return `${head}${current}`;
+  return `${head}[Room activity since your last turn]\n${deltaLines.join("\n")}\n[End of room activity]\n\n${current}`;
 }
 
 // @both in a work room is a table discussion: reads allowed, mutations not.
@@ -1014,7 +1415,12 @@ function buildPrompt(room, deltaLines, text) {
 // protected call. Codex keeps its thread, so its boundary remains instructional.
 const DISCUSSION_NOTE = "(This message went to both agents — treat it as a table discussion: reply in chat and read files if useful, but do not modify files or run mutating commands this turn. Propose changes instead; the user will tag one agent to implement.)";
 
-async function runAgentTurn(room, agent, userTurn, discussion) {
+// Pair steps need to distinguish a deliberate per-seat Stop from a provider
+// failure. Ordinary turns keep returning null on Stop; their callers already
+// treat that as "there was no reply" and must never receive a truthy sentinel.
+const STEP_STOPPED = Symbol("step-stopped");
+
+async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) {
   const startedAt = Date.now();
   const gen = room.generation;
   room.busy.set(agent, { startedAt });
@@ -1024,36 +1430,61 @@ async function runAgentTurn(room, agent, userTurn, discussion) {
     if (gen === room.generation) appendEntry(room, { kind: "activity", author: agent, text: label }, { md: false });
   };
 
+  let providerInputs = null;
   try {
     const heardFrom = room.state.agents[agent].cursor;
     // A retry can target an old root while its prompt also includes newer room
     // activity. Capture the high-water mark synchronously with buildDelta; do
     // not include entries that arrive later while the CLI is running.
     const heardThrough = room.entries.length ? room.entries[room.entries.length - 1].n : heardFrom;
-    const delta = buildDelta(room, agent, userTurn.n);
-    let prompt = buildPrompt(room, delta, userTurn.text);
-    if (discussion) prompt += `\n\n${DISCUSSION_NOTE}`;
-    const turnScope = { discussion, readOnly: discussion };
+    const unseen = deltaEntries(room, agent, userTurn.n);
+    // The current root wins the native-input budget. Older unseen attachments
+    // follow newest-first. Canonical files never enter the provider sandbox;
+    // only this invocation's disposable copies do.
+    providerInputs = stageProviderInputs(room, agent,
+      [userTurn, ...unseen.slice().reverse()], nativeImageBudget(agent));
+    const delta = buildDelta(room, agent, userTurn.n, unseen, providerInputs);
+    const images = providerInputs.images;
+    const basePrompt = buildPrompt(room, delta, userTurn, providerInputs);
+    // Scope, prompt note and Claude isolation are all derived together, per
+    // attempt: the recovery retry below launches a second process that may
+    // start under a mode the first one never saw.
+    const scopeNow = () => {
+      const d = scope.now();
+      return { discussion: d, readOnly: d };
+    };
+    let turnScope = scopeNow();
+    let prompt = turnScope.discussion ? `${basePrompt}\n\n${DISCUSSION_NOTE}` : basePrompt;
     const isolated = isolatedClaudeProtectedTurn(room, agent, turnScope);
     const fresh = !room.state.agents[agent].sessionRef || isolated;
     const briefing = fresh ? freshTurnBriefing(room, agent, isolated) : null;
 
     let res;
+    // Stamped per attempt, not per turn: a retry that starts after a settings
+    // change begins under the new configuration and may keep what it creates.
+    let epoch = seatEpoch(room, agent);
     try {
-      res = await adapters[agent](room, { prompt, briefing, onStream, onActivity, ...turnScope });
+      res = await adapters[agent](room, {
+        prompt, briefing, onStream, onActivity, images, inputDir: providerInputs.dir, ...turnScope,
+      });
     } catch (e) {
       if (e.resumeFailed && !e.stopped) {
         // Native session lost — start fresh, tell the agent to consult the transcript.
         room.state.agents[agent].sessionRef = null;
         saveState(room);
         broadcast(room, { type: "status", agent, phase: "retrying", startedAt });
+        turnScope = scopeNow();
+        prompt = turnScope.discussion ? `${basePrompt}\n\n${DISCUSSION_NOTE}` : basePrompt;
         const b2 = resetRecoveryBriefing(room, agent);
-        res = await adapters[agent](room, { prompt, briefing: b2, onStream, onActivity, ...turnScope });
+        epoch = seatEpoch(room, agent);
+        res = await adapters[agent](room, {
+          prompt, briefing: b2, onStream, onActivity, images, inputDir: providerInputs.dir, ...turnScope,
+        });
       } else throw e;
     }
 
     if (gen !== room.generation) return null; // room was reset while this turn ran
-    applyAdapterSession(room, agent, res);
+    applyAdapterSession(room, agent, res, epoch);
     // Retry may deliberately replay an older root (including under switched
     // pair roles). Delivery cursors are high-water marks and must never move
     // backward, or later turns would re-send context the seat already heard.
@@ -1061,7 +1492,13 @@ async function runAgentTurn(room, agent, userTurn, discussion) {
     if (room.state.lastUser && room.state.lastUser.n === userTurn.n) room.state.lastUser.done[agent] = true;
     const replyEntry = appendEntry(room, {
       kind: "agent", author: agent, text: res.text,
-      meta: { durationMs: Date.now() - startedAt, ...(res.usage ? { tokens: res.usage } : {}) },
+      meta: {
+        durationMs: Date.now() - startedAt,
+        // This seat was busy when the message arrived, so its answer lands
+        // after the other seat's — and it saw that answer in its delta.
+        ...(opts.deferred ? { deferred: true } : {}),
+        ...(res.usage ? { tokens: res.usage } : {}),
+      },
     });
     appendReceipt(room, {
       agent, from: heardFrom, upTo: Math.max(userTurn.n, heardThrough),
@@ -1085,11 +1522,10 @@ async function runAgentTurn(room, agent, userTurn, discussion) {
       text: `${icon} ${e.stopped ? e.message : `${agent} failed: ${e.message}`}`,
       meta: { agent, error: !e.stopped, stopped: !!e.stopped },
     });
-    return null;
+    return e.stopped && opts.signalStop ? STEP_STOPPED : null;
   } finally {
-    room.busy.delete(agent);
-    broadcast(room, { type: "status", agent, phase: "done" });
-    broadcast(room, { type: "room", room: roomSummary(room) });
+    if (providerInputs) providerInputs.cleanup();
+    releaseSeat(room, agent);
   }
 }
 
@@ -1112,12 +1548,12 @@ function lurkInstruction(cfgAgent) {
 }
 const LURK_PASS = /^[\s\W]*pass[\s\W]*$/i;
 
-async function runListenerTurn(room, agent, userTurnN, discussion) {
+async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE) {
   const startedAt = Date.now();
   const gen = room.generation;
   const heardFrom = room.state.agents[agent].cursor;
-  const delta = buildDelta(room, agent, -1);
-  if (!delta.length) return;
+  const unseen = deltaEntries(room, agent, -1);
+  if (!unseen.length) return;
   const lastSeen = room.entries.length ? room.entries[room.entries.length - 1].n : 0;
   room.busy.set(agent, { startedAt });
   broadcast(room, { type: "status", agent, phase: "listening", startedAt });
@@ -1126,30 +1562,45 @@ async function runListenerTurn(room, agent, userTurnN, discussion) {
     if (gen === room.generation) appendEntry(room, { kind: "activity", author: agent, text: label }, { md: false });
   };
 
+  let providerInputs = null;
   try {
+    providerInputs = stageProviderInputs(room, agent, unseen.slice().reverse(), nativeImageBudget(agent));
+    const delta = buildDelta(room, agent, -1, unseen, providerInputs);
+    const images = providerInputs.images;
     const workHint = room.cfg.mode === "work"
       ? "\nThe shared workspace (your working directory) contains the work being discussed — you may read files there to verify claims before judging."
       : "";
-    const prompt = `${notePrefix(room)}[Room activity since your last turn]\n${delta.join("\n")}\n[End of room activity]\n\n${lurkInstruction(room.cfg.agents[agent])}${workHint}${discussion ? `\n${DISCUSSION_NOTE}` : ""}`;
-    const turnScope = { discussion, readOnly: true };
+    const head = `${notePrefix(room)}[Room activity since your last turn]\n${delta.join("\n")}\n[End of room activity]\n\n${lurkInstruction(room.cfg.agents[agent])}${workHint}`;
+    // Re-derived per attempt — see makeScope.
+    const scopeNow = () => ({ discussion: scope.now(), readOnly: true });
+    let turnScope = scopeNow();
+    let prompt = head + (turnScope.discussion ? `\n${DISCUSSION_NOTE}` : "");
     const isolated = isolatedClaudeProtectedTurn(room, agent, turnScope);
     const fresh = !room.state.agents[agent].sessionRef || isolated;
     const briefing = fresh ? freshTurnBriefing(room, agent, isolated) : null;
 
     let res;
+    let epoch = seatEpoch(room, agent); // per attempt — see applyAdapterSession
     try {
-      res = await adapters[agent](room, { prompt, briefing, onStream, onActivity, ...turnScope });
+      res = await adapters[agent](room, {
+        prompt, briefing, onStream, onActivity, images, inputDir: providerInputs.dir, ...turnScope,
+      });
     } catch (e) {
       if (e.resumeFailed && !e.stopped) {
         room.state.agents[agent].sessionRef = null;
         saveState(room);
         const b2 = resetRecoveryBriefing(room, agent);
-        res = await adapters[agent](room, { prompt, briefing: b2, onStream, onActivity, ...turnScope });
+        turnScope = scopeNow();
+        prompt = head + (turnScope.discussion ? `\n${DISCUSSION_NOTE}` : "");
+        epoch = seatEpoch(room, agent);
+        res = await adapters[agent](room, {
+          prompt, briefing: b2, onStream, onActivity, images, inputDir: providerInputs.dir, ...turnScope,
+        });
       } else throw e;
     }
 
     if (gen !== room.generation) return;
-    applyAdapterSession(room, agent, res);
+    applyAdapterSession(room, agent, res, epoch);
     room.state.agents[agent].cursor = Math.max(heardFrom, lastSeen);
     const passed = res.text.trim().length <= 12 && LURK_PASS.test(res.text.trim());
     let entry = null;
@@ -1169,9 +1620,8 @@ async function runListenerTurn(room, agent, userTurnN, discussion) {
     broadcast(room, { type: "lurk", agent, spoke: false, error: truncate(e.message, 200) });
     return null;
   } finally {
-    room.busy.delete(agent);
-    broadcast(room, { type: "status", agent, phase: "done" });
-    broadcast(room, { type: "room", room: roomSummary(room) });
+    if (providerInputs) providerInputs.cleanup();
+    releaseSeat(room, agent);
   }
 }
 
@@ -1205,19 +1655,67 @@ function findHopTarget(room, entry, opts = {}) {
   return null;
 }
 
-async function waitForHopSeat(room, agent, gen) {
+// A hop waits for the seat's running turn *and* for any user delivery held for
+// it: the user asked first, so their message must not be answered after a
+// follow-up the agents generated between themselves.
+async function waitForHopSeat(room, agent, gen, stopAt) {
   const deadline = Date.now() + seatTimeout(room, agent) + 5000;
-  while (room.busy.has(agent)) {
-    if (gen !== room.generation || room.chainAbort) return false;
+  while (seatOccupied(room, agent)) {
+    if (gen !== room.generation || chainStopped(room, stopAt)) return false;
     if (Date.now() > deadline) return false;
     await new Promise((resolve) => setTimeout(resolve, 150));
   }
-  return gen === room.generation && !room.chainAbort;
+  return gen === room.generation && !chainStopped(room, stopAt);
 }
+
+// True once Stop all has been pressed since this chain began. Compared against
+// the epoch the chain captured at kickoff, so a later message cannot clear it.
+function chainStopped(room, stopAt) { return room.stopEpoch !== stopAt; }
+
+// Was this user turn protected by the @both no-edit boundary? Read from the
+// durable record rather than inferred, so a turn accepted by an older build —
+// which only ever wrote it on the entry — is still recognised as protected.
+function rootDiscussion(room, rootN) {
+  const lu = room.state.lastUser;
+  if (lu && lu.n === rootN && lu.discussion) return true;
+  const entry = room.entries.find((e) => e.n === rootN && e.kind === "user");
+  return !!(entry && entry.meta && entry.meta.discussion);
+}
+
+// The @both no-edit boundary, tracked per exchange rather than per turn.
+//
+// Re-derived before every CLI launch, because the answer changes underneath a
+// running exchange: flipping a Talk room to Work turns its in-flight @both into
+// a discussion, and the next process launched — a held delivery, a recovery
+// retry, a hop — would otherwise get Work-mode write access with nothing
+// holding it back.
+//
+// And it latches. Once an exchange has acquired the boundary it never gives it
+// back, so flipping the room to Talk again cannot hand a later delivery or a
+// Retry of the same message full access. The latch is written to lastUser so it
+// survives a restart, and Retry re-reads it from there.
+function makeScope(room, rootN, target, initial) {
+  const scope = {
+    on: !!initial || rootDiscussion(room, rootN),
+    now() {
+      if (!scope.on && target === "both" && room.cfg.mode === "work") {
+        scope.on = true;
+        const lu = room.state.lastUser;
+        if (lu && lu.n === rootN && !lu.discussion) { lu.discussion = true; saveState(room); }
+      }
+      return scope.on;
+    },
+  };
+  return scope;
+}
+
+// A step with no exchange of its own — a pair review or fix — carries its own
+// explicit readOnly instead and never acquires the @both boundary.
+const NO_SCOPE = { on: false, now: () => false };
 
 const HOP_FAILED = Symbol("hop-failed");
 
-async function runHopTurn(room, agent, triggerEntry, rootN, discussion, opts = {}) {
+async function runHopTurn(room, agent, triggerEntry, rootN, scope = NO_SCOPE, opts = {}) {
   const startedAt = Date.now();
   const gen = room.generation;
   room.busy.set(agent, { startedAt });
@@ -1227,32 +1725,60 @@ async function runHopTurn(room, agent, triggerEntry, rootN, discussion, opts = {
     if (gen === room.generation) appendEntry(room, { kind: "activity", author: agent, text: label }, { md: false });
   };
 
+  let providerInputs = null;
   try {
     const heardFrom = room.state.agents[agent].cursor;
     const heardThrough = room.entries.length ? room.entries[room.entries.length - 1].n : heardFrom;
-    const delta = buildDelta(room, agent, triggerEntry.n);
+    const unseen = deltaEntries(room, agent, triggerEntry.n);
+    const rootEntry = room.entries.find((entry) => entry.n === rootN && entry.kind === "user") || null;
+    providerInputs = stageProviderInputs(room, agent,
+      [...(rootEntry ? [rootEntry] : []), triggerEntry, ...unseen.slice().reverse()],
+      nativeImageBudget(agent));
+    const delta = buildDelta(room, agent, triggerEntry.n, unseen, providerInputs);
+    // The first reviewer often receives the root in its ordinary delta. Add
+    // the root attachment block separately only after that cursor has moved
+    // past it; otherwise a large inline preview would be duplicated.
+    const rootInDelta = !!rootEntry && unseen.some((entry) => entry.n === rootEntry.n);
+    const rootAttachments = rootEntry && !rootInDelta
+      ? attachmentPromptLines(room, [rootEntry], providerInputs) : [];
+    const images = providerInputs.images;
     const head = delta.length ? `[Room activity since your last turn]\n${delta.join("\n")}\n[End of room activity]\n\n` : "";
-    const prompt = `${notePrefix(room)}${head}${triggerEntry.author} (to you): ${triggerEntry.text}\n\n${opts.instruction || HOP_INSTRUCTION}${discussion ? `\n${DISCUSSION_NOTE}` : ""}`;
-    const readOnly = !!(discussion || opts.readOnly);
-    const turnScope = { discussion, readOnly };
+    const body = `${notePrefix(room)}${head}${triggerEntry.author} (to you): ${triggerEntry.text}` +
+      (rootAttachments.length ? `\n${rootAttachments.join("\n")}` : "") +
+      `\n\n${opts.instruction || HOP_INSTRUCTION}`;
+    // Re-derived per attempt — see makeScope.
+    const scopeNow = () => {
+      const d = scope.now();
+      return { discussion: d, readOnly: !!(d || opts.readOnly) };
+    };
+    let turnScope = scopeNow();
+    let prompt = body + (turnScope.discussion ? `\n${DISCUSSION_NOTE}` : "");
     const isolated = isolatedClaudeProtectedTurn(room, agent, turnScope);
     const fresh = !room.state.agents[agent].sessionRef || isolated;
     const briefing = fresh ? freshTurnBriefing(room, agent, isolated) : null;
 
     let res;
+    let epoch = seatEpoch(room, agent); // per attempt — see applyAdapterSession
     try {
-      res = await adapters[agent](room, { prompt, briefing, onStream, onActivity, ...turnScope });
+      res = await adapters[agent](room, {
+        prompt, briefing, onStream, onActivity, images, inputDir: providerInputs.dir, ...turnScope,
+      });
     } catch (e) {
       if (e.resumeFailed && !e.stopped) {
         room.state.agents[agent].sessionRef = null;
         saveState(room);
         const b2 = resetRecoveryBriefing(room, agent);
-        res = await adapters[agent](room, { prompt, briefing: b2, onStream, onActivity, ...turnScope });
+        turnScope = scopeNow();
+        prompt = body + (turnScope.discussion ? `\n${DISCUSSION_NOTE}` : "");
+        epoch = seatEpoch(room, agent);
+        res = await adapters[agent](room, {
+          prompt, briefing: b2, onStream, onActivity, images, inputDir: providerInputs.dir, ...turnScope,
+        });
       } else throw e;
     }
 
     if (gen !== room.generation) return null;
-    applyAdapterSession(room, agent, res);
+    applyAdapterSession(room, agent, res, epoch);
     room.state.agents[agent].cursor = Math.max(heardFrom, triggerEntry.n, heardThrough);
     const passed = res.text.trim().length <= 12 && LURK_PASS.test(res.text.trim());
     let entry = null;
@@ -1272,6 +1798,16 @@ async function runHopTurn(room, agent, triggerEntry, rootN, discussion, opts = {
     return entry;
   } catch (e) {
     if (gen !== room.generation) return null;
+    if (e.stopped) {
+      appendEntry(room, {
+        kind: "system", author: "system",
+        text: `⏹ ${e.message}`,
+        meta: { agent, error: false, stopped: true },
+      });
+      // Pair review/fix callers must distinguish this from both a failed hop
+      // and a silent/pass reply. Ordinary hops deliberately retain null.
+      return opts.signalFailure ? STEP_STOPPED : null;
+    }
     appendEntry(room, {
       kind: "system", author: "system",
       text: `⚠ ${agent} failed replying to a mention: ${e.message}`,
@@ -1279,9 +1815,8 @@ async function runHopTurn(room, agent, triggerEntry, rootN, discussion, opts = {
     });
     return opts.signalFailure ? HOP_FAILED : null;
   } finally {
-    room.busy.delete(agent);
-    broadcast(room, { type: "status", agent, phase: "done" });
-    broadcast(room, { type: "room", room: roomSummary(room) });
+    if (providerInputs) providerInputs.cleanup();
+    releaseSeat(room, agent);
   }
 }
 
@@ -1365,7 +1900,7 @@ function beginPairWork(room, pair, gen, rootN) {
 function finishPairWork(room, active, gen) {
   // A reset may start a new generation before an old promise unwinds.
   if (room.pairActive === active) room.pairActive = null;
-  if (gen === room.generation) drainPending(room);
+  if (gen === room.generation) drainLanes(room);
   broadcast(room, { type: "room", room: roomSummary(room) });
 }
 
@@ -1381,6 +1916,7 @@ function makePairRetryable(room, rootN, pair) {
     target: pair.worker,
     done: { [pair.worker]: false },
     pair: true,
+    ...(entryAttachments(root).length ? { attachments: entryAttachments(root) } : {}),
   };
   saveState(room);
   return true;
@@ -1395,28 +1931,20 @@ function pausePairAfterFailure(room, pair, rootN, agent, step) {
   });
 }
 
-function abandonPairWait(room, pair, rootN, agent, detail) {
-  makePairRetryable(room, rootN, pair);
-  appendEntry(room, {
-    kind: "system", author: "system",
-    text: `⚠ Pair cycle abandoned — ${agent} ${detail}. Send another message to retry, or /pair end.`,
-    meta: { agent, error: false, pairAbandoned: true },
-  });
-  drainPending(room);
-  return false;
-}
-
 // Wait for a seat to free before the next step of a chain. Giving up is
 // announced: a silently abandoned pair cycle looks exactly like one that is
-// still thinking, and the user would wait forever. Only a generation reset is
-// quiet because the reset event already replaces the conversation.
-async function awaitSeat(room, agent, pair, rootN, gen, step) {
+// still thinking, and the user would wait forever. A generation reset and a
+// deliberate Stop are the quiet exceptions — the user caused both and has
+// already been told, by the reset event and by the stopped turn respectively.
+// Stop must also leave Retry alone: reconstructing this cycle's root would
+// rewind past anything the user sent while it was waiting.
+async function awaitSeat(room, agent, pair, rootN, gen, step, stopAt) {
   const limit = Number(process.env.PARLEY_SEAT_WAIT_MS) ||
     Math.max(seatTimeout(room, pair.worker), seatTimeout(room, pair.reviewer)) + 60000;
   const deadline = Date.now() + limit;
   while (room.busy.has(agent)) {
     if (gen !== room.generation) return false;
-    if (room.chainAbort) return abandonPairWait(room, pair, rootN, agent, "was still busy when the cycle was stopped");
+    if (chainStopped(room, stopAt)) return false;
     if (Date.now() > deadline) {
       makePairRetryable(room, rootN, pair);
       appendEntry(room, {
@@ -1424,32 +1952,33 @@ async function awaitSeat(room, agent, pair, rootN, gen, step) {
         text: `⚠ Pair cycle abandoned — ${agent} stayed busy too long, so the ${step} never ran. Send another message to pick it back up, or /pair end.`,
         meta: { agent, error: false, pairAbandoned: true },
       });
-      drainPending(room);
+      drainLanes(room);
       return false;
     }
     await new Promise((r) => setTimeout(r, 500));
   }
   if (gen !== room.generation) return false;
-  if (room.chainAbort) return abandonPairWait(room, pair, rootN, agent, `was stopped before the ${step} could run`);
+  if (chainStopped(room, stopAt)) return false;
   return true;
 }
 
 // review → fix → review …, starting from a piece of the worker's output.
 // `offset` keeps round numbering honest when the loop is resumed.
-async function pairReviewLoop(room, pair, trigger, rootN, gen, offset = 0) {
+async function pairReviewLoop(room, pair, trigger, rootN, gen, offset = 0, stopAt = room.stopEpoch) {
   const { worker, reviewer, rounds } = pair;
   const limited = rounds > 0;                       // a cap you asked for
   const cap = limited ? rounds : PAIR_SAFETY_ROUNDS; // otherwise: runaway guard
   for (let r = 1; r <= cap && trigger; r++) {
-    if (!(await awaitSeat(room, reviewer, pair, rootN, gen, "review"))) return;
-    const review = await runHopTurn(room, reviewer, trigger, rootN, false, {
+    if (!(await awaitSeat(room, reviewer, pair, rootN, gen, "review", stopAt))) return;
+    const review = await runHopTurn(room, reviewer, trigger, rootN, NO_SCOPE, {
       instruction: pairReviewNote(offset + r, limited ? offset + cap : "until approved", worker),
       meta: { pair: "review", round: offset + r, rootN },
       phase: "review",
       signalFailure: true,
       readOnly: true,
     });
-    if (gen !== room.generation || room.chainAbort) return;
+    if (gen !== room.generation || chainStopped(room, stopAt)) return;
+    if (review === STEP_STOPPED) return;
     if (review === HOP_FAILED) {
       pausePairAfterFailure(room, pair, rootN, reviewer, "review");
       return;
@@ -1474,14 +2003,15 @@ async function pairReviewLoop(room, pair, trigger, rootN, gen, offset = 0) {
       });
       return;
     }
-    if (!(await awaitSeat(room, worker, pair, rootN, gen, "fix"))) return;
-    trigger = await runHopTurn(room, worker, review, rootN, false, {
+    if (!(await awaitSeat(room, worker, pair, rootN, gen, "fix", stopAt))) return;
+    trigger = await runHopTurn(room, worker, review, rootN, NO_SCOPE, {
       instruction: pairFixNote(reviewer),
       meta: { pair: "fix", round: offset + r, rootN },
       phase: "fix",
       signalFailure: true,
     });
-    if (gen !== room.generation || room.chainAbort) return;
+    if (gen !== room.generation || chainStopped(room, stopAt)) return;
+    if (trigger === STEP_STOPPED) return;
     if (trigger === HOP_FAILED) {
       pausePairAfterFailure(room, pair, rootN, worker, "fix");
       return;
@@ -1491,13 +2021,16 @@ async function pairReviewLoop(room, pair, trigger, rootN, gen, offset = 0) {
 
 // One work-then-review cycle for a single user message. The mode itself
 // (room.state.pair) outlives this and keeps applying to later messages.
-async function runPairCycle(room, userTurn, pair, gen) {
+async function runPairCycle(room, userTurn, pair, gen, stopAt) {
   const active = beginPairWork(room, pair, gen, userTurn.n);
   try {
-    const work = await runAgentTurn(room, active.worker, userTurn); // the work itself
-    if (work && gen === room.generation && !room.chainAbort) {
-      await pairReviewLoop(room, active, work, userTurn.n, gen);
-    } else if (!work && gen === room.generation && !room.chainAbort) {
+    const work = await runAgentTurn(room, active.worker, userTurn, NO_SCOPE, {
+      signalStop: true,
+    }); // the work itself
+    if (work === STEP_STOPPED) return;
+    if (work && gen === room.generation && !chainStopped(room, stopAt)) {
+      await pairReviewLoop(room, active, work, userTurn.n, gen, 0, stopAt);
+    } else if (!work && gen === room.generation && !chainStopped(room, stopAt)) {
       makePairRetryable(room, userTurn.n, active);
     }
   } finally {
@@ -1510,7 +2043,10 @@ async function runPairCycle(room, userTurn, pair, gen) {
 async function continuePair(room) {
   const pair = pairSnapshot(room);
   if (!pair) throw Object.assign(new Error("pair mode isn't on"), { status: 400 });
-  if (room.busy.size || room.pairActive) throw Object.assign(new Error("the agents are still working"), { status: 409 });
+  // Continue starts a fresh cycle straight into both seats without going
+  // through the lane queue, so everything the lanes still owe the user has to
+  // have cleared first — including a delivery accepted but not yet started.
+  if (roomWorkInFlight(room)) throw Object.assign(new Error("the agents are still working"), { status: 409 });
   const lastCap = [...room.entries].reverse()
     .find((e) => e.kind === "system" && e.meta && e.meta.pairContinue);
   const capRootN = Number(lastCap && lastCap.meta && lastCap.meta.rootN) || 0;
@@ -1528,20 +2064,25 @@ async function continuePair(room) {
     lastReview.n;
 
   const gen = room.generation;
-  room.chainAbort = false;
+  const stopAt = room.stopEpoch;
   const active = beginPairWork(room, pair, gen, rootN);
   (async () => {
     try {
-      const fix = await runHopTurn(room, active.worker, lastReview, rootN, false, {
+      const fix = await runHopTurn(room, active.worker, lastReview, rootN, NO_SCOPE, {
         instruction: pairFixNote(active.reviewer),
         meta: { pair: "fix", round: offset + 1, rootN },
         phase: "fix",
         signalFailure: true,
       });
+      // Stop-all is observed through the chain epoch, while a per-seat Stop is
+      // the distinct STEP_STOPPED result. Both must be handled before failure,
+      // or Retry is handed this cycle's old root and rewinds past newer work.
+      if (gen !== room.generation || chainStopped(room, stopAt)) return;
+      if (fix === STEP_STOPPED) return;
       if (fix === HOP_FAILED) {
         pausePairAfterFailure(room, active, rootN, active.worker, "fix");
-      } else if (fix && gen === room.generation && !room.chainAbort) {
-        await pairReviewLoop(room, active, fix, rootN, gen, offset);
+      } else if (fix) {
+        await pairReviewLoop(room, active, fix, rootN, gen, offset, stopAt);
       }
     } finally {
       finishPairWork(room, active, gen);
@@ -1576,8 +2117,12 @@ function planMessage(room, raw, targetSel) {
 // Synchronous validation + kickoff; agent turns continue in the background
 // and surface over SSE. Throws (with .status) on invalid input so the HTTP
 // route can report it.
-function handleUserMessage(room, rawText, targetSel) {
+function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles) {
   const raw0 = String(rawText || "").trim();
+  if (raw0.length > MAX_MESSAGE_TEXT) {
+    throw Object.assign(new Error(`message text must be ${MAX_MESSAGE_TEXT.toLocaleString()} characters or shorter`), { status: 413 });
+  }
+  const prepared = prepareAttachments(rawImages, rawFiles);
   // One pass decides everything: who it's for, whether it's a pair turn, and
   // which seats it needs. The queue asks the same function, so the two can't
   // drift apart (that disagreement is exactly what made asides queue wrongly).
@@ -1585,6 +2130,7 @@ function handleUserMessage(room, rawText, targetSel) {
   const { pairCmd, starting: startingPair, target, text } = plan;
 
   if (pairCmd && pairCmd.action === "end") {
+    if (prepared.length) throw Object.assign(new Error("attachments cannot be added to /pair end"), { status: 400 });
     if (!room.state.pair) throw Object.assign(new Error("pair mode isn't on"), { status: 400 });
     const was = room.state.pair;
     room.state.pair = null;
@@ -1595,12 +2141,12 @@ function handleUserMessage(room, rawText, targetSel) {
         (room.pairActive ? " The current cycle will finish; Stop aborts it." : ""),
     });
     broadcast(room, { type: "room", room: roomSummary(room) });
-    drainPending(room);
+    drainLanes(room);
     return;
   }
 
   if (startingPair && target === "both") throw Object.assign(new Error("/pair needs a single worker — tag one agent"), { status: 400 });
-  if (!text && !startingPair) throw Object.assign(new Error("empty message"), { status: 400 });
+  if (!text && !prepared.length && !startingPair) throw Object.assign(new Error("empty message"), { status: 400 });
   if (target !== "both" && !room.cfg.agents[target]) throw Object.assign(new Error(`unknown target: ${target}`), { status: 400 });
 
   // Turning pair mode on: it stays on for every later message until /pair end.
@@ -1621,9 +2167,9 @@ function handleUserMessage(room, rawText, targetSel) {
         (rounds > 0 ? `(up to ${rounds} round${rounds === 1 ? "" : "s"} per message)` : "(until approved)") +
         `. Every message you send now runs this way; /pair end to stop.`,
     });
-    if (!text) { // no task given — just arm the mode and wait
+    if (!text && !prepared.length) { // no task given — just arm the mode and wait
       broadcast(room, { type: "room", room: roomSummary(room) });
-      return;
+      return { target, explicit: plan.explicit };
     }
   }
 
@@ -1635,42 +2181,87 @@ function handleUserMessage(room, rawText, targetSel) {
 
   const allSeats = seatIds(room);
   const agents = effectiveTarget === "both" ? [...allSeats] : [effectiveTarget];
-  const lockAgents = asPairTurn ? [...allSeats] : agents;
-  // A running pair cycle reserves both seats only for another pair turn;
-  // an aside just needs the agent it names.
-  const pairBusy = asPairTurn && room.pairActive ? [...allSeats] : [];
-  if (lockAgents.some((a) => room.busy.has(a) || pairBusy.includes(a))) {
+  // Every turn is appended and snapshotted the moment it is accepted, in the
+  // order the user sent it; only the *work* waits. An ordinary turn holds a
+  // delivery per occupied seat — including all of them, which is how a @both
+  // sent to two busy agents still reaches whichever frees first instead of
+  // waiting for the slower one. A pair turn has no half to deliver, so what
+  // waits is its whole cycle; the mode change and the task still land now.
+  const deferred = new Set(asPairTurn ? [] : agents.filter((a) => seatOccupied(room, a)));
+  // Every occupied seat is deferred above, so this cannot fire — it guards the
+  // invariant that nothing starts a second turn on a seat already running one.
+  if (!asPairTurn && agents.some((a) => room.busy.has(a) && !deferred.has(a))) {
     throw Object.assign(new Error(`${effectiveTarget} is still busy — try again in a moment`), { status: 409 });
   }
   const listeners = asPairTurn ? [] // the reviewer is already in the loop
     : allSeats.filter((a) => !agents.includes(a) && room.cfg.agents[a].lurk);
   const discussion = effectiveTarget === "both" && room.cfg.mode === "work";
-  const userTurn = appendEntry(room, {
-    kind: "user", author: "user", target: effectiveTarget, text,
-    meta: {
-      audience: { addressed: agents, lurking: listeners },
-      ...(discussion ? { discussion: true } : {}),
-      ...(asPairTurn ? { pair: { rounds: pair.rounds, worker: pair.worker, reviewer: pair.reviewer } } : {}),
-    },
-  });
+  const attachments = persistAttachments(room, prepared);
+  let userTurn;
+  try {
+    userTurn = appendEntry(room, {
+      kind: "user", author: "user", target: effectiveTarget, text,
+      meta: {
+        audience: { addressed: agents, lurking: listeners },
+        ...(attachments.length ? { attachments } : {}),
+        ...(discussion ? { discussion: true } : {}),
+        ...(asPairTurn ? { pair: { rounds: pair.rounds, worker: pair.worker, reviewer: pair.reviewer } } : {}),
+      },
+    });
+  } catch (e) {
+    removeAttachments(room, attachments);
+    throw e;
+  }
   room.state.lastAddressed = effectiveTarget;
   room.state.lastUser = {
     n: userTurn.n, text, target: effectiveTarget, done: {},
-    pair: asPairTurn,
+    pair: asPairTurn, discussion,
+    ...(attachments.length ? { attachments } : {}),
   };
   saveState(room);
+  const scope = makeScope(room, userTurn.n, effectiveTarget, discussion);
 
   if (asPairTurn) {
     const gen = room.generation;
-    room.chainAbort = false;
-    runPairCycle(room, userTurn, pair, gen);
-    return;
+    const stopAt = room.stopEpoch;
+    // The roles and round cap are snapshotted here, at acceptance, so a queued
+    // cycle runs the pairing the user actually asked for even if /pair start
+    // switches the worker while it waits.
+    const snap = pairSnapshot(room, pair);
+    const start = () => runPairCycle(room, userTurn, snap, gen, stopAt);
+    if (room.pairActive || allSeats.some((a) => seatOccupied(room, a))) {
+      enqueue(room, {
+        kind: "cycle", agents: [...allSeats], pairTurn: true, gen, stopAt,
+        run: start,
+        // Nothing to undo: this cycle never started, and the snapshot taken
+        // when it was accepted is still in lastUser if nothing newer arrived.
+        // Reconstructing the pair root here (as a *failed* cycle does) would
+        // rewind Retry past whatever the user sent afterwards.
+        abandon() { /* the accepted snapshot already stands, or has been superseded */ },
+      });
+      return { pairQueued: true, target: effectiveTarget, explicit: plan.explicit };
+    }
+    start();
+    return { target: effectiveTarget, explicit: plan.explicit };
   }
 
   const gen = room.generation;
-  room.chainAbort = false;
+  const stopAt = room.stopEpoch;
+  // An exchange is in flight from here until the chain closes, including the
+  // gaps between its turns where no seat is busy. A hop launches a new process
+  // in one of those gaps, so anything that must not change underneath a single
+  // exchange — the project folder — asks about this, not about `busy`.
+  room.exchanges++;
   (async () => {
-    const results = await Promise.allSettled(agents.map((a) => runAgentTurn(room, a, userTurn, discussion)));
+   try {
+    // One entry, one coordinator, one delivery per addressed seat. A free seat
+    // starts now; an occupied one starts the moment its lane reaches it. Both
+    // kinds are awaited here, so the hop and lurk chain below still runs
+    // exactly once, after every addressed seat has had its say — or failed, or
+    // been stopped.
+    const results = await Promise.allSettled(agents.map((a) => deferred.has(a)
+      ? deferDelivery(room, a, userTurn, scope)
+      : runAgentTurn(room, a, userTurn, scope)));
     if (gen !== room.generation) return;
     const invoked = new Set(agents);
 
@@ -1689,47 +2280,52 @@ function handleUserMessage(room, rawText, targetSel) {
     queue.sort((a, b) => a.n - b.n); // follow the order the replies appeared in chat
 
     const drainMentions = async () => {
-      while (queue.length && !room.chainAbort) {
+      while (queue.length && !chainStopped(room, stopAt)) {
         const trigger = queue.shift();
         const target = findHopTarget(room, trigger, { allowPlain });
         if (!target) continue;
+        // A seat delivered to late read this reply in its own delta and has
+        // already answered it, so hopping would be the same agent replying
+        // twice to one message. Its cursor is the test: anything it has not
+        // seen yet — a later reply, a chime — still hops normally.
+        if (deferred.has(target) && room.state.agents[target].cursor >= trigger.n) continue;
         if (hops >= maxHops) { capped = true; return; }
-        if (room.busy.has(target) && !(await waitForHopSeat(room, target, gen))) {
+        if (seatOccupied(room, target) && !(await waitForHopSeat(room, target, gen, stopAt))) {
           broadcast(room, { type: "lurk", agent: target, spoke: false, skipped: true });
           continue;
         }
         hops++;
-        const reply = await runHopTurn(room, target, trigger, userTurn.n, discussion);
+        const reply = await runHopTurn(room, target, trigger, userTurn.n, scope);
         if (gen !== room.generation) return;
         invoked.add(target);
         if (reply) queue.push(reply);
       }
     };
     await drainMentions();
-    if (gen !== room.generation || room.chainAbort) return;
+    if (gen !== room.generation || chainStopped(room, stopAt)) return;
 
     const lurkers = listeners.filter((a) => !invoked.has(a)).filter((a) => {
-      if (room.busy.has(a)) { // busy in another lane — the delta catches it up later
+      if (seatOccupied(room, a)) { // busy in another lane — the delta catches it up later
         broadcast(room, { type: "lurk", agent: a, spoke: false, skipped: true });
         return false;
       }
       return true;
     });
     const chimeResults = lurkers.length
-      ? await Promise.allSettled(lurkers.map((a) => runListenerTurn(room, a, userTurn.n, discussion)))
+      ? await Promise.allSettled(lurkers.map((a) => runListenerTurn(room, a, userTurn.n, scope)))
       : [];
-    if (gen !== room.generation || room.chainAbort) return;
+    if (gen !== room.generation || chainStopped(room, stopAt)) return;
 
     const chimes = chimeResults.filter((r) => r.status === "fulfilled" && r.value).map((r) => r.value);
     if (chimes.length) {
       for (const chime of chimes) {
-        if (room.chainAbort) break;
+        if (chainStopped(room, stopAt)) break;
         const target = findHopTarget(room, chime, { allowPlain }) || otherSeat(room, chime.author);
-        if (room.busy.has(target) && !(await waitForHopSeat(room, target, gen))) {
+        if (seatOccupied(room, target) && !(await waitForHopSeat(room, target, gen, stopAt))) {
           broadcast(room, { type: "lurk", agent: target, spoke: false, skipped: true });
           continue;
         }
-        const reply = await runHopTurn(room, target, chime, userTurn.n, discussion); // free: right of reply
+        const reply = await runHopTurn(room, target, chime, userTurn.n, scope); // free: right of reply
         if (gen !== room.generation) return;
         invoked.add(target);
         if (reply) queue.push(reply); // but any tag in it is budgeted as usual
@@ -1747,34 +2343,123 @@ function handleUserMessage(room, rawText, targetSel) {
       });
     }
 
-    drainPending(room); // messages the user queued while the table was busy
+    drainLanes(room); // messages the user queued while the table was busy
+   } finally {
+     room.exchanges--;
+     broadcast(room, { type: "room", room: roomSummary(room) });
+   }
   })();
   // after kickoff, so the summary includes the now-busy agents
   broadcast(room, { type: "room", room: roomSummary(room) });
+  return { target: effectiveTarget, explicit: plan.explicit, deferred: [...deferred] };
 }
 
-// Dispatch every queued message whose target agents are all free, preserving
-// order within each agent's lane (a blocked message also blocks later
-// messages for the same agents, so per-agent ordering holds).
-function drainPending(room) {
-  if (!room.pendingMsgs.length) return;
+// ---- per-seat lanes ----
+// Each seat runs one thing at a time, and what it owes the user comes first.
+// Priority within a lane: the turn it is running now → every accepted user
+// item, in the order the user sent them → hops → a lurk check.
+//
+// "Accepted user item" is deliberately one queue, not two. A message the user
+// sent while a seat was busy and a held half of a split @both are both work the
+// user asked for, so they share one arrival order (`seq`); anything that ranks
+// below them — hops, lurks, and the drain itself — asks `seatOccupied`, which
+// covers both kinds. Two queues would let a later item start ahead of an
+// earlier one purely because they were stored in different places.
+//
+// Every item carries run()/abandon() and the generation and stop epoch it was
+// accepted under:
+//   { seq, kind: "delivery", agents: [agent],  gen, stopAt, run, abandon }
+//   { seq, kind: "cycle",    agents: allSeats, gen, stopAt, run, abandon, pairTurn }
+
+function queueSize(room) { return room.pending.length; }
+
+// Is the room doing anything at all on the user's behalf? Running turns, work
+// the lanes still owe them, and chains mid-flight between turns. Anything that
+// moves the room's own folder underneath a working directory, or starts a fresh
+// cycle in a seat, has to wait for all three — checking `busy` alone leaves the
+// gap between a seat's release and its next start, and the longer gap between
+// one turn of a chain and the next.
+function roomWorkInFlight(room) {
+  return room.busy.size > 0 || room.pending.length > 0 ||
+    room.exchanges > 0 || !!room.pairActive;
+}
+
+function seatOccupied(room, agent) {
+  return room.busy.has(agent) || room.pending.some((p) => p.agents.includes(agent));
+}
+
+function enqueue(room, item) {
+  room.pending.push({ seq: room.pendingSeq++, ...item });
+  broadcast(room, { type: "queue", size: queueSize(room) });
+}
+
+// Hold one seat's share of an already-appended user turn until that seat frees.
+// The entry is never appended twice; only its delivery is split. Resolves with
+// the reply entry, or null if the turn failed, was stopped or was abandoned —
+// so the single hop/lurk chain that awaits it always runs exactly once.
+function deferDelivery(room, agent, userTurn, scope) {
+  let settle;
+  const done = new Promise((resolve) => { settle = resolve; });
+  enqueue(room, {
+    kind: "delivery", agents: [agent], gen: room.generation, stopAt: room.stopEpoch,
+    run() {
+      // The badge means "the other seat answered this before me", so it belongs
+      // to a split @both. A single-seat message simply waiting its turn in its
+      // own lane is the ordinary case and needs no marking.
+      const deferred = userTurn.target === "both";
+      runAgentTurn(room, agent, userTurn, scope, { deferred }).then(settle, () => settle(null));
+    },
+    abandon() { settle(null); },
+  });
+  // Normally the seat's own release drains this. If it is somehow already free,
+  // drain anyway — a delivery nobody ever wakes would hang the chain.
+  if (!room.busy.has(agent)) setImmediate(() => drainLanes(room));
+  return done;
+}
+
+// Start everything whose seats are free, oldest first. An item that must wait
+// also claims its seats, so nothing behind it in those lanes can overtake it —
+// that single rule is what keeps arrival order across both item kinds.
+function drainLanes(room) {
+  if (!room.pending.length) return;
   const claimed = new Set([...room.busy.keys()]);
-  const stillPending = [];
-  for (const m of room.pendingMsgs) {
-    // a queued pair turn also waits for the cycle in flight; an aside doesn't
-    if (m.agents.some((a) => claimed.has(a)) || (m.pairTurn && room.pairActive)) {
-      m.agents.forEach((a) => claimed.add(a));
-      stillPending.push(m);
+  const still = [], go = [], drop = [];
+  for (const item of room.pending) {
+    // A delivery belongs to one user turn in one generation; once that turn is
+    // gone (reset, stop) there is nothing left to deliver.
+    if (item.gen !== room.generation || chainStopped(room, item.stopAt)) {
+      drop.push(item);
       continue;
     }
-    m.agents.forEach((a) => claimed.add(a));
-    try { handleUserMessage(room, m.text, m.target); }
-    catch (e) {
-      appendEntry(room, { kind: "system", author: "system", text: `⚠ queued message failed: ${e.message}` });
+    // a queued pair turn also waits for the cycle in flight; an aside doesn't
+    if (item.agents.some((a) => claimed.has(a)) || (item.pairTurn && room.pairActive)) {
+      item.agents.forEach((a) => claimed.add(a));
+      still.push(item);
+      continue;
     }
+    item.agents.forEach((a) => claimed.add(a));
+    go.push(item);
   }
-  room.pendingMsgs = stillPending;
-  broadcast(room, { type: "queue", size: room.pendingMsgs.length });
+  room.pending = still;
+  broadcast(room, { type: "queue", size: queueSize(room) });
+  for (const item of drop) item.abandon();
+  // Both runners mark the seat busy synchronously, so nothing can slip into the
+  // gap between leaving this queue and the seat being claimed.
+  for (const item of go) item.run();
+}
+
+function releaseSeat(room, agent) {
+  room.busy.delete(agent);
+  broadcast(room, { type: "status", agent, phase: "done" });
+  broadcast(room, { type: "room", room: roomSummary(room) });
+  // Deferred by a tick so the turn that just ended finishes unwinding first.
+  if (room.pending.length) setImmediate(() => drainLanes(room));
+}
+
+function clearPending(room) {
+  const held = room.pending;
+  room.pending = [];
+  for (const item of held) item.abandon();
 }
 
 function retryTargets(room) {
@@ -1794,13 +2479,26 @@ function retryTargets(room) {
 function handleRetry(room) {
   const lu = room.state.lastUser;
   if (!lu) throw Object.assign(new Error("nothing to retry"), { status: 400 });
-  const userTurn = { n: lu.n, text: lu.text };
+  // `target` rides along so the retried turn can re-derive its own no-edit
+  // scope per attempt, exactly as the original did.
+  // Reuse the authoritative transcript entry so Retry carries the original
+  // attachment metadata too. Legacy state without that entry falls back to the
+  // snapshot, including attachments persisted by newer builds.
+  const root = room.entries.find((e) => e.n === lu.n && e.kind === "user");
+  const userTurn = root || {
+    n: lu.n, text: lu.text, target: lu.target,
+    ...(Array.isArray(lu.attachments) ? { meta: { attachments: lu.attachments } } : {}),
+  };
   // A pair retry uses the mode active now, never a persisted old snapshot. This
   // is important after `/pair start @other` switches the worker/reviewer.
   if (lu.pair && room.state.pair) {
     const pair = pairSnapshot(room);
     if (lu.done && lu.done[lu.target]) throw Object.assign(new Error("nothing to retry"), { status: 400 });
-    if (room.pairActive || seatIds(room).some((a) => room.busy.has(a))) {
+    // seatOccupied, not busy: Retry launches straight into a seat rather than
+    // going through the lane queue, so anything the lane already owes the user
+    // — a queued message, a held half of a split @both — has to have cleared
+    // first, including in the tick between a seat's release and its next start.
+    if (room.pairActive || seatIds(room).some((a) => seatOccupied(room, a))) {
       throw Object.assign(new Error("the pair seats are still busy"), { status: 409 });
     }
     lu.target = pair.worker;
@@ -1808,15 +2506,21 @@ function handleRetry(room) {
     lu.pair = true;
     saveState(room);
     const gen = room.generation;
-    room.chainAbort = false;
-    runPairCycle(room, userTurn, pair, gen);
+    runPairCycle(room, userTurn, pair, gen, room.stopEpoch);
     return;
   }
   const targets = retryTargets(room);
   if (!targets.length) throw Object.assign(new Error("nothing to retry"), { status: 400 });
-  if (targets.some((a) => room.busy.has(a))) throw Object.assign(new Error("that agent is still busy"), { status: 409 });
-  const discussion = lu.target === "both" && room.cfg.mode === "work";
-  Promise.allSettled(targets.map((a) => runAgentTurn(room, a, userTurn, discussion))).then(() => drainPending(room));
+  if (targets.some((a) => seatOccupied(room, a))) {
+    throw Object.assign(new Error("that agent is still busy"), { status: 409 });
+  }
+  // The boundary the original turn ran under can only tighten — a room flipped
+  // to work since then makes this @both a discussion.
+  // Recovers the boundary from lastUser or, for a room written by an older
+  // build that only recorded it on the entry, from the entry itself — and keeps
+  // it latched, so a Work→Talk flip since the failure cannot widen this retry.
+  const scope = makeScope(room, lu.n, lu.target, lu.discussion);
+  Promise.allSettled(targets.map((a) => runAgentTurn(room, a, userTurn, scope))).then(() => drainLanes(room));
 }
 
 function handleStop(room, agent = null) {
@@ -1832,8 +2536,14 @@ function handleStop(room, agent = null) {
     killTree(child);
     return 1;
   }
-  room.chainAbort = true; // also stop any pending hop/lurk follow-ups
-  room.pendingMsgs = []; // Stop all means silence — drop queued messages too
+  // Draw the line forward rather than raising a flag: every chain running now
+  // captured the old count and abandons itself, and no later message can undo
+  // that by clearing a shared boolean.
+  room.stopEpoch++;
+  // Stop all means silence — drop queued messages too. Held deliveries go the
+  // same way, and settle so the chain waiting on them closes out instead of
+  // hanging on a turn that will never run.
+  clearPending(room);
   broadcast(room, { type: "queue", size: 0 });
   let n = 0;
   for (const [, child] of room.procs) { child.rtStopped = true; killTree(child); n++; }
@@ -1843,23 +2553,111 @@ function handleStop(room, agent = null) {
 // ---- native folder picker ----
 // A web page can't read a real filesystem path, but the server is on the same
 // machine — so it borrows the OS's own folder dialog rather than making one.
+// Generous: the user may be hunting through a deep tree, and the only cost of
+// waiting is one idle process.
+const PICKER_TIMEOUT_MS = Number(process.env.PARLEY_PICKER_MS) || 300000;
+
+// Each platform's picker reports a user cancel differently, and only Windows
+// treats it as a clean exit. osascript raises "User canceled. (-128)" and exits
+// non-zero; zenity exits 1 with nothing on stderr (it reserves 5 for its own
+// timeout and 255 for a real error). Without this the fix for a dead Browse
+// button would turn every macOS and Linux cancel into a spurious error.
+function pickerCancelled(code, err) {
+  if (IS_WIN) return false;
+  if (process.platform === "darwin") return /-128|User can?celled|User canceled/i.test(err);
+  // zenity documents exit 1 as "no selection" — the cancel case — and uses
+  // other codes for real trouble (5 for its own timeout, 255 for an error).
+  // stderr does not get a vote: GTK writes accessibility and theme warnings
+  // there on perfectly ordinary runs, and treating those as failure would turn
+  // every warned cancel into a spurious error.
+  return code === 1;
+}
+
 function pickFolder(start) {
   return new Promise((resolve) => {
     let cmd, args;
     if (IS_WIN) {
       const s = String(start || "").replace(/'/g, "''");
+      // Stop, not Continue: by default a failing cmdlet writes to stderr and
+      // lets the script run on to exit 0, which is indistinguishable from a
+      // cancel. Terminating on the first error makes failure visible.
       const script = `
+$ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms | Out-Null
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public static class ParleyPickerWindow {
+    const uint GW_ENABLEDPOPUP = 6;
+    const uint SWP_NOSIZE = 0x0001;
+    const uint SWP_NOMOVE = 0x0002;
+    const uint SWP_SHOWWINDOW = 0x0040;
+    static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+
+    [DllImport("user32.dll")]
+    static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+    [DllImport("user32.dll")]
+    static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")]
+    static extern bool SetWindowPos(IntPtr hWnd, IntPtr insertAfter,
+        int x, int y, int cx, int cy, uint flags);
+    [DllImport("user32.dll")]
+    static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")]
+    static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")]
+    static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr processId);
+    [DllImport("user32.dll")]
+    static extern bool AttachThreadInput(uint attachThread, uint attachToThread, bool attach);
+
+    public static bool RaiseOwnedPopup(IntPtr owner) {
+        IntPtr popup = GetWindow(owner, GW_ENABLEDPOPUP);
+        if (popup == IntPtr.Zero || popup == owner || !IsWindowVisible(popup)) return false;
+        IntPtr foreground = GetForegroundWindow();
+        uint popupThread = GetWindowThreadProcessId(popup, IntPtr.Zero);
+        uint foregroundThread = foreground == IntPtr.Zero
+            ? 0 : GetWindowThreadProcessId(foreground, IntPtr.Zero);
+        bool attached = popupThread != 0 && foregroundThread != 0 && popupThread != foregroundThread &&
+            AttachThreadInput(popupThread, foregroundThread, true);
+        try {
+            // Windows' foreground lock can make SetWindowPos report success
+            // without changing z-order. Joining the foreground input queue,
+            // activating first, then promoting is the sequence that works.
+            SetForegroundWindow(popup);
+            SetWindowPos(popup, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+            return GetForegroundWindow() == popup;
+        } finally {
+            if (attached) AttachThreadInput(popupThread, foregroundThread, false);
+        }
+    }
+}
+"@
 $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
 $dlg.Description = 'Choose a project folder for this Parley room'
 $dlg.ShowNewFolderButton = $true
 ${s ? `if (Test-Path -LiteralPath '${s}') { $dlg.SelectedPath = '${s}' }` : ""}
 $owner = New-Object System.Windows.Forms.Form
-$owner.TopMost = $true; $owner.ShowInTaskbar = $false; $owner.Opacity = 0
+$owner.Text = 'Parley — Choose a project folder'
+$owner.ShowInTaskbar = $true; $owner.Opacity = 0.01
+$owner.Width = 1; $owner.Height = 1; $owner.Left = -32000; $owner.Top = -32000
+$owner.Tag = 0
 $owner.Show() | Out-Null
-$res = $dlg.ShowDialog($owner)
-$owner.Close()
-if ($res -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dlg.SelectedPath }`;
+$timer = New-Object System.Windows.Forms.Timer
+$timer.Interval = 50
+$timer.Add_Tick({
+  $owner.Tag = [int]$owner.Tag + 1
+  if ([ParleyPickerWindow]::RaiseOwnedPopup($owner.Handle) -or [int]$owner.Tag -ge 40) { $timer.Stop() }
+})
+$picked = $null
+try {
+  $timer.Start()
+  $res = $dlg.ShowDialog($owner)
+  if ($res -eq [System.Windows.Forms.DialogResult]::OK) { $picked = $dlg.SelectedPath }
+} finally {
+  $timer.Stop(); $timer.Dispose(); $dlg.Dispose(); $owner.Close(); $owner.Dispose()
+}
+if ($picked) { Write-Output $picked }`;
       cmd = "powershell.exe";
       args = ["-NoProfile", "-STA", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")];
     } else if (process.platform === "darwin") {
@@ -1869,19 +2667,38 @@ if ($res -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dlg.Select
       cmd = "zenity";
       args = ["--file-selection", "--directory", "--title=Choose a project folder for this Parley room"];
     }
-    const child = spawn(cmd, args, {
-      stdio: ["ignore", "pipe", "pipe"], windowsHide: true, detached: !IS_WIN,
-    });
+    let child;
+    try {
+      child = spawn(cmd, args, {
+        stdio: ["ignore", "pipe", "pipe"], windowsHide: true, detached: !IS_WIN,
+      });
+    } catch (e) {
+      return resolve({ error: `couldn't open a folder picker on this system (${e.message}) — type the path instead` });
+    }
     child.rtProcessGroup = !IS_WIN;
-    let out = "";
-    const timer = setTimeout(() => killTree(child), 300000);
+    let out = "", err = "", timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; killTree(child); }, PICKER_TIMEOUT_MS);
     child.stdout.on("data", (d) => { out += d.toString("utf8"); });
+    // stderr is piped, so it must be read: an unread pipe fills its buffer and
+    // blocks the picker until the timeout, which then looks like a cancel.
+    child.stderr.on("data", (d) => { err += d.toString("utf8"); });
     child.on("error", (e) => {
       clearTimeout(timer);
       resolve({ error: `couldn't open a folder picker on this system (${e.message}) — type the path instead` });
     });
-    child.on("close", () => {
+    child.on("close", (code) => {
       clearTimeout(timer);
+      // How the process ended is judged before what it printed. A picker that
+      // wrote a path and then hung or crashed has not actually answered, and
+      // treating its stdout as a result would hand the room a folder the user
+      // never confirmed. Reporting a failure as a cancel is what made Browse
+      // look dead in the first place, so each ending gets its own answer.
+      if (timedOut) return resolve({ error: `the folder picker was still open after ${Math.round(PICKER_TIMEOUT_MS / 60000)} min, so Parley closed it — type the path instead` });
+      if (code !== 0) {
+        if (pickerCancelled(code, err)) return resolve({ cancelled: true });
+        const why = err.trim().split(/\r?\n/).filter(Boolean)[0];
+        return resolve({ error: `the folder picker failed (exit ${code}${why ? `: ${why.slice(0, 160)}` : ""}) — type the path instead` });
+      }
       const picked = out.trim().split(/\r?\n/).filter(Boolean).pop();
       resolve(picked ? { path: path.resolve(picked) } : { cancelled: true });
     });
@@ -1902,7 +2719,10 @@ function deleteRoom(room) {
   if (room.name === "default") {
     throw Object.assign(new Error("the default room can't be deleted — archive its conversation with New conversation instead"), { status: 400 });
   }
-  if (room.busy.size || room.pairActive) {
+  // Both of these move the room's folder, which is a live working directory for
+  // any process the room might still launch — so they wait for the whole
+  // exchange, not just for a seat that happens to be running right now.
+  if (roomWorkInFlight(room)) {
     throw Object.assign(new Error("that room's agents are still working — stop them first"), { status: 409 });
   }
   // Recoverable by design: a trashed room is just a folder you can drag back.
@@ -1923,7 +2743,10 @@ function renameRoom(room, newName) {
   if (!validRoomName(newName)) throw Object.assign(new Error("Room names: letters, numbers, dashes, underscores (max 40)."), { status: 400 });
   if (newName === room.name) return room;
   if (fs.existsSync(path.join(ROOT, newName))) throw Object.assign(new Error(`a room called "${newName}" already exists`), { status: 409 });
-  if (room.busy.size || room.pairActive) {
+  // Both of these move the room's folder, which is a live working directory for
+  // any process the room might still launch — so they wait for the whole
+  // exchange, not just for a seat that happens to be running right now.
+  if (roomWorkInFlight(room)) {
     throw Object.assign(new Error("that room's agents are still working — stop them first"), { status: 409 });
   }
 
@@ -1971,7 +2794,7 @@ function handleNewConversation(room) {
   }
   room.entries = [];
   room.receipts = [];
-  room.pendingMsgs = [];
+  clearPending(room); // the entry a held delivery would deliver no longer exists
   saveState(room);
   broadcast(room, { type: "reset" });
   broadcast(room, { type: "room", room: roomSummary(room) });
@@ -1991,11 +2814,12 @@ function requestHostAllowed(req) {
 function authorized(req, url, route) {
   // EventSource cannot attach a custom header. Keep query-token acceptance
   // scoped to that single streaming endpoint; its protocol travels the same
-  // way so an older open tab cannot attach to a newer event schema.
-  const queryToken = route === "GET /api/events"
+  // way so an old tab cannot mix runtime schemas.
+  const queryAuth = route === "GET /api/events";
+  const queryToken = queryAuth
     ? url.searchParams.get("token")
     : null;
-  const protocol = route === "GET /api/events"
+  const protocol = queryAuth
     ? url.searchParams.get("protocol")
     : req.headers["x-parley-runtime-protocol"];
   if (protocol !== RUNTIME_PROTOCOL) return false;
@@ -2023,15 +2847,25 @@ function json(res, code, obj) {
   res.end(body);
 }
 
-function readBody(req) {
+function readBody(req, maxBytes = 1_000_000) {
   return new Promise((resolve, reject) => {
-    let data = "";
+    const chunks = [];
+    let size = 0, failed = false;
     req.on("data", (c) => {
-      data += c;
-      if (data.length > 1_000_000) { reject(new Error("body too large")); req.destroy(); }
+      if (failed) return;
+      size += c.length;
+      if (size > maxBytes) {
+        failed = true;
+        reject(Object.assign(new Error("body too large"), { status: 413 }));
+        return;
+      }
+      chunks.push(c);
     });
     req.on("end", () => {
-      try { resolve(data ? JSON.parse(data) : {}); } catch { reject(new Error("invalid JSON body")); }
+      if (failed) return;
+      const data = Buffer.concat(chunks).toString("utf8");
+      try { resolve(data ? JSON.parse(data) : {}); }
+      catch { reject(Object.assign(new Error("invalid JSON body"), { status: 400 })); }
     });
     req.on("error", reject);
   });
@@ -2075,7 +2909,7 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, {
         "Content-Type": "text/html; charset=utf-8",
         "Cache-Control": "no-store, must-revalidate",
-        "Content-Security-Policy": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+        "Content-Security-Policy": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
         "X-Frame-Options": "DENY",
         "Referrer-Policy": "no-referrer",
         "X-Content-Type-Options": "nosniff",
@@ -2144,6 +2978,30 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { room: roomSummary(room), entries: room.entries, receipts: room.receipts });
     }
 
+    if (route === "GET /api/attachment") {
+      const room = loadRoom(url.searchParams.get("room") || "default");
+      const id = String(url.searchParams.get("id") || "");
+      if (!/^[0-9a-f-]{36}$/i.test(id)) return json(res, 404, { error: "attachment not found" });
+      let ref = null;
+      for (const entry of room.entries) {
+        ref = entryAttachments(entry).find((candidate) => candidate.id === id) || null;
+        if (ref) break;
+      }
+      const file = ref && attachmentFile(room, ref);
+      if (!file || !fs.existsSync(file)) return json(res, 404, { error: "attachment not found" });
+      const stat = fs.statSync(file);
+      const headers = {
+        "Content-Type": imageAttachmentSpec(ref) ? ref.mime : "application/octet-stream",
+        "Content-Length": stat.size,
+        "Cache-Control": "private, no-store",
+        "X-Content-Type-Options": "nosniff",
+        "X-Parley-Runtime-Protocol": RUNTIME_PROTOCOL,
+      };
+      if (fileAttachment(ref)) headers["Content-Disposition"] = attachmentDisposition(ref.name);
+      res.writeHead(200, headers);
+      return fs.createReadStream(file).pipe(res);
+    }
+
     if (route === "GET /api/events") {
       const room = loadRoom(url.searchParams.get("room") || "default");
       res.writeHead(200, {
@@ -2159,31 +3017,23 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (route === "POST /api/message") {
-      const { room: name, text, target } = await readBody(req);
+      const { room: name, text, target, images, files } = await readBody(req, MAX_MESSAGE_BODY_BYTES);
       const room = loadRoom(name || "default");
       const raw = String(text || "").trim();
-      if (!raw) return json(res, 400, { error: "empty message" });
-      // Per-agent lanes: queue only when a target agent is running or already
-      // has queued messages ahead (keeps per-lane order). Pair sessions need
-      // (and hold) both lanes.
-      const plan = planMessage(room, raw, target);
-      if (plan.pairCmd && plan.pairCmd.action === "end") { // ending never queues behind the work it disables
-        handleUserMessage(room, raw, target);
-        return json(res, 200, { ok: true });
-      }
-      // Only the seats this message actually needs — an aside to the free
-      // agent shouldn't wait behind a pair cycle running on the other one.
-      const { target: resolved, seats: wants } = plan;
-      const laneBusy = wants.some((a) => room.busy.has(a)) ||
-        (plan.asPairTurn && !!room.pairActive) ||
-        room.pendingMsgs.some((m) => m.agents.some((a) => wants.includes(a)));
-      if (laneBusy) {
-        room.pendingMsgs.push({ text: raw, target: resolved, agents: wants, pairTurn: plan.asPairTurn });
-        broadcast(room, { type: "queue", size: room.pendingMsgs.length });
-        return json(res, 200, { queued: true, position: room.pendingMsgs.length });
-      }
-      handleUserMessage(room, raw, resolved); // replies arrive over SSE
-      return json(res, 200, { ok: true });
+      // Every message is accepted here and now: validated, applied (a /pair
+      // command takes effect immediately), appended in send order and
+      // snapshotted for Retry. Only the work waits — a per-seat delivery for an
+      // ordinary turn, the whole cycle for a pair turn. Nothing is ever held as
+      // raw text, because text appended later lands after messages the user
+      // sent afterwards and takes the retry slot with it.
+      const outcome = handleUserMessage(room, raw, target, images, files) || {}; // replies arrive over SSE
+      if (outcome.pairQueued) return json(res, 200, {
+        queued: true, position: room.pending.length,
+        target: outcome.target, explicit: !!outcome.explicit,
+      });
+      return json(res, 200, outcome.deferred && outcome.deferred.length
+        ? { ok: true, target: outcome.target, explicit: !!outcome.explicit, deferred: outcome.deferred }
+        : { ok: true, ...(outcome.target ? { target: outcome.target, explicit: !!outcome.explicit } : {}) });
     }
 
     if (route === "POST /api/retry") {
@@ -2269,12 +3119,36 @@ const server = http.createServer(async (req, res) => {
       for (const id of sandboxChangedSeats) resetRequiredSeats.add(id);
       if (claudePermissionChanged) resetRequiredSeats.add("claude");
 
+      // Applying immediately is safe for permissions and sandboxes. The running
+      // process keeps the flags it launched with (nothing can change those once
+      // it has started), and the session it produces is fenced off by the epoch
+      // bumped below, so it is discarded rather than resumed under the new
+      // setting. The next invocation uses the new configuration.
+      //
+      // Two cases still refuse, because they would split a single exchange
+      // across two regimes rather than two turns:
+      const projectChanged = prevProjectDir !== next.projectDir;
       const runningResets = [...resetRequiredSeats].filter((id) => room.busy.has(id));
-      if (runningResets.length || (room.pairActive && resetRequiredSeats.size)) {
-        const who = runningResets.length ? runningResets.join(" and ") : "The pair cycle";
-        const verb = runningResets.length > 1 ? "are" : "is";
+      // A hop spawns a *new* invocation mid-chain. Picking up tightened
+      // permissions there is desirable; changing project underneath it is not —
+      // one exchange would span two working directories. So this asks about the
+      // whole exchange, not just running processes: a held delivery is the
+      // unstarted half of a turn whose other half has run, and `exchanges`
+      // covers the gaps between a chain's turns, where no seat is busy and a
+      // hop is about to start.
+      const projectBlockers = [...resetRequiredSeats].filter((id) => seatOccupied(room, id));
+      if (projectChanged && (projectBlockers.length || room.exchanges > 0)) {
+        const who = projectBlockers.length ? projectBlockers.join(" and ") : "the exchange in flight";
+        const verb = projectBlockers.length > 1 ? "are" : "is";
         return json(res, 409, {
-          error: `${who} ${verb} still working. Wait for the work to finish or stop it before changing settings that restart an agent session.`,
+          error: `${who} ${verb} still working. Wait for the work to finish or stop it before changing the project folder.`,
+        });
+      }
+      // A pair cycle's worker and reviewer must judge the same work under the
+      // same settings, and the cycle continues across gaps where nobody is busy.
+      if (room.pairActive && resetRequiredSeats.size) {
+        return json(res, 409, {
+          error: "The pair cycle is still working. Wait for it to finish or stop it before changing settings that restart an agent session.",
         });
       }
 
@@ -2283,7 +3157,13 @@ const server = http.createServer(async (req, res) => {
       room.cfg = next;
       cmdCache.clear();
       saveConfig(room);
-      for (const id of resetRequiredSeats) room.state.agents[id].sessionRef = null;
+      for (const id of resetRequiredSeats) {
+        room.state.agents[id].sessionRef = null;
+        // Fences any invocation already in flight on this seat: what it returns
+        // was created under the settings we just replaced. Only affected seats
+        // are bumped — an unaffected agent keeps its session.
+        room.cfgEpoch[id] = seatEpoch(room, id) + 1;
+      }
       if (room.state.agents.claude) {
         room.state.agents.claude.permissionScope = nextClaudePermission;
       }
@@ -2339,8 +3219,28 @@ const server = http.createServer(async (req, res) => {
           appendEntry(room, { kind: "system", author: "system", text });
         }
       }
+      // Settings show the new permission the moment it is saved, while the live
+      // process is still running under the old one. Saying so is not a nicety:
+      // without it the room looks like it already changed mid-answer.
+      //
+      // The boundary is the CLI invocation, not the reply. A reply whose native
+      // session is lost mid-flight is relaunched by the recovery retry, and
+      // that new process reads the config saved here — so promising that "this
+      // reply keeps its old permissions" would be false exactly when a turn
+      // restarts itself.
+      if (runningResets.length) {
+        const many = runningResets.length > 1;
+        appendEntry(room, {
+          kind: "system", author: "system",
+          text: `⏳ Saved — ${runningResets.join(" and ")} ${many ? "are" : "is"} mid-answer, and the ${many ? "runs" : "run"} already in progress ${many ? "keep" : "keeps"} the previous permissions. Parley applies the new settings to everything it starts from now on, including an automatic retry if a session is lost. A no-edit boundary an exchange has already taken on is the one thing that stays: it holds for the rest of that exchange even if the new settings would relax it.`,
+        });
+      }
       broadcast(room, { type: "room", room: roomSummary(room) });
-      return json(res, 200, { room: roomSummary(room) });
+      return json(res, 200, {
+        room: roomSummary(room),
+        // Seats with a CLI invocation already in flight under the old settings.
+        ...(runningResets.length ? { runningInvocations: runningResets } : {}),
+      });
     }
 
     if (route === "GET /api/transcript") {

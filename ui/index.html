@@ -176,6 +176,24 @@
   }
   .msg.claude .bubble { border-left: 2px solid rgba(232,132,92,.55); }
   .msg.codex .bubble { border-left: 2px solid rgba(47,214,168,.5); }
+  .attachments { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 9px; }
+  .attachments:first-child { margin-top: 0; }
+  .attachment {
+    display: block; max-width: min(360px, 100%); border: 1px solid var(--border2);
+    border-radius: 10px; overflow: hidden; background: rgba(0,0,0,.18);
+  }
+  .attachment img { display: block; max-width: 100%; max-height: 320px; object-fit: contain; }
+  .attachment .attachment-name { display: block; padding: 4px 8px; color: var(--text-faint); font-size: 11px; }
+  .attachment-file {
+    display: flex; align-items: center; gap: 10px; min-width: 210px; padding: 10px 12px;
+    color: var(--text); text-align: left; cursor: pointer;
+  }
+  .attachment-file:hover { border-color: var(--user); background: rgba(122,162,247,.08); }
+  .attachment-file:disabled { cursor: wait; opacity: .7; }
+  .attachment-file-icon { font-size: 22px; flex-shrink: 0; }
+  .attachment-file-copy { min-width: 0; }
+  .attachment-file .attachment-name { padding: 0; color: var(--text); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .attachment-file-size { display: block; margin-top: 2px; color: var(--text-faint); font-size: 11px; }
   .bubble > :first-child { margin-top: 0; }
   .bubble > :last-child { margin-bottom: 0; }
   .bubble p { margin: 8px 0; }
@@ -264,6 +282,17 @@
   .chip.active[data-t="codex"] { background: var(--codex); border-color: var(--codex); }
   .chip.active[data-t="both"] { background: var(--user); border-color: var(--user); }
   #routeHint { margin-left: auto; font-size: 12px; color: var(--text-faint); }
+  #draftImages { display: none; gap: 8px; flex-wrap: wrap; margin: 0 0 8px; }
+  #draftImages.show { display: flex; }
+  .draft-image { position: relative; width: 74px; height: 62px; border: 1px solid var(--border2); border-radius: 9px; overflow: hidden; background: var(--panel); }
+  .draft-image img { width: 100%; height: 100%; object-fit: cover; }
+  .draft-image button { position: absolute; top: 3px; right: 3px; width: 21px; height: 21px; border-radius: 50%; background: rgba(11,14,20,.86); color: var(--text); line-height: 1; }
+  .draft-file { position: relative; display: flex; align-items: center; gap: 8px; width: min(260px, 100%); min-height: 62px; padding: 8px 34px 8px 10px; border: 1px solid var(--border2); border-radius: 9px; background: var(--panel); }
+  .draft-file-icon { font-size: 20px; flex-shrink: 0; }
+  .draft-file-copy { min-width: 0; }
+  .draft-file-name { display: block; color: var(--text); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .draft-file-size { display: block; margin-top: 2px; color: var(--text-faint); font-size: 11px; }
+  .draft-file button { position: absolute; top: 3px; right: 3px; width: 21px; height: 21px; border-radius: 50%; color: var(--text-dim); line-height: 1; }
   .box {
     display: flex; align-items: flex-end; gap: 10px; background: var(--panel);
     border: 1px solid var(--border2); border-radius: 16px; padding: 10px 10px 10px 16px;
@@ -275,6 +304,11 @@
     max-height: 200px; line-height: 1.5; padding: 4px 0; color: var(--text);
   }
   #input::placeholder { color: var(--text-faint); }
+  #attachBtn {
+    width: 34px; height: 38px; border-radius: 10px; color: var(--text-dim);
+    display: flex; align-items: center; justify-content: center; flex-shrink: 0; font-size: 19px;
+  }
+  #attachBtn:hover { color: var(--text); background: var(--panel2); }
   #sendBtn, #stopBtn {
     width: 38px; height: 38px; border-radius: 12px; display: flex; align-items: center; justify-content: center; flex-shrink: 0;
   }
@@ -405,7 +439,7 @@
       </div>
       <button type="button" id="newRoomProj" class="ract"
         style="display:block;width:100%;text-align:left;margin-top:6px;padding:4px 2px;font-size:11.5px;color:var(--text-faint)"
-        title="Point this room at an existing project folder">📁 Link a project folder… <span id="newRoomProjVal"></span></button>
+        title="Point this room at an existing project folder"><span data-picker-label>📁 Link a project folder…</span> <span id="newRoomProjVal"></span></button>
     </form>
     <nav id="roomList"></nav>
     <div class="side-foot">
@@ -456,7 +490,10 @@
           <span id="queueBadge" style="display:none;color:#e8b45c;font-size:12px"></span>
           <span id="routeHint"></span>
         </div>
+        <div id="draftImages" aria-label="Attachments ready to send"></div>
         <div class="box">
+          <input id="fileInput" type="file" multiple hidden aria-label="Choose files to attach">
+          <button id="attachBtn" type="button" title="Attach files" aria-label="Attach files">📎</button>
           <textarea id="input" rows="1" placeholder="Message the table…  (@claude, @codex, @both)"></textarea>
           <div id="stopWrap">
             <button id="stopBtn" title="Stop the running response" aria-haspopup="menu" aria-expanded="false">■</button>
@@ -464,7 +501,7 @@
           </div>
           <button id="sendBtn" title="Send (Enter)">➤</button>
         </div>
-        <div class="hint">Enter to send · Shift+Enter newline · <b>/help</b> for commands · replies stream live · both agents see the whole room</div>
+        <div class="hint">Enter to send · Shift+Enter newline · attach or drop files · paste images · <b>/help</b> for commands · replies stream live</div>
       </div>
     </div>
   </div>
@@ -480,7 +517,7 @@
     <div class="fld" style="margin-top:14px"><label>Project folder (blank = room's own sandbox workspace)</label>
       <div style="display:flex;gap:8px">
         <input id="s_projdir" placeholder="e.g. D:\Projects\my-app" spellcheck="false" style="flex:1">
-        <button class="btn" id="s_browse" type="button" style="white-space:nowrap">Browse…</button>
+        <button class="btn" id="s_browse" type="button" style="white-space:nowrap"><span data-picker-label>Browse…</span></button>
       </div>
       <div class="note">Point this room at a real project — the agents work and read there, and pick up its CLAUDE.md / AGENTS.md automatically. Changing it resets both agents' sessions.</div></div>
     <div class="mgrid" style="margin-top:14px">
@@ -524,6 +561,13 @@ const state = {
   summary: null,
   providers: {},     // provider catalog (label/avatar/color/fields) from the server
   chip: "auto",
+  chipRevision: 0,   // manual changes fence off older in-flight send responses
+  sendVersion: 0,    // only the newest send may synchronize the selected chip
+  draftImages: [],   // native image attachments waiting for the next successful send
+  draftFiles: [],    // other files waiting for the next successful send
+  sending: false,
+  attachmentUrls: new Map(), // room/id -> fetched blob URL
+  attachmentRevision: 0,    // retires fetches that finish after a reset/room switch
   es: null,
   live: {},          // agent -> { el, mode:"think"|"stream", startedAt, text }
   streamTimer: {},   // agent -> throttle timer
@@ -549,7 +593,7 @@ function toast(msg, isErr) {
 // This blocks blind/cross-origin requests; it is not a secret from local
 // processes, which can fetch the public page and read the embedded token.
 const TOKEN = (document.querySelector('meta[name="parley-token"]') || {}).content || "";
-const REQUIRED_RUNTIME_PROTOCOL = "1";
+const REQUIRED_RUNTIME_PROTOCOL = "4";
 const PAGE_RUNTIME_PROTOCOL = (document.querySelector('meta[name="parley-runtime-protocol"]') || {}).content || "";
 const withToken = (url) => url + (url.includes("?") ? "&" : "?") +
   "token=" + encodeURIComponent(TOKEN) + "&protocol=" + encodeURIComponent(REQUIRED_RUNTIME_PROTOCOL);
@@ -590,6 +634,129 @@ async function api(path, body) {
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || res.statusText);
   return data;
+}
+
+function clearAttachmentUrls() {
+  state.attachmentRevision++;
+  for (const value of state.attachmentUrls.values()) {
+    if (typeof value === "string") URL.revokeObjectURL(value);
+  }
+  state.attachmentUrls.clear();
+}
+
+async function attachmentBlobUrl(room, ref) {
+  const key = room + ":" + ref.id;
+  const revision = state.attachmentRevision;
+  const cached = state.attachmentUrls.get(key);
+  if (typeof cached === "string") return cached;
+  if (cached) return cached;
+  let pending;
+  pending = fetch("/api/attachment?room=" + encodeURIComponent(room) + "&id=" + encodeURIComponent(ref.id), {
+    headers: { "X-Parley-Token": TOKEN, "X-Parley-Runtime-Protocol": REQUIRED_RUNTIME_PROTOCOL },
+  }).then(async (res) => {
+    if (res.headers.get("x-parley-runtime-protocol") !== REQUIRED_RUNTIME_PROTOCOL) {
+      showRuntimeMismatch();
+      throw new Error("runtime mismatch");
+    }
+    if (!res.ok) throw new Error("attachment unavailable");
+    const objectUrl = URL.createObjectURL(await res.blob());
+    if (revision !== state.attachmentRevision) {
+      URL.revokeObjectURL(objectUrl);
+      throw new Error("stale attachment request");
+    }
+    state.attachmentUrls.set(key, objectUrl);
+    return objectUrl;
+  }).catch((e) => {
+    if (state.attachmentUrls.get(key) === pending) state.attachmentUrls.delete(key);
+    throw e;
+  });
+  state.attachmentUrls.set(key, pending);
+  return pending;
+}
+
+function formatBytes(value) {
+  const bytes = Number(value) || 0;
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(bytes >= 10 * 1024 * 1024 ? 0 : 1)} MB`;
+}
+
+function imageAttachment(ref) {
+  return ref && (ref.kind === "image" || (!ref.kind && /^image\//i.test(ref.mime || "")));
+}
+
+function renderEntryAttachments(entry, bubble) {
+  const refs = entry && entry.meta && Array.isArray(entry.meta.attachments)
+    ? entry.meta.attachments : [];
+  if (!refs.length) return;
+  const room = state.room;
+  const gallery = document.createElement("div");
+  gallery.className = "attachments";
+  for (const ref of refs) {
+    if (!imageAttachment(ref)) {
+      const card = document.createElement("button");
+      card.type = "button";
+      card.className = "attachment attachment-file";
+      card.title = `Download ${ref.name || "attached file"}`;
+      const icon = document.createElement("span");
+      icon.className = "attachment-file-icon";
+      icon.textContent = "📄";
+      const copy = document.createElement("span");
+      copy.className = "attachment-file-copy";
+      const name = document.createElement("span");
+      name.className = "attachment-name";
+      name.textContent = ref.name || "Attached file";
+      const size = document.createElement("span");
+      size.className = "attachment-file-size";
+      size.textContent = `${formatBytes(ref.size)} · click to download`;
+      copy.append(name, size);
+      card.append(icon, copy);
+      card.onclick = async () => {
+        if (card.disabled) return;
+        card.disabled = true;
+        const old = size.textContent;
+        size.textContent = "Preparing download…";
+        try {
+          const url = await attachmentBlobUrl(room, ref);
+          if (state.room !== room || ("isConnected" in card && !card.isConnected)) return;
+          const download = document.createElement("a");
+          download.href = url;
+          download.download = ref.name || "attachment";
+          document.body.appendChild(download);
+          download.click();
+          download.remove();
+          size.textContent = `${formatBytes(ref.size)} · downloaded`;
+        } catch {
+          size.textContent = `${formatBytes(ref.size)} · unavailable`;
+          toast(`${ref.name || "Attachment"} is unavailable.`, true);
+        } finally {
+          card.disabled = false;
+          if (size.textContent.endsWith("downloaded")) setTimeout(() => { size.textContent = old; }, 1500);
+        }
+      };
+      gallery.appendChild(card);
+      continue;
+    }
+    const link = document.createElement("a");
+    link.className = "attachment";
+    link.target = "_blank";
+    link.rel = "noopener";
+    link.title = ref.name || "Pasted image";
+    const img = document.createElement("img");
+    img.alt = ref.name || "Pasted image";
+    img.loading = "lazy";
+    const label = document.createElement("span");
+    label.className = "attachment-name";
+    label.textContent = ref.name || "Pasted image";
+    link.append(img, label);
+    gallery.appendChild(link);
+    attachmentBlobUrl(room, ref).then((url) => {
+      if (state.room !== room || ("isConnected" in img && !img.isConnected)) return;
+      img.src = url;
+      link.href = url;
+    }).catch(() => { label.textContent = `${ref.name || "Pasted image"} (unavailable)`; });
+  }
+  bubble.appendChild(gallery);
 }
 $("dlTranscript").onclick = async (ev) => {
   ev.preventDefault();
@@ -665,17 +832,29 @@ function renderMD(src) {
   t = t.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
 
   const lines = t.split(/\r?\n/);
-  let html = "", para = [], list = null; // list: {type, items}
+  let html = "", para = [], list = null, listGap = false; // list: {type, start, items}
   const flushPara = () => { if (para.length) { html += "<p>" + para.join("<br>") + "</p>"; para = []; } };
   const flushList = () => {
-    if (list) { html += `<${list.type}>` + list.items.map((i) => "<li>" + i + "</li>").join("") + `</${list.type}>`; list = null; }
+    if (list) {
+      const open = list.type === "ol" && list.start !== 1 ? `<ol start="${list.start}">` : `<${list.type}>`;
+      html += open + list.items.map((i) => "<li>" + i + "</li>").join("") + `</${list.type}>`;
+      list = null;
+    }
+    listGap = false;
+  };
+  // A blank line inside a list is a loose list, not a new one — closing here is
+  // what makes every item restart the numbering at 1.
+  const addItem = (type, text, start) => {
+    flushPara();
+    if (!list || list.type !== type) { flushList(); list = { type, start: start || 1, items: [] }; }
+    list.items.push(text); listGap = false;
   };
   for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
     const raw = lines[lineIndex];
     const line = raw.trimEnd();
     let m;
     if (SENT_LINE.test(line.trim())) { flushPara(); flushList(); html += line.trim(); continue; }
-    if (!line.trim()) { flushPara(); flushList(); continue; }
+    if (!line.trim()) { flushPara(); if (list) listGap = true; else flushList(); continue; }
     const header = splitTableRow(line);
     const alignments = header && lineIndex + 1 < lines.length
       ? tableAlignments(lines[lineIndex + 1].trim(), header.length)
@@ -700,15 +879,15 @@ function renderMD(src) {
     }
     if ((m = /^(#{1,4})\s+(.*)$/.exec(line))) { flushPara(); flushList(); html += `<h${m[1].length}>${m[2]}</h${m[1].length}>`; continue; }
     if (/^(---|\*\*\*|___)$/.test(line.trim())) { flushPara(); flushList(); html += "<hr>"; continue; }
-    if ((m = /^\s*[-*+]\s+(.*)$/.exec(line))) {
-      flushPara(); if (!list || list.type !== "ul") { flushList(); list = { type: "ul", items: [] }; }
-      list.items.push(m[1]); continue;
-    }
-    if ((m = /^\s*\d+[.)]\s+(.*)$/.exec(line))) {
-      flushPara(); if (!list || list.type !== "ol") { flushList(); list = { type: "ol", items: [] }; }
-      list.items.push(m[1]); continue;
-    }
+    if ((m = /^\s*[-*+]\s+(.*)$/.exec(line))) { addItem("ul", m[1]); continue; }
+    if ((m = /^\s*(\d+)[.)]\s+(.*)$/.exec(line))) { addItem("ol", m[2], Number(m[1])); continue; }
     if ((m = /^&gt;\s?(.*)$/.exec(line))) { flushPara(); flushList(); html += "<blockquote>" + m[1] + "</blockquote>"; continue; }
+    // Wrapped or indented text belongs to the item above it; only an
+    // unindented line after a blank one starts something new.
+    if (list && list.items.length && (!listGap || /^\s{2,}\S/.test(raw))) {
+      list.items[list.items.length - 1] += (listGap ? "<br><br>" : "<br>") + line.trim();
+      listGap = false; continue;
+    }
     flushList(); para.push(line);
   }
   flushPara(); flushList();
@@ -750,7 +929,12 @@ function scrollBottom(force) {
   if (force || nearBottom()) { chatWrap.scrollTop = chatWrap.scrollHeight; $("jump").style.display = "none"; }
   else $("jump").style.display = "block";
 }
-chatWrap.addEventListener("scroll", () => { if (nearBottom()) $("jump").style.display = "none"; });
+chatWrap.addEventListener("scroll", () => {
+  if (nearBottom()) $("jump").style.display = "none";
+  // Scrolling to the top is the second path into "Show earlier ▸"; the button
+  // stays as the discoverable one.
+  if (chatWrap.scrollTop < 80) expandHistory();
+});
 $("jump").onclick = () => scrollBottom(true);
 
 // Receipt dots: for each participant other than the author, show whether they
@@ -829,8 +1013,13 @@ function entryEl(e) {
   // a pair turn is a review or a fix, never a generic "follow-up"
   const pairTag = e.meta && e.meta.pair && typeof e.meta.pair === "string"
     ? ` <span style="opacity:.6">· 🔁 ${e.meta.pair} r${e.meta.round}</span>` : "";
+  // Only what `deferred` actually records: this seat was busy when the message
+  // arrived, so its half ran later. Whether it had read the other seat's answer
+  // by then depends on which seat freed first, so the badge doesn't claim it.
+  const deferTag = e.meta && e.meta.deferred
+    ? ' <span style="opacity:.6" title="This agent was busy when you sent the message, so its half of it ran later">· ⏳ delayed</span>' : "";
   const lurkTag = pairTag || (e.meta && e.meta.lurk ? ' <span style="opacity:.6">· 👂 chimed in</span>'
-    : e.meta && e.meta.hop && !(e.meta && e.meta.pair) ? ' <span style="opacity:.6">· ⛓ follow-up</span>' : "");
+    : e.meta && e.meta.hop && !(e.meta && e.meta.pair) ? ' <span style="opacity:.6">· ⛓ follow-up</span>' : deferTag);
   const userPair = e.meta && e.meta.pair && typeof e.meta.pair === "object"
     ? ` · 🔁 pair ×${e.meta.pair.rounds} (${e.meta.pair.worker} works, ${e.meta.pair.reviewer} reviews)` : "";
   const label = e.kind === "user"
@@ -840,6 +1029,7 @@ function entryEl(e) {
   div.innerHTML = `<div class="meta">${av}<span class="who">${label}</span><span>${hhmm(e.ts)}${dur}${tok}</span>` +
     `<button class="cpy" title="Copy message">📋</button></div>` +
     `<div class="bubble">${renderMD(e.text)}</div>` + heardHTML(e);
+  renderEntryAttachments(e, div.querySelector(".bubble"));
   if ((e.text || "").length > 2500) {
     const bub = div.querySelector(".bubble");
     const key = e.n === undefined || e.n === null ? null : String(e.n);
@@ -932,6 +1122,21 @@ function renderedStartIndex() {
   return after >= 0 ? after : state.entries.length;
 }
 
+// Reveal the whole transcript, keeping the reader on the entry they were looking
+// at. The anchor correction must be instant: #chatWrap scrolls smoothly, and
+// animating it fights an in-flight scroll and reads as a lurch.
+function expandHistory() {
+  if (state.renderFromN === null) return;
+  const beforeHeight = chatWrap.scrollHeight;
+  const beforeTop = chatWrap.scrollTop;
+  const behavior = chatWrap.style.scrollBehavior;
+  chatWrap.style.scrollBehavior = "auto";
+  state.renderFromN = null;
+  renderAll({ stickToBottom: false });
+  chatWrap.scrollTop = beforeTop + chatWrap.scrollHeight - beforeHeight;
+  chatWrap.style.scrollBehavior = behavior;
+}
+
 function renderAll({ stickToBottom = true, preserveTransient = true } = {}) {
   const oldTop = chatWrap.scrollTop;
   // Re-rendering the durable transcript must not erase a whisper or a local
@@ -949,13 +1154,7 @@ function renderAll({ stickToBottom = true, preserveTransient = true } = {}) {
     earlier.className = "history-more";
     earlier.textContent = "Show earlier ▸";
     earlier.title = `${start} earlier entr${start === 1 ? "y" : "ies"}`;
-    earlier.onclick = () => {
-      const beforeHeight = chatWrap.scrollHeight;
-      const beforeTop = chatWrap.scrollTop;
-      state.renderFromN = null;
-      renderAll({ stickToBottom: false });
-      chatWrap.scrollTop = beforeTop + chatWrap.scrollHeight - beforeHeight;
-    };
+    earlier.onclick = expandHistory;
     frag.appendChild(earlier);
   }
   appendEntryRange(frag, state.entries.slice(start));
@@ -1275,9 +1474,16 @@ document.querySelectorAll(".mbtn").forEach((b) => {
     catch (e) { toast(e.message, true); }
   };
 });
+// Two different questions. `working` — any chain mid-flight, including the gaps
+// between its turns — decides whether Stop is offered at all, so it doesn't
+// blink out between an agent's reply and the follow-up it triggers.
+// `workingPair` is narrower and controls wording only. The chooser follows the
+// whole exchange: when one half of @both finishes first, the remaining seat
+// must still be stoppable without turning the main button into Stop-all.
+const stopIsChoice = (s) => (s.busy || []).length > 1 || s.queued > 0 ||
+  (!!s.working && (s.busy || []).length > 0);
+
 function updateBusyUI() {
-  // `working` covers the gaps between a chain's turns, so Stop doesn't blink
-  // out mid pair cycle when neither agent happens to be running yet.
   const summary = state.summary;
   const active = summary ? summary.busy : [];
   const visible = !!summary && (active.length > 0 || summary.working);
@@ -1288,9 +1494,10 @@ function updateBusyUI() {
     $("stopBtn").setAttribute("aria-expanded", "false");
     return;
   }
-  const choose = active.length > 1 || summary.queued > 0 || (summary.working && active.length > 0);
+  const choose = stopIsChoice(summary);
   $("stopBtn").title = choose ? "Choose which response to stop" :
-    active.length === 1 ? `Stop ${seatLabel(active[0])}` : "Stop the pair cycle";
+    active.length === 1 ? `Stop ${seatLabel(active[0])}` :
+      summary.workingPair ? "Stop the pair cycle" : "Stop the exchange";
   $("stopMenu").innerHTML = active.map((a) =>
     `<button role="menuitem" data-stop-agent="${esc(a)}">■ Stop ${esc(seatLabel(a))}</button>`).join("") +
     (choose ? `<button role="menuitem" class="stop-all" data-stop-agent="">■ Stop all</button>` : "");
@@ -1324,6 +1531,15 @@ function updateRouteHint() {
     || (state.chip !== "auto" ? state.chip : (state.summary.lastAddressed || state.summary.cfg.defaultAgent));
   const disc = t === "both" && (state.summary.cfg.mode || "talk") === "work" ? " · discussion (no edits)" : "";
   $("routeHint").textContent = "→ " + (t === "both" ? state.summary.seats.join(" + ") : t) + disc;
+}
+function selectChip(target) {
+  const chips = [...document.querySelectorAll(".chip")];
+  const chip = chips.find((candidate) => candidate.dataset.t === String(target));
+  if (!chip) return false;
+  state.chip = String(target);
+  chips.forEach((x) => x.classList.toggle("active", x === chip));
+  updateRouteHint();
+  return true;
 }
 $("pairEndBtn").onclick = async () => {
   try { await api("/api/message", { room: state.room, text: "/pair end", target: "auto" }); }
@@ -1412,6 +1628,8 @@ function connect(resyncOnOpen = false) {
     }
     else if (msg.type === "reset") {
       state.resyncVersion++;
+      clearDraftAttachments();
+      clearAttachmentUrls();
       clearLive();
       state.entries = [];
       state.receipts = [];
@@ -1433,6 +1651,7 @@ function connect(resyncOnOpen = false) {
 
 // ------------------------------------------------------------ load room
 async function loadRoom(name) {
+  retireSettingsPick(); // a folder dialog open for the old room must not land here
   let data;
   try {
     data = await api("/api/room?name=" + encodeURIComponent(name));
@@ -1447,6 +1666,8 @@ async function loadRoom(name) {
     old.close();
   }
   $("connDot").classList.remove("on");
+  clearDraftAttachments();
+  clearAttachmentUrls();
   state.resyncVersion++;
   state.eventVersion++;
   const roomName = data.room.name || name;
@@ -1538,6 +1759,166 @@ function fillSeatPickers() {
 
 // ------------------------------------------------------------ composer
 const input = $("input");
+const PASTE_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+const PASTE_IMAGE_EXTENSIONS = new Map([
+  ["png", "image/png"], ["jpg", "image/jpeg"], ["jpeg", "image/jpeg"],
+  ["gif", "image/gif"], ["webp", "image/webp"],
+]);
+const PASTE_IMAGE_MAX = 4;
+const ATTACHMENT_MAX = 8;
+const ATTACHMENT_BYTES = 5 * 1024 * 1024;
+const ATTACHMENT_TOTAL = 6 * 1024 * 1024;
+
+function draftAttachmentCount() {
+  return state.draftImages.length + state.draftFiles.length;
+}
+
+function draftAttachmentBytes() {
+  return [...state.draftImages, ...state.draftFiles].reduce((n, draft) => n + draft.file.size, 0);
+}
+
+function nativeImageMime(file) {
+  const type = String(file.type || "").toLowerCase();
+  if (PASTE_IMAGE_TYPES.has(type)) return type;
+  if (type) return null;
+  const match = /\.([^.]+)$/.exec(String(file.name || "").toLowerCase());
+  return match ? PASTE_IMAGE_EXTENSIONS.get(match[1]) || null : null;
+}
+
+function renderDraftAttachments() {
+  const row = $("draftImages");
+  row.innerHTML = "";
+  row.classList.toggle("show", draftAttachmentCount() > 0);
+  for (const draft of state.draftImages) {
+    const item = document.createElement("div");
+    item.className = "draft-image";
+    item.title = draft.file.name || "Pasted image";
+    const img = document.createElement("img");
+    img.src = draft.url;
+    img.alt = draft.file.name || "Pasted image";
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.title = "Remove image";
+    remove.textContent = "×";
+    remove.onclick = () => clearDraftImages([draft.id]);
+    item.append(img, remove);
+    row.appendChild(item);
+  }
+  for (const draft of state.draftFiles) {
+    const item = document.createElement("div");
+    item.className = "draft-file";
+    item.title = draft.file.name || "Attached file";
+    const icon = document.createElement("span");
+    icon.className = "draft-file-icon";
+    icon.textContent = "📄";
+    const copy = document.createElement("span");
+    copy.className = "draft-file-copy";
+    const name = document.createElement("span");
+    name.className = "draft-file-name";
+    name.textContent = draft.file.name || "Attached file";
+    const size = document.createElement("span");
+    size.className = "draft-file-size";
+    size.textContent = formatBytes(draft.file.size);
+    copy.append(name, size);
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.title = "Remove file";
+    remove.textContent = "×";
+    remove.onclick = () => clearDraftFiles([draft.id]);
+    item.append(icon, copy, remove);
+    row.appendChild(item);
+  }
+}
+
+function clearDraftImages(ids = null) {
+  const remove = ids ? new Set(ids) : null;
+  const keep = [];
+  for (const draft of state.draftImages) {
+    if (!remove || remove.has(draft.id)) URL.revokeObjectURL(draft.url);
+    else keep.push(draft);
+  }
+  state.draftImages = keep;
+  renderDraftAttachments();
+}
+
+function clearDraftFiles(ids = null) {
+  const remove = ids ? new Set(ids) : null;
+  state.draftFiles = remove ? state.draftFiles.filter((draft) => !remove.has(draft.id)) : [];
+  renderDraftAttachments();
+}
+
+function clearDraftAttachments() {
+  for (const draft of state.draftImages) URL.revokeObjectURL(draft.url);
+  state.draftImages = [];
+  state.draftFiles = [];
+  renderDraftAttachments();
+}
+
+function addDraftImages(files) {
+  for (const file of files) {
+    const mime = nativeImageMime(file);
+    if (!mime) {
+      toast("Paste PNG, JPEG, GIF, or WebP images.", true);
+      continue;
+    }
+    if (file.size > ATTACHMENT_BYTES) {
+      toast("Each attachment must be 5 MB or smaller.", true);
+      continue;
+    }
+    if (state.draftImages.length >= PASTE_IMAGE_MAX) {
+      toast("Attach at most 4 images to one message.", true);
+      break;
+    }
+    if (draftAttachmentCount() >= ATTACHMENT_MAX) {
+      toast("Attach at most 8 files and images to one message.", true);
+      break;
+    }
+    if (draftAttachmentBytes() + file.size > ATTACHMENT_TOTAL) {
+      toast("Attachments must total 6 MB or less.", true);
+      continue;
+    }
+    state.draftImages.push({ id: crypto.randomUUID(), file, mime, url: URL.createObjectURL(file) });
+  }
+  renderDraftAttachments();
+}
+
+function addDraftFiles(files) {
+  for (const file of files) {
+    if (nativeImageMime(file)) {
+      addDraftImages([file]);
+      continue;
+    }
+    if (file.size > ATTACHMENT_BYTES) {
+      toast("Each attachment must be 5 MB or smaller.", true);
+      continue;
+    }
+    if (draftAttachmentCount() >= ATTACHMENT_MAX) {
+      toast("Attach at most 8 files and images to one message.", true);
+      break;
+    }
+    if (draftAttachmentBytes() + file.size > ATTACHMENT_TOTAL) {
+      toast("Attachments must total 6 MB or less.", true);
+      continue;
+    }
+    state.draftFiles.push({ id: crypto.randomUUID(), file });
+  }
+  renderDraftAttachments();
+}
+
+function fileBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error(`Could not read ${file.name || "the attachment"}.`));
+    reader.onload = () => {
+      const value = String(reader.result || "");
+      const comma = value.indexOf(",");
+      if (comma < 0) return reject(new Error(`Could not read ${file.name || "the attachment"}.`));
+      resolve(value.slice(comma + 1));
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
 function autosize() { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, 200) + "px"; }
 input.addEventListener("input", () => { autosize(); updateRouteHint(); mentionCheck(); });
 
@@ -1582,7 +1963,18 @@ async function handleSlash(text) {
 
 async function send() {
   const text = input.value.trim();
-  if (!text) return;
+  const imageDrafts = [...state.draftImages];
+  const fileDrafts = [...state.draftFiles];
+  if ((!text && !imageDrafts.length && !fileDrafts.length) || state.sending) return;
+  if (text.startsWith("/") && (imageDrafts.length || fileDrafts.length) && !/^\/pair\b/i.test(text)) {
+    toast("Attachments can accompany messages or /pair tasks, not local slash commands.", true);
+    return;
+  }
+  const sentRoom = state.room;
+  const sentTarget = state.chip;
+  const sentResync = state.resyncVersion;
+  const chipRevision = state.chipRevision;
+  const sendVersion = ++state.sendVersion;
   if (text.startsWith("/")) {
     input.value = ""; autosize(); hideMention();
     const handled = await handleSlash(text);
@@ -1590,12 +1982,72 @@ async function send() {
   } else {
     input.value = ""; autosize(); hideMention();
   }
+  state.sending = true;
+  $("sendBtn").disabled = true;
   try {
-    const r = await api("/api/message", { room: state.room, text, target: state.chip });
-    if (r.queued) toast(`⏳ Queued (#${r.position}) — sends when the table quiets down.`);
-  } catch (e) { toast(e.message, true); input.value = text; autosize(); }
+    const images = await Promise.all(imageDrafts.map(async (draft) => ({
+      name: draft.file.name || "pasted-image",
+      mime: draft.mime || draft.file.type,
+      data: await fileBase64(draft.file),
+    })));
+    const files = await Promise.all(fileDrafts.map(async (draft) => ({
+      name: draft.file.name || "attachment",
+      mime: draft.file.type || "application/octet-stream",
+      data: await fileBase64(draft.file),
+    })));
+    const r = await api("/api/message", { room: sentRoom, text, target: sentTarget, images, files });
+    clearDraftImages(imageDrafts.map((draft) => draft.id));
+    clearDraftFiles(fileDrafts.map((draft) => draft.id));
+    if (r.explicit && r.target && state.room === sentRoom && state.resyncVersion === sentResync &&
+        state.chipRevision === chipRevision && state.sendVersion === sendVersion) {
+      selectChip(r.target);
+    }
+    if (r.queued) toast(`⏳ Queued (#${r.position}) — sends when the target lane is free.`);
+    // Partly delivered: the free seat is already answering, the busy one is next.
+    else if (r.deferred && r.deferred.length) {
+      toast(`⏳ ${r.deferred.join(" and ")} still working — reaches them as soon as they're free.`);
+    }
+  } catch (e) {
+    toast(e.message, true);
+    if (state.room === sentRoom && !input.value.trim()) { input.value = text; autosize(); }
+  } finally {
+    state.sending = false;
+    $("sendBtn").disabled = false;
+  }
 }
 $("sendBtn").onclick = send;
+$("attachBtn").onclick = () => {
+  if (state.sending) return toast("Wait for the current message to finish sending.", true);
+  $("fileInput").click();
+};
+$("fileInput").addEventListener("change", (e) => {
+  const files = [...(e.target.files || [])];
+  e.target.value = ""; // allow choosing the same file again after removing it
+  if (!files.length) return;
+  if (state.sending) return toast("Wait for the current message to finish sending.", true);
+  addDraftFiles(files);
+});
+function dragCarriesFiles(e) {
+  const transfer = e && e.dataTransfer;
+  return !!transfer && ((transfer.files && transfer.files.length > 0) ||
+    Array.from(transfer.types || []).includes("Files"));
+}
+// Without cancelling the browser's default file-drop behaviour, Chrome
+// navigates away from Parley and opens the dropped file. Keep the whole window
+// safe as a target, then feed the exact same validation path as the paperclip.
+window.addEventListener("dragover", (e) => {
+  if (!dragCarriesFiles(e)) return;
+  e.preventDefault();
+  if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+});
+window.addEventListener("drop", (e) => {
+  if (!dragCarriesFiles(e)) return;
+  e.preventDefault();
+  const files = [...(e.dataTransfer.files || [])];
+  if (!files.length) return;
+  if (state.sending) return toast("Wait for the current message to finish sending.", true);
+  addDraftFiles(files);
+});
 async function stopResponses(agent) {
   $("stopWrap").classList.remove("open");
   $("stopBtn").setAttribute("aria-expanded", "false");
@@ -1606,8 +2058,7 @@ async function stopResponses(agent) {
 $("stopBtn").onclick = () => {
   if (!state.summary) return;
   const active = state.summary.busy || [];
-  const choose = active.length > 1 || state.summary.queued > 0 || (state.summary.working && active.length > 0);
-  if (!choose) return stopResponses(active[0] || null);
+  if (!stopIsChoice(state.summary)) return stopResponses(active[0] || null);
   const wrap = $("stopWrap");
   const open = wrap.classList.toggle("open");
   $("stopBtn").setAttribute("aria-expanded", String(open));
@@ -1620,14 +2071,21 @@ input.addEventListener("keydown", (e) => {
   if (mentionKeydown(e)) return;
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
 });
+input.addEventListener("paste", (e) => {
+  const items = [...(e.clipboardData && e.clipboardData.items || [])];
+  const files = items.filter((item) => item.kind === "file" && /^image\//i.test(item.type || ""))
+    .map((item) => item.getAsFile()).filter(Boolean);
+  if (!files.length) return; // leave ordinary text paste to the browser
+  e.preventDefault();
+  if (state.sending) return toast("Wait for the current message to finish sending.", true);
+  addDraftImages(files);
+});
 
 $("chipsRow").addEventListener("click", (e) => {
   const c = e.target.closest(".chip");
   if (!c) return;
-  document.querySelectorAll(".chip").forEach((x) => x.classList.remove("active"));
-  c.classList.add("active");
-  state.chip = c.dataset.t;
-  updateRouteHint();
+  state.chipRevision++;
+  selectChip(c.dataset.t);
   input.focus();
 });
 $("starters").addEventListener("click", (e) => {
@@ -1682,13 +2140,26 @@ function mentionKeydown(e) {
 
 // ------------------------------------------------------------ rooms sidebar
 $("addRoomBtn").onclick = () => {
+  clearNewRoomProject(); // a fresh form never inherits the last one's folder
   $("newRoomForm").style.display = "block";
   $("newRoomInput").focus();
 };
 let newRoomProjectDir = null;
+// The OS dialog isn't modal to this page, so the form can be submitted while it
+// is still open. Each pick is stamped, and anything that ends the form's life
+// moves the stamp on: a result that arrives after that belongs to a form the
+// user already finished with, and must not seed the next room's folder.
+let newRoomPick = 0;
+function clearNewRoomProject() {
+  newRoomPick++;
+  newRoomProjectDir = null;
+  $("newRoomProjVal").textContent = "";
+  $("newRoomProj").style.color = "var(--text-faint)";
+}
 $("newRoomProj").onclick = async () => {
-  const r = await browseFolder();
-  if (!r) return;
+  const pick = ++newRoomPick;
+  const r = await browseFolder(null, $("newRoomProj"));
+  if (pick !== newRoomPick || !r) return; // superseded while the dialog was open
   newRoomProjectDir = r;
   $("newRoomProjVal").textContent = "— " + r.split(/[\\/]/).pop();
   $("newRoomProj").style.color = "var(--text-dim)";
@@ -1702,28 +2173,45 @@ $("newRoomForm").onsubmit = async (e) => {
   const body = { name };
   if (seats.length === 2) body.seats = seats;
   if (newRoomProjectDir) body.projectDir = newRoomProjectDir;
+  // Retire this form's pick: a dialog still open belongs to the room being
+  // created now, not to whatever is typed next. The chosen folder itself is
+  // only cleared on success — a rejected name leaves the form up, and the user
+  // shouldn't have to pick their project again to fix a typo.
+  newRoomPick++;
   try {
     await api("/api/rooms", body);
     $("newRoomInput").value = "";
     $("newRoomForm").style.display = "none";
-    newRoomProjectDir = null;
-    $("newRoomProjVal").textContent = "";
-    $("newRoomProj").style.color = "var(--text-faint)";
+    clearNewRoomProject();
     await loadRoom(name);
   } catch (err) { toast(err.message, true); }
 };
 // Ask the server to open the OS folder dialog; returns a path or null.
-async function browseFolder(start) {
-  toast("Opening the folder picker — check the taskbar if it doesn't come forward.");
+// The dialog is modal on the desktop but not in this page, so the button that
+// opened it is held down until it closes — otherwise a second click stacks
+// another dialog behind the first.
+// The "Choosing…" swap touches a dedicated label span, never the button's own
+// contents. One of these buttons also holds a live element (#newRoomProjVal)
+// that other code writes to while the dialog is open — rewriting the button's
+// text destroys it, and the next write to it throws.
+async function browseFolder(start, btn) {
+  const label = btn && btn.querySelector("[data-picker-label]");
+  const original = label && label.textContent;
+  if (btn) { btn.disabled = true; if (label) label.textContent = "Choosing…"; }
+  toast("Opening the folder picker… If Windows keeps it behind, choose ‘Parley — Choose a project folder’ from the taskbar.");
   try {
     const r = await api("/api/pickfolder", { start: start || null });
     if (r.error) { toast(r.error, true); return null; }
     return r.cancelled ? null : r.path;
   } catch (e) { toast(e.message, true); return null; }
+  finally { if (btn) { btn.disabled = false; if (label) label.textContent = original; } }
 }
 $("s_browse").onclick = async () => {
-  const picked = await browseFolder($("s_projdir").value.trim() || null);
-  if (picked) $("s_projdir").value = picked;
+  const pick = ++settingsPick;
+  const openedFor = state.room;
+  const picked = await browseFolder($("s_projdir").value.trim() || null, $("s_browse"));
+  if (pick !== settingsPick || state.room !== openedFor || !picked) return;
+  $("s_projdir").value = picked;
 };
 $("openWs").onclick = () => api("/api/open", { room: state.room, what: "workspace" })
   .then(() => toast("📁 Workspace opened in Explorer — check the taskbar if it isn't in front."))
@@ -1886,8 +2374,19 @@ function renderSeatCards(s) {
     }
   }
 }
+// The folder dialog is not modal to this page, so Settings can be closed,
+// saved, or pointed at a different room while it is still open. Every one of
+// those retires the stamp, and a result that comes back against a retired stamp
+// is dropped rather than written into whatever room is on screen by then.
+let settingsPick = 0;
+function retireSettingsPick() { settingsPick++; }
+function closeSettings() {
+  retireSettingsPick();
+  $("overlay").classList.remove("open");
+}
 function openSettings() {
   const s = state.summary; if (!s) return;
+  retireSettingsPick();
   $("roomPath").textContent = s.dir;
   $("mDelete").hidden = s.name === "default"; // the fallback room can't be removed
   renderSeatCards(s);
@@ -1902,9 +2401,9 @@ function openSettings() {
 }
 $("settingsBtn").onclick = openSettings;
 $("settingsBtn2").onclick = openSettings;
-$("mCancel").onclick = () => $("overlay").classList.remove("open");
-$("overlay").addEventListener("click", (e) => { if (e.target === $("overlay")) $("overlay").classList.remove("open"); });
-document.addEventListener("keydown", (e) => { if (e.key === "Escape") $("overlay").classList.remove("open"); });
+$("mCancel").onclick = () => closeSettings();
+$("overlay").addEventListener("click", (e) => { if (e.target === $("overlay")) closeSettings(); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeSettings(); });
 $("mSave").onclick = async () => {
   const s = state.summary; if (!s) return;
   const agents = {};
@@ -1935,26 +2434,35 @@ $("mSave").onclick = async () => {
       if (!accepted) return;
     }
   }
+  // Build the request from what is on screen now, then retire the picker: a
+  // dialog that resolves while the save is in flight would otherwise fill the
+  // field with a folder this request did not carry.
+  const config = {
+    defaultAgent: $("s_default").value,
+    timeoutMs: Math.max(10, Number($("s_timeout").value) || 300) * 1000,
+    maxHops: Math.min(8, Math.max(0, Number($("s_maxhops").value) || 0)),
+    pairRounds: Math.min(99, Math.max(0, Number($("s_pairrounds").value) || 0)),
+    projectDir: $("s_projdir").value.trim() || null,
+    roomNote: $("s_roomnote").value.trim() || null,
+    agents,
+  };
+  retireSettingsPick();
   try {
-    await api("/api/config", {
-      room: state.room,
-      config: {
-        defaultAgent: $("s_default").value,
-        timeoutMs: Math.max(10, Number($("s_timeout").value) || 300) * 1000,
-        maxHops: Math.min(8, Math.max(0, Number($("s_maxhops").value) || 0)),
-        pairRounds: Math.min(99, Math.max(0, Number($("s_pairrounds").value) || 0)),
-        projectDir: $("s_projdir").value.trim() || null,
-        roomNote: $("s_roomnote").value.trim() || null,
-        agents,
-      },
-    });
-    $("overlay").classList.remove("open");
-    toast("Settings saved.");
+    const saved = await api("/api/config", { room: state.room, config });
+    closeSettings();
+    // The panel above already shows the new permission, but a CLI process that
+    // has launched cannot be changed. Say what the user is actually watching —
+    // scoped to the run in flight, since a recovery retry would relaunch under
+    // the new settings within that same reply.
+    const late = (saved && saved.runningInvocations) || [];
+    toast(late.length
+      ? `Saved — ${late.join(" and ")} ${late.length > 1 ? "are" : "is"} mid-answer, and the ${late.length > 1 ? "runs" : "run"} already in progress ${late.length > 1 ? "keep" : "keeps"} the previous permissions.`
+      : "Settings saved.");
   } catch (e) { toast(e.message, true); }
 };
 async function newConversation() {
   if (!confirm("Archive this conversation and reset both agents' sessions?")) return;
-  try { await api("/api/new", { room: state.room }); $("overlay").classList.remove("open"); }
+  try { await api("/api/new", { room: state.room }); closeSettings(); }
   catch (e) { toast(e.message, true); }
 }
 // Rename/delete work on any room — the one you're viewing (Settings) or one
@@ -1974,7 +2482,7 @@ async function renameFlow(name) {
   if (warn && !confirm(`Rename "${name}" → "${t}"?${warn}`)) return;
   try {
     const r = await api("/api/room/rename", { room: name, to: t });
-    $("overlay").classList.remove("open");
+    closeSettings();
     // Follow the successful response too: the SSE notification may have been
     // missed while disconnected. The shared helper is idempotent if it arrived.
     followRoomRename(name, r.name);
@@ -1993,7 +2501,7 @@ async function deleteFlow(name) {
   if (!confirm(`Delete room "${name}"?\n\n${msgs} message${msgs === 1 ? "" : "s"} and its transcript will be moved to .parley/.trash — recoverable from your file manager until you clear it.${where}`)) return;
   try {
     const r = await api("/api/room/delete", { room: name });
-    $("overlay").classList.remove("open");
+    closeSettings();
     toast(`"${name}" moved to .trash — restore or clear it from your file manager.`);
     if (state.room === name) {
       if (state.es) { state.es.close(); state.es = null; }

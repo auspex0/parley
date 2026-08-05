@@ -13,6 +13,8 @@
  *                   block (proves the delta protocol relayed the other agent)
  *   LURKARGS        expose argv from a listener turn
  *   REVIEWARGS      expose argv from a pair-review turn
+ *   IMAGEINFO       report the images received through the provider's native input
+ *   FILEINFO        report generic files received through Parley's staged input
  *   ARGJSON         reply with argv as JSON (avoids briefing text ambiguity)
  *   ARGS            reply with the argv it was invoked with (proves flags:
  *                   --resume, --permission-mode, --effort, --sandbox …)
@@ -28,10 +30,15 @@
  *   NEEDSFIX        as reviewer in a pair session, demand a fix in round 1
  *   SHOWCASE        use a polished two-round pair exchange for UI demos
  *   NEVERHAPPY      as reviewer, never approve (used to reach the round cap)
+ *   SLOWREVIEW      keep a pair-review hop open long enough to stop it
+ *   SLOWFIX         with NEVERHAPPY, make the fix turn slow enough to interrupt
  *   SLEEP:<ms>      stay busy this long before replying (occupies a seat)
  *   FAILONCE:<id>   fail one process invocation, then succeed on explicit Retry
+ *   FAILONCESEAT:<seat>  as FAILONCE, but only on that seat's CLI
  *   RESUMEERROR     fail a resumed invocation with a generic provider error
  *   MISSINGSESSION  fail a resumed invocation as a missing native session
+ *   RESUMEDELAY:<ms> hold a resumed invocation open before it fails, so a test
+ *                   can change settings while the first attempt is still running
  *   SPAWNCHILD:<id> spawn a delayed sentinel child (proves Stop kills the tree)
  *   REVIEWFAILONCE  fail one logical pair-review turn, then review normally
  *   FIXFAILONCE     request a fix, then fail one logical pair-fix turn
@@ -45,17 +52,78 @@ import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 
 const argv = process.argv.slice(2);
-const codexMode = argv[0] === "exec";
+// Codex global options may precede `exec` (notably Parley's isolated
+// `--add-dir`). Find the subcommand instead of assuming argv[0].
+const execIndex = argv.indexOf("exec");
+const codexMode = execIndex >= 0;
 const arg = (flag) => { const i = argv.indexOf(flag); return i >= 0 ? argv[i + 1] : null; };
-const nativeResume = codexMode ? argv[1] === "resume" : !!arg("--resume");
+const nativeResume = codexMode ? argv[execIndex + 1] === "resume" : !!arg("--resume");
 
-const prompt = await new Promise((resolve) => {
+const rawInput = await new Promise((resolve) => {
   let s = "";
   process.stdin.setEncoding("utf8");
   process.stdin.on("data", (d) => { s += d; });
   process.stdin.on("end", () => resolve(s));
   if (process.stdin.isTTY) resolve("");
 });
+
+let prompt = rawInput;
+const receivedImages = [];
+if (!codexMode && arg("--input-format") === "stream-json") {
+  const line = rawInput.split(/\r?\n/).find((value) => value.trim());
+  let event;
+  try { event = JSON.parse(line || "{}"); } catch { event = {}; }
+  const content = event && event.message && Array.isArray(event.message.content)
+    ? event.message.content : [];
+  prompt = content.filter((part) => part.type === "text").map((part) => part.text || "").join("\n");
+  for (const part of content.filter((value) => value.type === "image" && value.source)) {
+    const bytes = Buffer.from(String(part.source.data || ""), "base64");
+    receivedImages.push({ mime: part.source.media_type || "", bytes });
+  }
+} else if (codexMode) {
+  // Mirror the real parser closely enough to catch a subtle argv regression:
+  // fresh `exec --image` consumes multiple values, while resume consumes one.
+  // A bare `-` after a fresh image flag is therefore an image path unless a
+  // recognized option (Parley uses --json) terminates that variadic list.
+  const imagePaths = [];
+  let promptOnStdin = false;
+  for (let i = execIndex + 1; i < argv.length; i++) {
+    if (argv[i] !== "--image" && argv[i] !== "-i") {
+      if (argv[i] === "-") promptOnStdin = true;
+      continue;
+    }
+    if (nativeResume) {
+      if (i + 1 < argv.length) imagePaths.push(argv[++i]);
+      continue;
+    }
+    while (i + 1 < argv.length && (argv[i + 1] === "-" || !argv[i + 1].startsWith("-"))) {
+      imagePaths.push(argv[++i]);
+    }
+  }
+  for (const imagePath of imagePaths) {
+    if (imagePath === "-") {
+      receivedImages.push({ mime: "", bytes: Buffer.alloc(0), path: imagePath, swallowedPrompt: true });
+      continue;
+    }
+    try {
+      const bytes = fs.readFileSync(imagePath);
+      receivedImages.push({ mime: "", bytes, path: imagePath, promptOnStdin });
+    } catch { /* the adapter test will expose the missing image */ }
+  }
+}
+
+const receivedFiles = [];
+const fileMarker = /\[Attached file: ("(?:\\.|[^"\\])*") \([^;\]]+\); temporary path: ("(?:\\.|[^"\\])*")\./g;
+for (const match of prompt.matchAll(fileMarker)) {
+  let name, filePath;
+  try { name = JSON.parse(match[1]); filePath = JSON.parse(match[2]); } catch { continue; }
+  try {
+    const bytes = fs.readFileSync(filePath);
+    receivedFiles.push({ name, path: filePath, bytes, addDir: arg("--add-dir") });
+  } catch {
+    receivedFiles.push({ name, path: filePath, bytes: Buffer.alloc(0), addDir: arg("--add-dir"), missing: true });
+  }
+}
 
 // Only the *current* instruction should drive behaviour — earlier turns are
 // replayed inside the room-activity block and must not re-trigger directives.
@@ -84,7 +152,9 @@ if (isReview) {
   const failFix = has("FIXFAILONCE", prompt);
   if (has("REVIEWARGS", prompt)) reply = "ARGVJSON " + JSON.stringify(argv);
   else
-  reply = stubborn ? "Still not right — try again. NEVERHAPPY"
+  // SLOWFIX rides into the feedback so the *fix* turn that reads it is slow
+  // enough for a test to interrupt deliberately.
+  reply = stubborn ? "Still not right — try again. NEVERHAPPY" + (has("SLOWFIX", prompt) ? " SLEEP:3000" : "")
     : firstPass && showcase ? "One issue: add a reminder to redact diagnostics before sharing them."
       : firstPass ? "Not quite — please add a comment at the top."
       : failFix ? "Please revise this. FIXFAILONCE"
@@ -101,11 +171,33 @@ if (isReview) {
 } else if (has("SHOWCASE", prompt)) {
   reply = "Prepared the release checklist and ran the full validation suite.";
 } else if (after("SAY:")) {
-  reply = after("SAY:");
+  // Carry the review-delay marker into the worker's visible reply so the next
+  // pair hop sees it in its current instruction, independent of delta cursors.
+  reply = after("SAY:") + (has("SLOWREVIEW") ? " SLOWREVIEW" : "");
 } else if (isHop && has("DUMPARGV")) {
   reply = "ARGVJSON " + JSON.stringify(argv);
 } else if (has("ARGJSON")) {
   reply = "ARGVJSON " + JSON.stringify(argv);
+} else if (has("IMAGEINFO")) {
+  reply = "IMAGEJSON " + JSON.stringify(receivedImages.map((image) => ({
+    mime: image.mime,
+    size: image.bytes.length,
+    sha256: crypto.createHash("sha256").update(image.bytes).digest("hex"),
+    ...(image.path ? { path: image.path } : {}),
+    ...(image.promptOnStdin !== undefined ? { promptOnStdin: image.promptOnStdin } : {}),
+    ...(image.swallowedPrompt ? { swallowedPrompt: true } : {}),
+  })));
+} else if (has("FILEINFO")) {
+  reply = "FILEJSON " + JSON.stringify(receivedFiles.map((file) => ({
+    name: file.name,
+    path: file.path,
+    addDir: file.addDir,
+    size: file.bytes.length,
+    sha256: crypto.createHash("sha256").update(file.bytes).digest("hex"),
+    inline: prompt.includes(`[Beginning attached file ${JSON.stringify(file.name)}`) &&
+      prompt.includes(file.bytes.toString("utf8")),
+    ...(file.missing ? { missing: true } : {}),
+  })));
 } else if (has("ARGS")) {
   reply = "ARGV " + argv.join(" ");
 } else if (has("RECALL")) {
@@ -165,6 +257,9 @@ function failLogicalTurn(keyText, label) {
   }
 }
 
+const resumeDelay = after("RESUMEDELAY:");
+if (nativeResume && resumeDelay) await new Promise((r) => setTimeout(r, Number(resumeDelay)));
+
 if (nativeResume && has("RESUMEERROR")) {
   process.stderr.write("fake-cli: generic upstream failure after work may have started\n");
   process.exit(2);
@@ -187,6 +282,12 @@ if (childId) {
 
 const failOnce = after("FAILONCE:");
 if (failOnce) failLogicalTurn(`turn:${failOnce}`, failOnce);
+// Same idea, but only for one seat — so a @both can leave exactly one half
+// failed and retryable while the other answers normally.
+const failOnceSeat = after("FAILONCESEAT:");
+if (failOnceSeat === (codexMode ? "codex" : "claude")) {
+  failLogicalTurn(`seat:${failOnceSeat}`, failOnceSeat);
+}
 if (isReview && has("REVIEWFAILONCE")) failLogicalTurn("review-once", "review");
 if (isFix && has("FIXFAILONCE")) failLogicalTurn("fix-once", "fix");
 
@@ -197,13 +298,14 @@ if ((isReview && /\bREVIEWFAIL\b/.test(current)) || /\bFAIL\b/.test(current)) {
 
 const slept = after("SLEEP:");
 const orderDelay = has("ORDERSTART") && !codexMode ? 400 : 0;
-await new Promise((r) => setTimeout(r, Number(slept || process.env.FAKE_DELAY_MS || 250) + orderDelay));
+const reviewDelay = isReview && has("SLOWREVIEW", prompt) ? 5000 : 0;
+await new Promise((r) => setTimeout(r, Number(slept || reviewDelay || process.env.FAKE_DELAY_MS || 250) + orderDelay));
 
 const out = (o) => process.stdout.write(JSON.stringify(o) + "\n");
 
 if (codexMode) {
-  const resuming = argv[1] === "resume" && argv[2] && argv[2] !== "--last";
-  const threadId = resuming ? argv[2] : "fake-thread-" + crypto.randomUUID();
+  const resuming = argv[execIndex + 1] === "resume" && argv[execIndex + 2] && argv[execIndex + 2] !== "--last";
+  const threadId = resuming ? argv[execIndex + 2] : "fake-thread-" + crypto.randomUUID();
   out({ type: "thread.started", thread_id: threadId });
   out({ type: "turn.started" });
   if (wroteFile) {
