@@ -45,7 +45,7 @@ npm start    # `npm link` here gives you the global `parley` command
 
 Two notes at the door:
 
-- **Platform honesty:** developed and used daily on **Windows 11** against both real CLIs, and CI-tested on Windows and Linux. The macOS paths are written but have neither CI nor real-world mileage — open an issue if something's off.
+- **Platform honesty:** developed and used daily on **Windows 11** against both real CLIs. Windows, Linux and macOS are all CI-tested, but only Windows has real-world mileage — open an issue if something's off.
 - Windows works natively: Parley resolves npm `.cmd` shims to the real binaries rather than going through a shell. After updating, restart Parley before reloading the page.
 
 ## How you talk to it
