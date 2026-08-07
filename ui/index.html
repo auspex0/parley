@@ -1848,12 +1848,15 @@ function isConservative(mode) {
 // nothing at all rather than a stale or guessed branch.
 function renderGitId(git) {
   const el = $("gitId");
-  const label = git && (git.detached
-    ? (git.head ? `⑂ ${git.head} · detached` : "")
-    : (git.branch ? `⑂ ${git.branch} · ${git.worktree}` : ""));
-  el.textContent = label || "";
+  const where = git && (git.detached ? (git.head ? `${git.head} (detached)` : "") : (git.branch || ""));
+  // The worktree's name is only worth the space when it is a *linked* worktree.
+  // For an ordinary checkout it just repeats the folder name the workspace
+  // button above already shows.
+  const label = where ? `⑂ ${where}${git.linked && git.worktree ? ` · ${git.worktree}` : ""}` : "";
+  el.textContent = label;
   el.title = label
-    ? (git.detached ? "Detached HEAD — this folder is on no branch" : `On branch ${git.branch} in worktree ${git.worktree}`)
+    ? (git.detached ? "Detached HEAD — this folder is on no branch" : `On branch ${git.branch}`) +
+      (git.linked && git.worktree ? ` · linked worktree ${git.worktree}` : "")
     : "";
   el.style.display = label ? "" : "none";
 }

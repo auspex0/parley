@@ -814,12 +814,20 @@ async function checkFolderPickerUi() {
     probe.projectDir === null, String(probe.projectDir));
   await Promise.race([openWhileReset, sleep(0)]);
 
-  const branchLine = probe.gitLine({ branch: "feature/slash-name", worktree: "parley", detached: false });
-  ok("branch line UI: a branch renders as branch · worktree",
-    branchLine.text === "⑂ feature/slash-name · parley" && !branchLine.hidden, JSON.stringify(branchLine));
-  const detachedLine = probe.gitLine({ branch: null, head: "3f5a9c1", worktree: "parley", detached: true });
-  ok("branch line UI: a detached HEAD renders as commit · detached",
-    detachedLine.text === "⑂ 3f5a9c1 · detached" && !detachedLine.hidden, JSON.stringify(detachedLine));
+  // The worktree name earns its place only on a linked worktree; on an ordinary
+  // checkout it would just repeat the workspace button directly above it.
+  const branchLine = probe.gitLine({ branch: "feature/slash-name", worktree: "parley", linked: false, detached: false });
+  ok("branch line UI: an ordinary checkout renders the branch alone",
+    branchLine.text === "⑂ feature/slash-name" && !branchLine.hidden, JSON.stringify(branchLine));
+  const linkedLine = probe.gitLine({ branch: "feature/slash-name", worktree: "wt-alpha", linked: true, detached: false });
+  ok("branch line UI: a linked worktree adds its own name",
+    linkedLine.text === "⑂ feature/slash-name · wt-alpha", JSON.stringify(linkedLine));
+  const detachedLine = probe.gitLine({ branch: null, head: "3f5a9c1", worktree: "parley", linked: false, detached: true });
+  ok("branch line UI: a detached HEAD renders the short commit",
+    detachedLine.text === "⑂ 3f5a9c1 (detached)" && !detachedLine.hidden, JSON.stringify(detachedLine));
+  const detachedLinked = probe.gitLine({ branch: null, head: "3f5a9c1", worktree: "wt-alpha", linked: true, detached: true });
+  ok("branch line UI: a detached linked worktree keeps both the commit and its name",
+    detachedLinked.text === "⑂ 3f5a9c1 (detached) · wt-alpha", JSON.stringify(detachedLinked));
   const noGitLine = probe.gitLine(null);
   ok("branch line UI: no identity clears the line and hides it",
     noGitLine.text === "" && noGitLine.hidden, JSON.stringify(noGitLine));
@@ -4073,9 +4081,9 @@ async function main() {
 
   const plainRepo = writeRepo("plain-repo", "ref: refs/heads/feature/slash-name\n");
   const plainId = await gitIdOf(plainRepo);
-  ok("a repo folder reports its branch, keeping slashes, with the worktree name",
+  ok("a repo folder reports its branch, keeping slashes, and is not a linked worktree",
     plainId && plainId.branch === "feature/slash-name" && plainId.worktree === "plain-repo" &&
-    plainId.detached === false, JSON.stringify(plainId));
+    plainId.linked === false && plainId.detached === false, JSON.stringify(plainId));
 
   const nested = path.join(plainRepo, "src", "deep");
   fs.mkdirSync(nested, { recursive: true });
@@ -4095,7 +4103,8 @@ async function main() {
   fs.writeFileSync(path.join(linkedWt, ".git"), "gitdir: ../main-repo/.git/worktrees/wt-alpha\n");
   const wtId = await gitIdOf(linkedWt);
   ok("a linked worktree reports its own HEAD and its own folder, not the main repo's",
-    wtId && wtId.branch === "side-branch" && wtId.worktree === "wt-alpha", JSON.stringify(wtId));
+    wtId && wtId.branch === "side-branch" && wtId.worktree === "wt-alpha" && wtId.linked === true,
+    JSON.stringify(wtId));
 
   const detachedId = await gitIdOf(writeRepo("detached-repo", "3f5a9c1d2b8e4f6a0c1d2e3f4a5b6c7d8e9f0a1b\n"));
   ok("a detached HEAD reports the short commit and no branch",

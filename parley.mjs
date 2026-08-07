@@ -867,12 +867,12 @@ function findGitDir(dir) {
     const entry = path.join(cur, ".git");
     let st = null;
     try { st = fs.statSync(entry); } catch { /* absent or unreadable: keep walking */ }
-    if (st && st.isDirectory()) return { gitDir: entry, root: cur };
+    if (st && st.isDirectory()) return { gitDir: entry, root: cur, linked: false };
     if (st && st.isFile()) {
       // A linked worktree: .git is a file pointing at the real gitdir, which
       // git may write relative to the worktree.
       const m = /^gitdir:[ \t]*(.+?)[ \t]*$/m.exec(fs.readFileSync(entry, "utf8").slice(0, GIT_READ_MAX));
-      return m ? { gitDir: path.resolve(cur, m[1]), root: cur } : null;
+      return m ? { gitDir: path.resolve(cur, m[1]), root: cur, linked: true } : null;
     }
     const up = path.dirname(cur);
     if (up === cur) return null;
@@ -889,15 +889,18 @@ function gitIdentity(dir) {
     const head = fs.readFileSync(path.join(found.gitDir, "HEAD"), "utf8").slice(0, GIT_READ_MAX).trim();
     // The worktree's name is the folder holding the .git entry — for a linked
     // worktree that is the worktree itself, not the repository it belongs to.
+    // `linked` is what the UI needs: only a linked worktree's name says
+    // anything the workspace button above the line hasn't already said.
     const worktree = path.basename(found.root);
+    const linked = found.linked;
     const ref = /^ref:[ \t]*(\S+)$/.exec(head);
     if (ref) {
       // Only the refs/heads/ prefix goes; the rest of the name keeps its
       // slashes, so "feature/x" reads as itself and not as "x".
       const branch = ref[1].replace(/^refs\/heads\//, "");
-      return branch ? { branch, worktree, detached: false } : null;
+      return branch ? { branch, worktree, linked, detached: false } : null;
     }
-    if (/^[0-9a-f]{7,64}$/i.test(head)) return { branch: null, head: head.slice(0, 7), worktree, detached: true };
+    if (/^[0-9a-f]{7,64}$/i.test(head)) return { branch: null, head: head.slice(0, 7), worktree, linked, detached: true };
     return null;
   } catch { return null; }
 }
