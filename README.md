@@ -32,7 +32,9 @@ npm install -g parley-room
 parley
 ```
 
-The UI opens at `http://127.0.0.1:4141` (auto-increments if the port is taken). Flags: `--port N`, `--root DIR`, `--no-open`. Note that the *unscoped* `parley` package on npm is a different project.
+The npm package is `parley-room`; `parley` on npm is unrelated. The command remains `parley`.
+
+The UI opens automatically at a loopback URL, normally `http://127.0.0.1:4141`. Flags: `--port N`, `--root DIR`, `--no-open`.
 
 Or run from source — there are no runtime dependencies:
 
