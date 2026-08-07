@@ -851,6 +851,57 @@ function workDir(room) {
   return room.cfg.projectDir || room.workspace;
 }
 
+// ---- git identity of the working directory, for the sidebar's branch line.
+// Read straight from .git rather than spawning git: this runs on a render path,
+// and a folder that is not a repo must cost nothing. Every unreadable or
+// unrecognised case reports null — the UI then shows no line at all, because a
+// stale or guessed branch ("main") is worse than saying nothing.
+
+const GIT_READ_MAX = 4096;
+
+// Nearest-ancestor discovery, as git itself does it: walk up until a .git
+// entry appears, or the filesystem root ends the search.
+function findGitDir(dir) {
+  let cur = path.resolve(dir);
+  for (;;) {
+    const entry = path.join(cur, ".git");
+    let st = null;
+    try { st = fs.statSync(entry); } catch { /* absent or unreadable: keep walking */ }
+    if (st && st.isDirectory()) return { gitDir: entry, root: cur };
+    if (st && st.isFile()) {
+      // A linked worktree: .git is a file pointing at the real gitdir, which
+      // git may write relative to the worktree.
+      const m = /^gitdir:[ \t]*(.+?)[ \t]*$/m.exec(fs.readFileSync(entry, "utf8").slice(0, GIT_READ_MAX));
+      return m ? { gitDir: path.resolve(cur, m[1]), root: cur } : null;
+    }
+    const up = path.dirname(cur);
+    if (up === cur) return null;
+    cur = up;
+  }
+}
+
+function gitIdentity(dir) {
+  if (!dir) return null;
+  try {
+    fs.statSync(dir); // a working directory we cannot even stat identifies nothing
+    const found = findGitDir(dir);
+    if (!found) return null;
+    const head = fs.readFileSync(path.join(found.gitDir, "HEAD"), "utf8").slice(0, GIT_READ_MAX).trim();
+    // The worktree's name is the folder holding the .git entry — for a linked
+    // worktree that is the worktree itself, not the repository it belongs to.
+    const worktree = path.basename(found.root);
+    const ref = /^ref:[ \t]*(\S+)$/.exec(head);
+    if (ref) {
+      // Only the refs/heads/ prefix goes; the rest of the name keeps its
+      // slashes, so "feature/x" reads as itself and not as "x".
+      const branch = ref[1].replace(/^refs\/heads\//, "");
+      return branch ? { branch, worktree, detached: false } : null;
+    }
+    if (/^[0-9a-f]{7,64}$/i.test(head)) return { branch: null, head: head.slice(0, 7), worktree, detached: true };
+    return null;
+  } catch { return null; }
+}
+
 const fileBase = (p) => String(p || "").split(/[\\/]/).pop();
 
 function claudeToolLabel(name, input) {
@@ -1615,6 +1666,7 @@ function roomSummary(room) {
     cfg: room.cfg,
     dir: room.dir,
     workspace: workDir(room),
+    git: gitIdentity(workDir(room)),
     lastAddressed: room.state.lastAddressed,
     seats,
     providers: providerCatalog(),
