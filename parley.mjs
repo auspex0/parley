@@ -2171,7 +2171,9 @@ function seatAlt(room) { return seatIds(room).map(escRe).join("|"); }
 
 function findHopTarget(room, entry, opts = {}) {
   const text = (entry && entry.text) || "";
-  const explicit = text.matchAll(new RegExp(`(^|[\\s(.,;:!?"'\`])@(${seatAlt(room)})\\b`, "gi"));
+  // Markdown emphasis counts as a boundary: agents routinely bold or italicise
+  // the tag ("**@codex**"), and that must still read as a real call.
+  const explicit = text.matchAll(new RegExp(`(^|[\\s(.,;:!?"'\`*_~])@(${seatAlt(room)})\\b`, "gi"));
   for (const match of explicit) {
     const target = match[2].toLowerCase();
     if (target !== entry.author) return target;
@@ -2406,7 +2408,7 @@ function textTarget(room, text) {
   const alt = seatAlt(room);
   const tags = new Set([...text.matchAll(new RegExp(`@(${alt}|both)\\b`, "gi"))].map((m) => m[1].toLowerCase()));
   if (tags.has("both") || seats.every((s) => tags.has(s))) return { target: "both", text };
-  const lead = new RegExp(`^@(${alt})\\b[\\s:,]*`, "i").exec(text);
+  const lead = new RegExp(`^[*_~]*@(${alt})\\b[*_~]*[\\s:,]*`, "i").exec(text);
   if (lead) return { target: lead[1].toLowerCase(), text: text.slice(lead[0].length).trim() };
   for (const s of seats) if (tags.has(s)) return { target: s, text };
   return null;

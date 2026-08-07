@@ -1964,6 +1964,20 @@ async function main() {
   ok("an explicit agent @call responds without lurk mode",
     d.entries.slice(beforeHop).some((e) => e.author === "codex" && e.meta && e.meta.hop));
 
+  beforeHop = d.entries.length;
+  await say("hoproom", "@claude EMTAG:codex");
+  d = await idle("hoproom");
+  ok("an @tag wrapped in markdown emphasis still hops",
+    d.entries.slice(beforeHop).some((e) => e.author === "codex" && e.meta && e.meta.hop));
+
+  beforeHop = d.entries.length;
+  const emphasisLead = await say("hoproom", "**@codex** SAY:EMLEAD");
+  d = await idle("hoproom");
+  ok("a leading emphasised @tag routes to that seat and is stripped from the prompt",
+    emphasisLead.data.target === "codex" &&
+    d.entries.slice(beforeHop).some((e) => e.author === "codex" && e.text.includes("EMLEAD")) &&
+    !d.entries.slice(beforeHop).some((e) => e.kind === "user" && e.text.includes("@codex")));
+
   await api("POST", "/api/rooms", { name: "hop-authority-framing" });
   await useFakes("hop-authority-framing");
   await cfg("hop-authority-framing", {
