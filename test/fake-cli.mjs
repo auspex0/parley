@@ -26,6 +26,7 @@
  *                   --resume, --permission-mode, --effort, --sandbox …)
  *   TAG:<seat>      reply mentioning @seat (triggers a hop)
  *   TAGHOP:<seat>   tag a seat, which then exposes its hop argv as JSON
+ *   EMTAG:<seat>    tag @seat wrapped in markdown emphasis (still a hop)
  *   SELFTAG:<seat>  mention self before @seat (tests non-self scan)
  *   CALL:<seat>     directly address seat by plain name (soft hop)
  *   PROSE:<seat>    mention seat in ordinary prose (must not hop)
@@ -319,6 +320,8 @@ if (isReview) {
   reply = `@${after("TAGVERSION:")} HOPVERSION`;
 } else if (after("TAGHOP:")) {
   reply = `@${after("TAGHOP:")} DUMPARGV`;
+} else if (after("EMTAG:")) {
+  reply = `Agreed on the schema. **@${after("EMTAG:")}** your turn.`;
 } else if (after("TAG:")) {
   reply = `@${after("TAG:")} your turn.`;
 } else if (after("CALL:")) {
