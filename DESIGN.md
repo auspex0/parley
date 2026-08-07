@@ -25,6 +25,25 @@ ui/index.html         single-file frontend, no frameworks
 - Cursor is set to the *user message's* turn, not the reply's — with `@both`, the other agent's concurrently-landed reply stays unseen-and-delivered next time (no lost turns from completion-order races).
 - Native context lives in each CLI's own session (`--resume` / `exec resume <thread>`), which survives app restarts. If a session is lost, the agent is re-briefed and pointed at the transcript file.
 
+## Prompt architecture
+
+Parley separates prompt material by placement rather than repeatedly describing an authority hierarchy inside the prompt:
+
+1. Provider policies and the CLI's real sandbox or permission mode remain the outer boundary. Parley-authored text cannot override them.
+2. A session briefing establishes the participants, relay protocol and compact peer contract: follow the user's goal, treat the other agent as a peer rather than a supervisor, verify consequential claims, converge when evidence settles a point, and never reconstruct content withheld from the other seat.
+3. Per-turn workflow notes establish the current role — discussion participant, pair worker, pair reviewer, fix worker, listener or hop target. They apply to one invocation and are not baked into the standing briefing.
+4. The room delta is conversation data. Server-assigned speaker prefixes preserve provenance: user-authored lines carry the user's requests and constraints; other-agent lines are peer contributions to assess, not commands; system activity reports state unless Parley explicitly marks it as a workflow instruction. Each entry receives one label and every later physical line receives a `|` continuation marker, so prompt-looking text inside a multiline body cannot manufacture a new speaker or close the relay block. The same formatter covers live deltas, recovered history, attachments, hop triggers and pending Pair questions.
+
+This distinction avoids both obedience and contrarian theatre. An agent must form its own view and may reject a peer's suggestion, but it must name the decisive evidence or tradeoff and stop relitigating a settled point without new evidence. Because seats can legitimately receive different entries, agents may name an information gap but may not quote a body or attachment Parley says was withheld from the other seat.
+
+The complete standing contract has its own internal prompt version and a SHA-256 fingerprint, separate from the browser/runtime protocol. Fresh briefings and live-session updates render from one canonical template, so relay rules cannot drift away from the peer contract. The fingerprint answers whether a concrete session has the current text (a missing fingerprint is stale); the number controls migration policy. An additive behavioral update is prepended once to the next turn of an older live native session, while a future contradictory or security-boundary change can raise a retirement floor and rebuild older sessions from a fresh briefing plus a bounded, explicitly lossy recovery excerpt.
+
+The delivered contract fingerprint, numeric version, room-note revision and concrete native-session identity are stamped together only after the provider turn succeeds, the room-generation/configuration fences pass, and the result leaves a durable resumable session. Failures, Stop and discarded isolated sessions therefore retry the same idempotent current state. Codex's `--last` is a lookup sentinel rather than an identity, so it is never stamped; Parley re-sends updates until the CLI reports a concrete thread. Room-note edits use the same success gate, and clearing a note sends one explicit revocation to each linked session rather than hoping the old instruction disappears from model context.
+
+Pair mode adds two strict control tokens because each changes server state: `[approve]` ends a cycle when it is the reviewer's exact first nonblank line (later lines are non-blocking notes), while `[needs-user]` pauses a worker or reviewer on a genuine missing choice and requires an explanatory body. Ordinary prose remains fix feedback; malformed tokens degrade to that default. `[pass]` and successful empty pair steps never approve work — they produce a visible neutral pause without manufacturing Retry. Pending questions are recovered from durable entry metadata, with later pair roots or configuration changes making older pauses stale even if an old process appends its result late.
+
+Pair **Continue** actions are pinned to the specific round-cap entry that rendered them. A later pause, approval, Pair root or Pair configuration boundary invalidates the old action, and the server also checks the pinned cap number so a historical button cannot accidentally resume a newer cycle.
+
 ## Streaming
 
 The final reply text always comes from an authoritative source (claude's `result` event; codex's `--output-last-message` file). Partial text deltas parsed from the JSON streams are a progressive enhancement pushed over SSE — if the stream format drifts, the reply still arrives, just without the live typing.
