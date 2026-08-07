@@ -28,7 +28,7 @@ Whether it speaks is the model's own judgment — there is no keyword trigger. A
 You need **Node.js ≥ 20** and the two official CLIs, each installed and authenticated: `claude` (Claude Code) and `codex` (OpenAI Codex). Parley shells out to them under your existing logins.
 
 ```bash
-npm install -g @auspex0/parley
+npm install -g parley-room
 parley
 ```
 

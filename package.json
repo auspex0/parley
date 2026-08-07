@@ -1,8 +1,8 @@
 {
-  "name": "@auspex0/parley",
+  "name": "parley-room",
   "version": "1.0.1",
   "private": false,
-  "description": "Parley — one local chat room shared by you, Claude (Claude Code CLI) and Codex (OpenAI Codex CLI), with a web UI, lurk mode and per-room talk/work modes.",
+  "description": "Multi-agent chat room for you, Claude Code, and Codex - runs locally, using the CLI sessions you're already signed into.",
   "type": "module",
   "bin": {
     "parley": "parley.mjs"
