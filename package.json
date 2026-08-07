@@ -33,7 +33,6 @@
   "files": [
     "parley.mjs",
     "ui/",
-    "docs/parley-demo.gif",
     "README.md",
     "LICENSE"
   ]

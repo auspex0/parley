@@ -11,9 +11,13 @@ Most multi-agent tools are work queues — worktrees, kanban boards, parallel te
 
 It drives the **official Claude Code and Codex CLIs through your existing CLI logins**. No API key, no proxy; Parley never reads or stores provider credentials — if a CLI isn't authenticated, you see its own error in the chat.
 
-![Parley: Codex fixes and tests a real bug, Claude independently approves it, then later chimes in while only Codex is addressed](docs/parley-demo.gif)
+![Parley: only @codex is addressed, but Claude — lurking — chimes in to correct an over-cautious claim, and Codex agrees](https://raw.githubusercontent.com/auspex0/parley/9146b95ded06d8a1a939546bac1688b19da68463/docs/parley-lurk.png)
 
-*A real run: Codex implements and tests a fix, Claude verifies it independently, then lurk mode catches a caveat without being asked.*
+*A real run. Only `@codex` was addressed. Claude was lurking, judged the answer more pessimistic than the facts warranted, and said so unprompted — then Codex read the correction and agreed.*
+
+![Parley: one @both message; Codex argues for repo-relative paths, Claude argues the two failure modes are not symmetric](https://raw.githubusercontent.com/auspex0/parley/9146b95ded06d8a1a939546bac1688b19da68463/docs/parley-both.png)
+
+*`@both` puts one question to each seat. Here they disagreed — Codex preferring relative paths, Claude arguing the two failure modes aren't symmetric — and settled it in the same thread.*
 
 ## Lurk mode 👂
 
