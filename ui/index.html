@@ -91,6 +91,11 @@
   }
   .side-foot button:hover, .side-foot a:hover { background: var(--panel); color: var(--text); }
   .side-foot .ico { width: 16px; text-align: center; opacity: .8; }
+  /* branch line: reads as a caption under Open workspace, never as an action */
+  #gitId {
+    padding: 0 10px 4px 35px; margin-top: -3px; font-size: 11.5px; color: var(--text-faint);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
 
   /* ---------- main column ---------- */
   #main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
@@ -526,6 +531,7 @@
     <nav id="roomList"></nav>
     <div class="side-foot">
       <button id="openWs"><span class="ico">📁</span> <span id="openWsLabel">Open workspace</span></button>
+      <div id="gitId" style="display:none"></div>
       <a id="dlTranscript" href="#"><span class="ico">📄</span> Download transcript</a>
       <button id="openRoomDir"><span class="ico">🗂️</span> Room folder</button>
       <button id="settingsBtn2"><span class="ico">⚙️</span> Settings</button>
@@ -1011,7 +1017,7 @@ document.addEventListener("click", (e) => {
   }
   if (!e.target.closest("#queueWrap")) closeQueuePop();
 });
-window.addEventListener("focus", () => { document.title = "Parley"; });
+window.addEventListener("focus", () => { document.title = "Parley"; refreshGitId(); });
 
 // ------------------------------------------------------------ chat rendering
 const chatWrap = $("chatWrap"), chat = $("chat");
@@ -1837,6 +1843,34 @@ function isFullAccess(mode) {
 function isConservative(mode) {
   return ["default", "manual", "plan", "read-only"].includes(mode);
 }
+// Which branch/worktree the room's folder is actually in. The server reports
+// null for anything it could not read with certainty, and then this shows
+// nothing at all rather than a stale or guessed branch.
+function renderGitId(git) {
+  const el = $("gitId");
+  const label = git && (git.detached
+    ? (git.head ? `⑂ ${git.head} · detached` : "")
+    : (git.branch ? `⑂ ${git.branch} · ${git.worktree}` : ""));
+  el.textContent = label || "";
+  el.title = label
+    ? (git.detached ? "Detached HEAD — this folder is on no branch" : `On branch ${git.branch} in worktree ${git.worktree}`)
+    : "";
+  el.style.display = label ? "" : "none";
+}
+
+// A checkout in another window changes this with no event to announce it, so
+// re-read on focus. One fetch per focus, never a poll.
+async function refreshGitId() {
+  const room = state.room;
+  if (!room) return;
+  try {
+    const data = await api("/api/room?name=" + encodeURIComponent(room));
+    if (state.room !== room) return;
+    if (state.summary) state.summary.git = data.room.git;
+    renderGitId(data.room.git);
+  } catch { /* keep the last line rather than blanking on a transport hiccup */ }
+}
+
 function applySummary(s) {
   s.busy = s.busy || [];
   s.busyInfo = s.busyInfo || [];
@@ -1918,6 +1952,7 @@ function applySummary(s) {
   wsBtn.title = s.cfg.projectDir
     ? `Linked project — open ${s.cfg.projectDir}`
     : `This room's own scratch folder — open ${s.workspace}`;
+  renderGitId(s.git);
   for (const a of s.busy) ensureLive(a);
   applyLiveRefs();
   renderBusyStrip();

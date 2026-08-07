@@ -780,6 +780,11 @@ async function checkFolderPickerUi() {
   queueBadgeText() { setQueue(state.summary.queued, state.summary.queue, state.summary.queuedDispatches); return $("queueBadge").textContent; },
   stopMenu() { updateBusyUI(); return $("stopMenu").innerHTML; },
   entryQuote(entry) { return entryQuoteHTML(entry); },
+  gitLine(git) {
+    renderGitId(git);
+    const el = $("gitId");
+    return { text: el.textContent, hidden: el.style.display === "none" };
+  },
 };`, Object.assign(sandbox, { __windowListeners: windowListeners }), { filename: "parley-ui.js" });
 
   const probe = sandbox.__probe;
@@ -808,6 +813,16 @@ async function checkFolderPickerUi() {
   ok("folder picker UI: a result arriving after the form was reset is discarded",
     probe.projectDir === null, String(probe.projectDir));
   await Promise.race([openWhileReset, sleep(0)]);
+
+  const branchLine = probe.gitLine({ branch: "feature/slash-name", worktree: "parley", detached: false });
+  ok("branch line UI: a branch renders as branch · worktree",
+    branchLine.text === "⑂ feature/slash-name · parley" && !branchLine.hidden, JSON.stringify(branchLine));
+  const detachedLine = probe.gitLine({ branch: null, head: "3f5a9c1", worktree: "parley", detached: true });
+  ok("branch line UI: a detached HEAD renders as commit · detached",
+    detachedLine.text === "⑂ 3f5a9c1 · detached" && !detachedLine.hidden, JSON.stringify(detachedLine));
+  const noGitLine = probe.gitLine(null);
+  ok("branch line UI: no identity clears the line and hides it",
+    noGitLine.text === "" && noGitLine.hidden, JSON.stringify(noGitLine));
 
   // Behavioural, not source-shaped: drive the real functions over seeded state.
   // Both queue rows below come from the *same* message (sourceN 4) via two
@@ -4037,6 +4052,71 @@ async function main() {
   const bad = await cfg("default", { projectDir: path.join(ROOT, "nope-not-here") });
   ok("bad project folder rejected", bad.status === 400);
   ok("rejected config leaves the room untouched", (await room("default")).room.cfg.projectDir === null);
+
+  // ---- git identity of the working folder (sidebar branch line) ----
+  // HEAD is read straight from .git, so these fixtures are plain files and the
+  // suite needs no git binary. Every unreadable case must report nothing at
+  // all — a guessed "main" would be worse than a missing line.
+  const gitFix = path.join(ROOT, "gitfix");
+  const writeRepo = (name, head) => {
+    const repo = path.join(gitFix, name);
+    fs.mkdirSync(path.join(repo, ".git"), { recursive: true });
+    if (head !== null) fs.writeFileSync(path.join(repo, ".git", "HEAD"), head);
+    return repo;
+  };
+  let gitRoomN = 0;
+  const gitIdOf = async (dir) => {
+    const name = `gitid${++gitRoomN}`;
+    await api("POST", "/api/rooms", { name });
+    return (await cfg(name, { projectDir: dir })).data.room.git;
+  };
+
+  const plainRepo = writeRepo("plain-repo", "ref: refs/heads/feature/slash-name\n");
+  const plainId = await gitIdOf(plainRepo);
+  ok("a repo folder reports its branch, keeping slashes, with the worktree name",
+    plainId && plainId.branch === "feature/slash-name" && plainId.worktree === "plain-repo" &&
+    plainId.detached === false, JSON.stringify(plainId));
+
+  const nested = path.join(plainRepo, "src", "deep");
+  fs.mkdirSync(nested, { recursive: true });
+  const nestedId = await gitIdOf(nested);
+  ok("a nested folder finds the repo above it and names the repo's own folder",
+    nestedId && nestedId.branch === "feature/slash-name" && nestedId.worktree === "plain-repo",
+    JSON.stringify(nestedId));
+
+  // A linked worktree: .git is a *file* pointing (relatively) at a gitdir under
+  // the main repo, and its HEAD is the one that counts.
+  const mainRepo = writeRepo("main-repo", "ref: refs/heads/main\n");
+  const wtGitDir = path.join(mainRepo, ".git", "worktrees", "wt-alpha");
+  fs.mkdirSync(wtGitDir, { recursive: true });
+  fs.writeFileSync(path.join(wtGitDir, "HEAD"), "ref: refs/heads/side-branch\n");
+  const linkedWt = path.join(gitFix, "wt-alpha");
+  fs.mkdirSync(linkedWt, { recursive: true });
+  fs.writeFileSync(path.join(linkedWt, ".git"), "gitdir: ../main-repo/.git/worktrees/wt-alpha\n");
+  const wtId = await gitIdOf(linkedWt);
+  ok("a linked worktree reports its own HEAD and its own folder, not the main repo's",
+    wtId && wtId.branch === "side-branch" && wtId.worktree === "wt-alpha", JSON.stringify(wtId));
+
+  const detachedId = await gitIdOf(writeRepo("detached-repo", "3f5a9c1d2b8e4f6a0c1d2e3f4a5b6c7d8e9f0a1b\n"));
+  ok("a detached HEAD reports the short commit and no branch",
+    detachedId && detachedId.detached === true && detachedId.head === "3f5a9c1" &&
+    detachedId.branch === null, JSON.stringify(detachedId));
+
+  const crlfId = await gitIdOf(writeRepo("crlf-repo", "ref: refs/heads/crlf-branch\r\n"));
+  ok("a CRLF HEAD does not carry its line ending into the branch name",
+    crlfId && crlfId.branch === "crlf-branch", JSON.stringify(crlfId));
+
+  const nonRepo = path.join(gitFix, "not-a-repo");
+  fs.mkdirSync(nonRepo, { recursive: true });
+  ok("a folder outside any repo reports no identity", (await gitIdOf(nonRepo)) === null);
+
+  ok("a repo whose HEAD cannot be read reports nothing rather than guessing a branch",
+    (await gitIdOf(writeRepo("headless-repo", null))) === null);
+
+  const brokenLink = path.join(gitFix, "broken-link");
+  fs.mkdirSync(brokenLink, { recursive: true });
+  fs.writeFileSync(path.join(brokenLink, ".git"), "not a gitdir pointer\n");
+  ok("an unrecognised .git file reports nothing", (await gitIdOf(brokenLink)) === null);
 
   const before = (await room("lurkroom")).entries.length;
   await api("POST", "/api/new", { room: "lurkroom" });
