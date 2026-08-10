@@ -55,15 +55,20 @@ Under every message, one dot per other participant shows how they experienced it
 
 - **solid** — heard live (addressed, or lurked and chimed in)
 - **faded solid** — lurked but had nothing to add
+- **pending** — selected to lurk, but occupied; one catch-up is queued behind user work
 - **outlined** — caught up later via the delta (tooltip says at which turn)
 - **dim outline** — hasn't seen it yet
 - **red outline** — you cancelled that delivery before the agent saw it
 
-Powered by an audience snapshot stamped on each user message, append-only delivery receipts in `events.jsonl`, and persisted per-seat withdrawal state — no extra model calls.
+Powered by an audience snapshot stamped on each user message, append-only delivery receipts in `events.jsonl`, and persisted per-seat withdrawal, catch-up and terminal-outcome state. The dot reflects the latest truth: a later successful delivery supersedes an earlier queued or failed lurk.
 
 ## Lurk mode 👂
 
-Opt-in per agent, per room (the 👂 on each agent's pill; config key `agents.<name>.lurk`). A lurking agent overhears every exchange it wasn't addressed in: after the addressed agent replies, the lurker is invoked with the delta and may chime in (marked "👂 chimed in") or silently pass (a brief "listened — nothing to add" whisper). Costs one extra call to the lurking agent per message — that's the trade for real-time awareness and unprompted interjections.
+Opt-in per agent, per room (the 👂 on each agent's pill; config key `agents.<name>.lurk`). A lurking agent overhears every exchange it wasn't addressed in: after the addressed agent replies, the lurker is invoked with the delta and may chime in (marked "👂 chimed in") or silently pass (a brief "listened — nothing to add" whisper). Normally that costs one extra call to the lurking agent per message — that's the trade for real-time awareness and unprompted interjections.
+
+If the listener is occupied — either running a turn or already owing user-addressed work in its lane — the lurk is delayed, not discarded. Parley persists one coalesced obligation per seat outside the user queue, extends it across further missed exchanges, and waits until every accepted user exchange and queued delivery has settled. User work therefore always wins. The listener then gets one full-delta catch-up, with the missed exchanges in their real chronological order, rather than one stale call per message. Roots that actually selected the seat to lurk are marked actionable; later Solo and otherwise-unselected messages remain visible as context for deciding whether an issue became stale, but cannot themselves trigger an interjection. Any ordinary successful invocation that has already advanced its cursor past the obligation supersedes the catch-up automatically.
+
+The obligation survives a restart and is attempted once. A successful spoken response or `[pass]` advances the cursor and writes the ordinary receipt. A spoken catch-up earns the other seat one final, structurally bounded right of reply; that return is never expanded into another automatic leg. Before launch, putting the seat to sleep or turning lurk off cancels the obligation and records why; if the catch-up is already running, Sleep's ordinary future-launch rule lets that turn finish unless you Stop it. Provider failure or Stop ends the attempt without advancing the cursor and leaves a durable outcome for the receipt dot. There is no automatic retry loop, though a later deliberate delivery can still catch the seat up from the unchanged cursor. **Archive & start fresh** clears the obligation with the rest of the old conversation.
 
 Whether a lurker speaks is its own model's judgment — there is no mechanical trigger — so Settings gives each agent a dial (`lurkStyle`):
 
@@ -77,15 +82,40 @@ Lurkers deliberately respect your explicit constraints — if you demand "just y
 
 **Lurk-as-reviewer** is the flagship combination: a work room where one agent codes and the other lurks. The lurker sees every action, may read workspace files to verify, and interjects only when it has something real — a bug, a risk, a better approach. Continuous unprompted code review.
 
+## Sleeping a seat 😴
+
+A rate-limited seat can still be invoked — by you, by a queued delivery, or by the other agent writing `@claude` into a reply. Sleep is the per-seat, per-room switch that stops all of it: the 😴 on the seat's pill, or `/sleep @agent [reason]` when the reason is worth recording (`/wake @agent` brings it back).
+
+Sleep is **manual only**. Parley never infers it from a provider error — the CLIs report exit codes and stderr text, not a stable rate-limit signal — and the failure is already in front of you, so you decide.
+
+- **Nothing launches that seat.** One authoritative gate sits at the turn-launch functions rather than per route, so every path is covered: your message, the held half of a split `@both`, an explicit `@tag` from the other agent, a soft direct call, a scheduled lurk check, Retry, and a pair step.
+- **Your messages are held, not refused.** Sending to a sleeping seat lands the message in the thread where you sent it, marked `📥 held until wake`, and it is delivered when you wake the seat — so you never have to keep the request in your head and re-send it later. `@both` splits: the awake seat answers now, the sleeping seat's copy waits. A held message launches *nobody*, including the other seat as a lurker.
+- **What the agents do while asleep is dropped, and said so.** An `@tag` from the other agent, a lurk check or a pair step is skipped and recorded as not delivered — those go stale, and replaying them on wake would produce a burst of invocations. The other agent's lurk instruction reads silence as agreement, so an unrecorded skip would manufacture consensus. Both agents see these notices in their delta.
+- **Pair mode pauses.** It never substitutes the awake seat for the sleeping role or runs a cycle with half of it missing. A cycle already in flight finishes the step it is on, then pauses with nothing approved.
+- **Future launches only.** A response already running finishes; Stop remains the separate explicit action. Deliveries the lanes still owe that seat are cancelled immediately, in one consolidated note, rather than waiting to fail later.
+- **Waking asks what to do with what is held.** With nothing held, the 😴 is a plain toggle. With messages waiting it opens a two-way menu: **Wake & deliver** answers all of them in *one* turn, rooted at the newest, with the earlier ones and everything that happened in between still in their real positions — so the seat can tell a stale request from a live one and say where later context overtook it. **Wake only** wakes the seat and leaves them as ordinary context. Clicking elsewhere cancels.
+- **Waking replays nothing on its own.** The cursor does not move, so everything said while the seat slept — including every "not delivered" entry — is still ahead of it and arrives as ordinary context on its next deliberate delivery. A cursor jump would throw away exactly the record of having been asked. The pill shows the backlog (`asleep · 3 held · 14 pending`) because this is the one moment the size of a turn is knowable before it runs. The held count is a *subset* of pending, not an addition to it, and it stays visible after **Wake only** until a turn actually delivers those messages.
+- **Both edges are persisted**, not merely broadcast — otherwise a restart would leave a transcript where a seat goes quiet and later starts talking again with nothing explaining either.
+
+Sleep lives in `state.json` beside the per-seat cursors, not in `room.json` beside `lurk`: it is a temporary, externally caused *condition*, not part of how the seat is configured. So it survives restarts, and it survives **Archive & start fresh** — a rate-limited account does not become invocable again because you archived a conversation.
+
 ## Agent-to-agent hops & right of reply
 
 If an agent explicitly @mentions the other in a reply ("@codex what do you think?"), the other qualifies for a response whether lurk is enabled or not. A soft direct address without the tag ("Codex, what do you reckon?") also qualifies when Codex is lurking, or when your original message addressed `@both`; ordinary prose such as "give Codex write access" does not. Markdown emphasis around a tag is transparent — `**@codex**` calls exactly like `@codex`.
 
-A busy target waits for its current lane to finish instead of silently losing the call. `maxHops` limits these agent-triggered follow-ups per user message (Settings, default 0 = until the conversation settles), with a high emergency safety stop for accidental ping-pong. Separately, a lurker's spoken chime-in always earns the other agent one reply back, never counted against this budget.
+Mentions inside fenced code, inline code and blockquotes are examples, not routing. Parley masks those regions only in a detection copy, preserving every newline; the transcript and prompt remain untouched. This also prevents a pasted `@codex` example from consuming a handoff.
 
-Chains end at the configured budget, when a reply triggers nothing, on `[pass]`, on Stop/provider failure, or at the emergency stop. Pair-review turns remain governed by the pair loop rather than ordinary hops.
+The server, not the model, owns the counter. `hopBudget` is snapshotted when each user message is accepted:
 
-**Scheduling details.** An explicit agent handoff waits for the target's current turn. A scheduled lurk check is skipped when that listener is occupied by another lane, and it catches up via its next delta instead.
+- **`-1` / `∞`** — follow up until the exchange settles, still fenced by the emergency safety stop.
+- **`0`** — launch no agent-to-agent handoffs.
+- **positive integer** — launch at most that many handoffs. Settings accepts any safe whole number; the compact one-message composer control offers quick values through `8`.
+
+The initial agent response is not a hop. A handoff is charged only when Parley actually launches the target: an asleep target or a late target that already read and answered the trigger spends nothing, while a launched call that later fails still spends one. At the cap, Parley does not invoke the tagged seat; the tagging reply is already in the transcript and reaches that seat as ordinary context on a later turn. A subtle system line records that the chain was capped. The live counter beside the composer reports the latest active exchange, and each launched hop is told how many handoffs remain so it can compose accordingly; the relay remains authoritative if the model ignores the hint.
+
+The composer control is one-shot: **Room default**, **Solo**, `∞`, or `0`–`8`. The next accepted user message resets an override to Room default; a failed send preserves it, and a taskless `/pair start` or `/pair end` does not consume it. **Solo** requires one ordinary addressee, suppresses both lurk and agent-to-agent handoffs for that message, and is rejected with `@both` or a Pair turn. It controls reaction, not later visibility: the other seat can still read that transcript entry in a future delta.
+
+A busy handoff target waits for its lane instead of losing the call. Separately, a lurker's spoken chime-in earns the other agent one structurally bounded right of reply outside `hopBudget`. For a live lurk, a further explicit tag in that answer re-enters the original budgeted chain. A delayed coalesced catch-up has no single original budget, so its one return is final and is not auto-routed again. Pair review is governed only by `pairRounds`, never by `hopBudget`. Chains also end when a reply triggers nothing, on `[pass]`, on Stop/provider failure, or at the emergency safety stop.
 
 ## Pair mode 🔁
 

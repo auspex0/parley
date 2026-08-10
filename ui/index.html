@@ -119,9 +119,13 @@
   .pill.busy .st { background: #ffd479; animation: pulse 1s infinite; }
   .hdot.withheld { background: none; border: 1px solid var(--danger); opacity: .75; position: relative; }
   .pill.bad .st { background: var(--danger); }
-  .pill .ear { font-size: 13px; line-height: 1; padding: 0 1px; opacity: .25; filter: grayscale(1); transition: opacity .15s, filter .15s; }
-  .pill .ear.on { opacity: 1; filter: none; }
-  .pill .ear:hover { opacity: .8; }
+  .pill .ear, .pill .moon { font-size: 13px; line-height: 1; padding: 0 1px; opacity: .25; filter: grayscale(1); transition: opacity .15s, filter .15s; }
+  .pill .ear.on, .pill .moon.on { opacity: 1; filter: none; }
+  .pill .ear:hover, .pill .moon:hover { opacity: .8; }
+  .pill.asleep { border-style: dashed; opacity: .72; }
+  /* :not(.busy) — a seat slept mid-answer is still writing that answer, and its
+     status dot has to keep saying so. */
+  .pill.asleep:not(.busy) .st { background: var(--text-faint); animation: none; }
   @keyframes pulse { 50% { opacity: .3; } }
   .hbtn { padding: 6px 10px; border-radius: 9px; color: var(--text-dim); font-size: 13px; border: 1px solid transparent; }
   .hbtn:hover { background: var(--panel2); color: var(--text); border-color: var(--border); }
@@ -174,7 +178,13 @@
   .bubble {
     padding: 11px 15px; border-radius: var(--radius); font-size: 14.8px;
     background: var(--panel); border: 1px solid var(--border);
-    overflow-wrap: break-word; min-width: 40px;
+    /* `anywhere`, not `break-word`: only `anywhere` shrinks min-content width, so a
+       pasted token with no break opportunity (DKIM key, base64) can't push the bubble
+       past .msg's max-width and spill sideways over the sidebar. */
+    overflow-wrap: anywhere; min-width: 40px;
+    /* Hard cap so a wide child (code block, table) can't push the bubble past .msg
+       either — without this their overflow-x scrollers never actually engage. */
+    max-width: 100%;
   }
   .msg.user .bubble {
     background: linear-gradient(135deg, rgba(122,162,247,.16), rgba(122,162,247,.09));
@@ -287,18 +297,62 @@
   /* ---------- composer ---------- */
   #composerWrap { padding: 10px 24px 18px; }
   #composer { max-width: 880px; margin: 0 auto; position: relative; }
-  .chips { display: flex; gap: 6px; margin-bottom: 8px; align-items: center; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; align-items: center; min-width: 0; }
   .chip {
     padding: 4px 13px; border-radius: 999px; font-size: 12.5px; border: 1px solid var(--border2);
     color: var(--text-dim); background: var(--panel);
   }
   .chip:hover { color: var(--text); }
+  .chip:disabled { opacity: .35; cursor: not-allowed; }
+  .chip:disabled:hover { color: var(--text-dim); }
   .chip.active { color: #0b0e14; font-weight: 600; }
   .chip.active[data-t="auto"] { background: var(--text-dim); border-color: var(--text-dim); }
   .chip.active[data-t="claude"] { background: var(--claude); border-color: var(--claude); }
   .chip.active[data-t="codex"] { background: var(--codex); border-color: var(--codex); }
   .chip.active[data-t="both"] { background: var(--user); border-color: var(--user); }
-  #routeHint { margin-left: auto; font-size: 12px; color: var(--text-faint); }
+  #routeHint { margin-left: auto; min-width: 0; font-size: 12px; color: var(--text-faint); }
+  #routeHint.warn { color: #e8b45c; }
+
+  /* Per-message exchange policy. The menu is fixed and positioned from the
+     trigger, like the wake menu, so a wrapped composer row cannot clip it. */
+  #hopWrap { position: relative; display: inline-flex; align-items: center; flex-shrink: 0; }
+  #hopBtn {
+    display: inline-flex; align-items: center; gap: 5px; padding: 4px 9px;
+    border-radius: 999px; border: 1px solid var(--border2); background: var(--panel);
+    color: var(--text-dim); font-size: 12px; white-space: nowrap;
+  }
+  #hopBtn:hover, #hopWrap.open #hopBtn { color: var(--text); border-color: rgba(122,162,247,.55); }
+  #hopBtn.override { color: var(--user); border-color: rgba(122,162,247,.55); }
+  #hopBtn .hop-caret { font-size: 9px; opacity: .7; }
+  #hopMenu {
+    position: fixed; display: none; width: 286px; max-width: calc(100vw - 16px);
+    max-height: calc(100vh - 16px); overflow-y: auto; padding: 6px;
+    background: var(--panel2); border: 1px solid var(--border2); border-radius: 11px;
+    box-shadow: 0 8px 30px rgba(0,0,0,.5); z-index: 40;
+  }
+  #hopWrap.open #hopMenu { display: block; }
+  #hopMenu > button {
+    width: 100%; padding: 8px 9px; border-radius: 7px; text-align: left;
+    color: var(--text-dim);
+  }
+  #hopMenu > button:hover, #hopMenu > button[aria-checked="true"] { background: var(--panel); color: var(--text); }
+  #hopMenu button b { display: block; font-size: 12.5px; }
+  #hopMenu .hm-sub { display: block; margin-top: 2px; font-size: 10.5px; line-height: 1.3; opacity: .68; }
+  #hopMenu .hm-label { margin: 5px 7px 4px; padding-top: 6px; border-top: 1px solid var(--border); color: var(--text-faint); font-size: 10.5px; }
+  #hopMenu .hm-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; }
+  #hopMenu .hm-grid button {
+    padding: 6px 2px; border: 1px solid transparent; border-radius: 7px;
+    color: var(--text-dim); font-size: 12px; text-align: center;
+  }
+  #hopMenu .hm-grid button:hover { background: var(--panel); color: var(--text); }
+  #hopMenu .hm-grid button[aria-checked="true"] { border-color: var(--user); color: var(--user); background: rgba(122,162,247,.08); }
+  #hopProgress {
+    display: inline-flex; align-items: center; flex-shrink: 0; padding: 3px 7px;
+    border-radius: 8px; border: 1px solid rgba(122,162,247,.25);
+    color: var(--text-faint); font-size: 11px; white-space: nowrap;
+  }
+  #hopProgress.capped { color: #e8b45c; border-color: rgba(232,180,92,.35); }
+  #hopProgress[hidden] { display: none; }
   #draftImages { display: none; gap: 8px; flex-wrap: wrap; margin: 0 0 8px; }
   #draftImages.show { display: flex; }
   .draft-image { position: relative; width: 74px; height: 62px; border: 1px solid var(--border2); border-radius: 9px; overflow: hidden; background: var(--panel); }
@@ -344,6 +398,21 @@
   #stopMenu button.stop-all { color: var(--danger); border-top: 1px solid var(--border); border-radius: 0 0 7px 7px; margin-top: 4px; padding-top: 9px; }
   #stopMenu button.stop-scope { color: var(--text-dim); }
   #stopMenu button .sm-sub { display: block; font-size: 10.5px; opacity: .62; margin-top: 1px; }
+
+  /* Wake menu. Waking a seat with messages held for it is a three-way choice —
+     deliver, wake only, or cancel — which a native confirm() cannot express:
+     its two buttons would leave Escape silently picking one of the two wakes.
+     Same anchored-menu shape as #stopMenu, but positioned against the moon
+     button, which lives in a pill row that re-renders under it. */
+  #wakeMenu {
+    position: fixed; display: none; min-width: 210px;
+    padding: 5px; background: var(--panel2); border: 1px solid var(--border2); border-radius: 11px;
+    box-shadow: 0 8px 30px rgba(0,0,0,.5); z-index: 40;
+  }
+  #wakeMenu.open { display: block; }
+  #wakeMenu button { width: 100%; padding: 8px 10px; border-radius: 7px; text-align: left; color: var(--text-dim); }
+  #wakeMenu button:hover { background: var(--panel); color: var(--text); }
+  #wakeMenu button .sm-sub { display: block; font-size: 10.5px; opacity: .62; margin-top: 1px; }
 
   /* quote header: what a reply is answering. Lives between .meta and .bubble
      so copying a message never picks up the quoted text. */
@@ -507,6 +576,14 @@
   @media (max-width: 760px) {
     #sidebar { display: none; }
     .msg { max-width: 92%; }
+    #composerWrap { padding: 8px 10px 12px; }
+    .chips { gap: 5px; }
+    .chip { padding-left: 10px; padding-right: 10px; }
+    #routeHint {
+      order: 20; width: 100%; margin-left: 0; white-space: nowrap;
+      overflow: hidden; text-overflow: ellipsis;
+    }
+    #hopMenu { width: min(286px, calc(100vw - 16px)); }
   }
 </style>
 </head>
@@ -575,6 +652,34 @@
           <button class="chip active" data-t="auto">Auto</button>
           <span id="seatChips" style="display:contents"></span>
           <button class="chip" data-t="both">@both</button>
+          <span id="hopWrap">
+            <button id="hopBtn" type="button" aria-haspopup="menu" aria-expanded="false"
+              title="Choose the agent-to-agent follow-up policy for the next message">
+              <span id="hopBtnLabel">⛓ Hops: Room (∞)</span><span class="hop-caret">▼</span>
+            </button>
+            <div id="hopMenu" role="menu" aria-label="Hops for the next message">
+              <button type="button" role="menuitemradio" aria-checked="true" data-hop-choice="default">
+                <b>Room default</b><span class="hm-sub" id="hopRoomDefault">Currently ∞ — follow up until settled</span>
+              </button>
+              <button type="button" role="menuitemradio" aria-checked="false" data-hop-choice="solo">
+                <b>Solo</b><span class="hm-sub">For the next message, one selected seat responds. The other cannot lurk or react, but can read this transcript later.</span>
+              </button>
+              <div class="hm-label">Override once · resets after the next accepted message</div>
+              <div class="hm-grid">
+                <button type="button" role="menuitemradio" aria-label="Unlimited hops" aria-checked="false" data-hop-choice="-1" title="Follow up until settled; the safety stop still applies">∞</button>
+                <button type="button" role="menuitemradio" aria-label="No hops" aria-checked="false" data-hop-choice="0" title="No agent-to-agent follow-ups; a lurker may still react">0</button>
+                <button type="button" role="menuitemradio" aria-label="1 hop" aria-checked="false" data-hop-choice="1">1</button>
+                <button type="button" role="menuitemradio" aria-label="2 hops" aria-checked="false" data-hop-choice="2">2</button>
+                <button type="button" role="menuitemradio" aria-label="3 hops" aria-checked="false" data-hop-choice="3">3</button>
+                <button type="button" role="menuitemradio" aria-label="4 hops" aria-checked="false" data-hop-choice="4">4</button>
+                <button type="button" role="menuitemradio" aria-label="5 hops" aria-checked="false" data-hop-choice="5">5</button>
+                <button type="button" role="menuitemradio" aria-label="6 hops" aria-checked="false" data-hop-choice="6">6</button>
+                <button type="button" role="menuitemradio" aria-label="7 hops" aria-checked="false" data-hop-choice="7">7</button>
+                <button type="button" role="menuitemradio" aria-label="8 hops" aria-checked="false" data-hop-choice="8">8</button>
+              </div>
+            </div>
+          </span>
+          <span id="hopProgress" aria-live="polite" hidden></span>
           <span id="queueWrap">
             <button id="queueBadge" aria-haspopup="dialog" aria-expanded="false" title="See what's waiting"></button>
             <div id="queuePop" role="dialog" aria-label="Queued work"></div>
@@ -599,6 +704,8 @@
   </div>
 </div>
 
+<div id="wakeMenu" role="menu"></div>
+
 <div id="overlay">
   <div class="modal">
     <h2>Room settings</h2>
@@ -619,9 +726,9 @@
         <div class="note">Work rooms always get at least 900s.</div></div>
     </div>
     <div class="mgrid">
-      <div class="fld"><label>Agent-to-agent hops per message (0 = until settled)</label>
-        <input id="s_maxhops" type="number" min="0" max="8" step="1">
-        <div class="note">Explicit @calls qualify regardless of lurk. Plain-name direct calls qualify when lurking or when you addressed both. Limits and a high safety stop catch loops.</div></div>
+      <div class="fld"><label>Agent-to-agent hop budget per message</label>
+        <input id="s_hopbudget" type="number" min="-1" step="1">
+        <div class="note">Room default: -1 = ∞ (with a safety stop), 0 = none, any positive integer = that exact cap. The composer keeps quick one-message choices through 8, or Solo.</div></div>
       <div class="fld"><label>Pair review rounds per message (0 = until approved)</label>
         <input id="s_pairrounds" type="number" min="0" max="99" step="1">
         <div class="note">Pair mode ends when the reviewer approves, so a limit is optional. A high safety stop still catches two agents that never converge.</div></div>
@@ -655,6 +762,8 @@ const state = {
   chip: "auto",
   chipRevision: 0,   // manual changes fence off older in-flight send responses
   sendVersion: 0,    // only the newest send may synchronize the selected chip
+  hopChoice: "default", // one-shot message policy: default | solo | -1..8
+  hopRevision: 0,    // a newer choice must survive an older in-flight send
   draftImages: [],   // native image attachments waiting for the next successful send
   draftFiles: [],    // other files waiting for the next successful send
   sending: false,
@@ -689,7 +798,7 @@ function toast(msg, isErr) {
 // This blocks blind/cross-origin requests; it is not a secret from local
 // processes, which can fetch the public page and read the embedded token.
 const TOKEN = (document.querySelector('meta[name="parley-token"]') || {}).content || "";
-const REQUIRED_RUNTIME_PROTOCOL = "5";
+const REQUIRED_RUNTIME_PROTOCOL = "7";
 const PAGE_RUNTIME_PROTOCOL = (document.querySelector('meta[name="parley-runtime-protocol"]') || {}).content || "";
 const withToken = (url) => url + (url.includes("?") ? "&" : "?") +
   "token=" + encodeURIComponent(TOKEN) + "&protocol=" + encodeURIComponent(REQUIRED_RUNTIME_PROTOCOL);
@@ -1015,6 +1124,7 @@ document.addEventListener("click", (e) => {
     $("stopWrap").classList.remove("open");
     $("stopBtn").setAttribute("aria-expanded", "false");
   }
+  if (!e.target.closest("#hopWrap")) closeHopMenu();
   if (!e.target.closest("#queueWrap")) closeQueuePop();
 });
 window.addEventListener("focus", () => { document.title = "Parley"; refreshGitId(); });
@@ -1058,6 +1168,9 @@ function computeHeard(a, e) {
   }
   const r = state.receipts.find((x) => x.agent === a && x.from < e.n && e.n <= x.upTo);
   if (r) {
+    if (r.mode === "lurk-catchup") return r.spoke
+      ? { cls: "late", title: `${a} · caught up while lurking — chimed in` }
+      : { cls: "passed", title: `${a} · caught up while lurking — nothing to add` };
     const live = e.n >= r.turn; // heard as part of the exchange that delivered it
     if (live && r.mode === "lurk") return r.spoke
       ? { cls: "live", title: `${a} · lurking — chimed in` }
@@ -1072,6 +1185,27 @@ function computeHeard(a, e) {
   const cur = agent ? agent.cursor : 0;
   if (cur >= e.n) return { cls: "late", title: `${a} · has seen this` };
   if (state.summary && (state.summary.busy || []).includes(a)) return { cls: "pending " + a, title: `${a} · receiving…` };
+  // Still unheard, but for a reason the user chose — and one that will not
+  // resolve on its own, unlike an ordinary seat that simply hasn't caught up.
+  if (seatAsleep(a)) return { cls: "unheard", title: `${a} · asleep — hasn't seen this, and won't until you wake it` };
+  const catchUp = agent && agent.catchUp;
+  if (catchUp && catchUp.sinceN <= e.n && e.n <= catchUp.throughN) {
+    return { cls: "pending " + a, title: `${a} · queued to catch up when its user work finishes` };
+  }
+  if (e.kind === "user" && e.meta && e.meta.relay && e.meta.relay.solo &&
+      !(((e.meta.audience || {}).addressed || []).includes(a))) {
+    return { cls: "unheard", title: `${a} · Solo — response intentionally suppressed; it can still see this as later context` };
+  }
+  const outcomes = ((state.summary && state.summary.lurkOutcomes) || [])
+    .filter((x) => x.agent === a && x.fromN <= e.n && e.n <= x.throughN);
+  const outcome = outcomes.length ? outcomes[outcomes.length - 1] : null;
+  if (outcome) {
+    const why = outcome.reason === "stopped" ? "was stopped"
+      : outcome.reason === "disabled" ? "was disabled"
+        : outcome.reason === "asleep" ? "went to sleep"
+          : outcome.reason === "cancelled" ? "was cancelled" : "failed";
+    return { cls: "unheard", title: `${a} · lurk ${why} before this was heard` };
+  }
   return { cls: "unheard", title: `${a} · hasn't seen this yet` };
 }
 function heardHTML(e) {
@@ -1608,11 +1742,11 @@ function applyLiveRefs() {
 
 const PHASE_VERB = {
   start: "replying to", hop: "replying to", retrying: "replying to",
-  listening: "listening in on", review: "reviewing", fix: "fixing after",
+  listening: "listening in on", "catching-up": "catching up on", review: "reviewing", fix: "fixing after",
 };
 const RUNNING_VERB = {
   start: "responding", hop: "responding", retrying: "responding",
-  listening: "listening", review: "reviewing", fix: "fixing",
+  listening: "listening", "catching-up": "catching up", review: "reviewing", fix: "fixing",
 };
 
 // Hysteresis, not a boolean. Showing the strip the instant the bubble's last
@@ -1733,11 +1867,21 @@ function liveStream(agent, text) {
     scrollBottom();
   }, 90);
 }
-function whisper(agent, error, hop, skipped) {
+function whisper(agent, error, hop, skipped, asleep, held, queued) {
   const d = document.createElement("div");
   d.className = "whisper";
-  d.textContent = skipped
-    ? `⏭ ${agent} is busy in another exchange — it'll catch up on its next turn`
+  // A sleeping seat is not a busy one: there is no later turn to catch up on
+  // until the user wakes it, which is why this skip also lands in the thread.
+  // Held is the opposite case and must not read as a drop — the message was
+  // accepted and is waiting for the seat, not lost.
+  d.textContent = queued
+    ? `👂 ${agent} was occupied — queued one catch-up after user work finishes`
+    : held
+    ? `📥 ${agent} is asleep — held until you wake it`
+    : skipped
+    ? (asleep
+      ? `😴 ${agent} is asleep — nothing was delivered to it`
+      : `⏭ ${agent} is busy in another exchange — it'll catch up on its next turn`)
     : error
       ? `👂 ${agent} was listening but hit an error: ${error}`
       : hop
@@ -1781,7 +1925,8 @@ function renderSeatsUI(s) {
   $("pills").innerHTML = seats.map((a) =>
     `<div class="pill" data-seat="${esc(a)}" id="pill_${esc(a)}"><span class="st"></span>` +
     `<b style="color:${seatColor(a)}">${esc(seatLabel(a))}</b><span class="pinfo"></span>` +
-    `<button class="ear" data-seat="${esc(a)}">👂</button></div>`).join("");
+    `<button class="ear" data-seat="${esc(a)}">👂</button>` +
+    `<button class="moon" data-seat="${esc(a)}">😴</button></div>`).join("");
   $("seatChips").innerHTML = seats.map((a) => `<button class="chip" data-t="${esc(a)}">@${esc(a)}</button>`).join("");
   document.querySelectorAll(".chip").forEach((c) => c.classList.toggle("active", c.dataset.t === state.chip));
   $("tagline").textContent = `you · ${seats.join(" · ")}`;
@@ -1890,17 +2035,47 @@ function applySummary(s) {
     const pill = $("pill_" + a);
     if (!pill) continue;
     const ag = s.agents[a];
+    const asleep = !!ag.asleep;
     pill.classList.toggle("linked", ag.linked);
     pill.classList.toggle("busy", s.busy.includes(a));
     pill.classList.toggle("bad", !ag.command.ok);
+    pill.classList.toggle("asleep", asleep);
     let txt = "";
     if (!ag.command.ok) txt = "not found";
-    else if (s.busy.includes(a)) txt = "typing…";
-    else if (s.cfg.agents[a].model) txt = s.cfg.agents[a].model;
+    else {
+      // A seat can be both: sleep stops the *next* launch, so a response
+      // already running still says so.
+      const bits = [];
+      if (s.busy.includes(a)) bits.push("typing…");
+      if (ag.catchUp && !s.busy.includes(a)) bits.push("catch-up queued");
+      // Held is a subset of pending, never an addend — "3 held · 14 pending"
+      // means 3 of those 14 are messages the user addressed to this seat.
+      // It outlives sleep: after Wake only the seat is awake and they are still
+      // undelivered, so the count stays until a turn moves the cursor.
+      if (asleep) bits.push(ag.pending ? `asleep · ${ag.pending} pending` : "asleep");
+      if (ag.held) bits.push(`${ag.held} held`);
+      if (!bits.length && s.cfg.agents[a].model) bits.push(s.cfg.agents[a].model);
+      txt = bits.join(" · ");
+    }
     pill.querySelector(".pinfo").textContent = txt ? " · " + txt : "";
     pill.title = ag.command.ok
       ? (ag.linked ? `session linked (${ag.sessionRef}…) · seen through turn ${ag.cursor}` : "fresh session")
       : ag.command.detail;
+    const moon = pill.querySelector(".moon");
+    const reason = (ag.sleep && ag.sleep.reason) || "";
+    moon.classList.toggle("on", asleep);
+    moon.textContent = asleep ? "☀" : "😴";
+    // The pending count is context, not a token estimate — but this is the one
+    // moment the size of the next turn is knowable before it runs, and that
+    // turn arrives right after whatever quota event caused the sleep.
+    moon.title = asleep
+      ? `Wake ${seatLabel(a)}${ag.pending ? ` — ${ag.pending} entr${ag.pending === 1 ? "y" : "ies"} pending` : ""}` +
+        `${reason ? ` · asleep: ${reason}` : ""}. ` +
+        (ag.held
+          ? `${ag.held} of them ${ag.held === 1 ? "is a message" : "are messages"} you sent it — choose whether to answer ${ag.held === 1 ? "it" : "them"} on wake.`
+          : "Nothing is replayed; its next turn carries them as ordinary context.")
+      : `Put ${seatLabel(a)} to sleep — no message, @call or lurk launches it until you wake it. ` +
+        `Use this when it is rate limited; a response already running still finishes.`;
     const ear = pill.querySelector(".ear");
     const lurking = !!s.cfg.agents[a].lurk;
     ear.classList.toggle("on", lurking);
@@ -1962,9 +2137,78 @@ function applySummary(s) {
   setQueue(s.queued || 0, s.queue, s.queuedDispatches);
   refreshHeard(0, Infinity); // busy/cursor changes can flip pending/unheard dots
   updateBusyUI();
+  renderHopControl();
   updateRouteHint();
 }
+// Waking a seat that is holding messages asks a question with three answers,
+// so it gets a real menu; a plain toggle stays a plain toggle when there is
+// nothing held to decide about.
+function closeWakeMenu() {
+  $("wakeMenu").classList.remove("open");
+  $("wakeMenu").innerHTML = "";
+}
+function openWakeMenu(moon, agent, held) {
+  const menu = $("wakeMenu");
+  menu.innerHTML =
+    `<button role="menuitem" data-wake="deliver" data-seat="${esc(agent)}">` +
+    `☀ Wake &amp; deliver<span class="sm-sub">answers the ${held} held message${held === 1 ? "" : "s"} in one turn</span></button>` +
+    `<button role="menuitem" data-wake="only" data-seat="${esc(agent)}">` +
+    `☀ Wake only<span class="sm-sub">held message${held === 1 ? " becomes" : "s become"} ordinary context</span></button>`;
+  menu.classList.add("open");
+  // Fixed positioning against the button: the pill row it lives in is rebuilt
+  // on every room update, so an anchored child would be thrown away mid-choice.
+  const r = moon.getBoundingClientRect();
+  const w = menu.offsetWidth;
+  menu.style.left = `${Math.max(8, Math.min(r.right - w, window.innerWidth - w - 8))}px`;
+  menu.style.top = `${r.bottom + 7}px`;
+}
+async function wakeSeatFromMenu(agent, deliver) {
+  closeWakeMenu();
+  try {
+    const res = await api("/api/seat/sleep",
+      { room: state.room, agent, asleep: false, ...(deliver ? { deliver: true } : {}) });
+    toast(deliver && res.delivered
+      ? `☀ ${agent} is awake — answering ${res.held} held message${res.held === 1 ? "" : "s"}`
+      : `☀ ${agent} is awake — nothing was replayed`);
+  } catch (err) { toast(err.message, true); }
+}
+$("wakeMenu").addEventListener("click", (e) => {
+  const choice = e.target.closest("[data-wake]");
+  if (choice) wakeSeatFromMenu(choice.dataset.seat, choice.dataset.wake === "deliver");
+});
+// Anywhere else, including Escape, means "not now" — which is why this cannot
+// be a confirm(): its Cancel would have to double as one of the two wakes.
+document.addEventListener("click", (e) => {
+  if (!e.target.closest("#wakeMenu") && !e.target.closest(".moon")) closeWakeMenu();
+});
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeWakeMenu(); });
+
 $("pills").addEventListener("click", async (e) => {
+  const moon = e.target.closest(".moon");
+  if (moon && state.summary) {
+    const a = moon.dataset.seat;
+    const ag = state.summary.agents[a] || {};
+    const asleep = !!ag.asleep;
+    if (asleep && ag.held > 0) {
+      if ($("wakeMenu").classList.contains("open")) closeWakeMenu();
+      else openWakeMenu(moon, a, ag.held);
+      return;
+    }
+    closeWakeMenu();
+    // Sleeping cancels what the lanes still owe this seat, so say so before it
+    // happens rather than in a note afterwards.
+    const owed = ((state.summary.queue) || []).filter((it) => (it.agents || []).includes(a)).length;
+    if (!asleep && owed && !confirm(
+      `${a} has ${owed} queued deliver${owed === 1 ? "y" : "ies"}.\n\n` +
+      `Sleeping it cancels ${owed === 1 ? "that" : "those"} now — nothing waits for a seat that won't take it. Continue?`)) return;
+    try {
+      await api("/api/seat/sleep", { room: state.room, agent: a, asleep: !asleep });
+      toast(asleep
+        ? `☀ ${a} is awake — nothing was replayed`
+        : `😴 ${a} is asleep — nothing will be launched for it until you wake it`);
+    } catch (err) { toast(err.message, true); }
+    return;
+  }
   const ear = e.target.closest(".ear");
   if (!ear || !state.summary) return;
   const a = ear.dataset.seat;
@@ -2150,20 +2394,183 @@ function guessTextTarget(raw) {
   for (const s of seats) if (tags.has(s)) return s;
   return null;
 }
+function seatAsleep(a) {
+  const s = state.summary;
+  return !!(s && s.agents && s.agents[a] && s.agents[a].asleep);
+}
+// The send succeeds either way now — this says *when* the answer arrives, so
+// the user is not left waiting on a seat that will not reply until it is woken.
+function sleepHint(targets) {
+  const dozing = targets.filter(seatAsleep);
+  if (!dozing.length) return "";
+  if (dozing.length === targets.length) return ` · 😴 ${dozing.join(" + ")} asleep — held until wake`;
+  return ` · 😴 held for ${dozing.join(" + ")} until wake`;
+}
+function normalizedHopBudget(value, fallback = -1) {
+  const n = Number(value);
+  if (!Number.isSafeInteger(n) || n < -1) return fallback;
+  return n;
+}
+function roomHopBudget() {
+  return normalizedHopBudget(state.summary && state.summary.cfg && state.summary.cfg.hopBudget, -1);
+}
+function hopBudgetLabel(value) { return Number(value) === -1 ? "∞" : String(value); }
+function hopBudgetDetail(value) {
+  const budget = normalizedHopBudget(value, -1);
+  if (budget === -1) return "follow up until settled (the safety stop still applies)";
+  if (budget === 0) return "no agent-to-agent follow-ups; a lurker may still react";
+  return `allow up to ${budget} agent follow-up${budget === 1 ? "" : "s"}`;
+}
+function pairControlOnly(raw, hasAttachments = false) {
+  if (hasAttachments) return false;
+  const text = String(raw || "").trim();
+  if (!/^\/pair\b/i.test(text)) return false;
+  if (/^\/pair\s+(?:end|stop|off)\b/i.test(text)) return true;
+  let body = text.replace(/^\/pair\b\s*/i, "").replace(/^start\b\s*/i, "");
+  // Match parsePair(): a rounds token must end at whitespace or end-of-input,
+  // never at `@`; `start3` likewise remains task text.
+  body = body.replace(/^\d{1,2}(?:\s+|$)/, "").trim();
+  const target = guessTextTarget(body);
+  if (target && target !== "both") {
+    // Mirror textTarget's leading-tag grammar, including Markdown emphasis.
+    body = body.replace(new RegExp(`^[*_~]*@${target}\\b[*_~]*[\\s:,]*`, "i"), "").trim();
+  }
+  return !body;
+}
+function soloTargetProblem(raw, hasAttachments = false) {
+  if (state.hopChoice !== "solo" || !state.summary) return "";
+  const text = String(raw || "").trim();
+  if (/^\/pair\b/i.test(text) && !pairControlOnly(text, hasAttachments)) {
+    return "Solo cannot start or run a pair cycle — choose Room or a hop budget.";
+  }
+  const explicit = guessTextTarget(text);
+  if (explicit === "both") return "Solo needs one target — tag only one seat, not @both or both names.";
+  if (state.summary.pair && !explicit && !text.startsWith("/")) {
+    return "Solo needs one explicit @seat while pair mode is on.";
+  }
+  const target = explicit
+    || (state.chip !== "auto" ? state.chip : (state.summary.lastAddressed || state.summary.cfg.defaultAgent));
+  return target === "both" ? "Solo needs one target — choose a single seat." : "";
+}
+function closeHopMenu() {
+  const wrap = $("hopWrap");
+  if (!wrap) return;
+  wrap.classList.remove("open");
+  $("hopBtn").setAttribute("aria-expanded", "false");
+}
+function openHopMenu() {
+  const wrap = $("hopWrap"), btn = $("hopBtn"), menu = $("hopMenu");
+  wrap.classList.add("open");
+  btn.setAttribute("aria-expanded", "true");
+  const r = btn.getBoundingClientRect();
+  const w = menu.offsetWidth, h = menu.offsetHeight;
+  menu.style.left = `${Math.max(8, Math.min(r.left, window.innerWidth - w - 8))}px`;
+  menu.style.top = `${Math.max(8, r.top - h - 7)}px`;
+}
+function renderHopControl() {
+  const roomBudget = roomHopBudget();
+  const choice = state.hopChoice;
+  const btn = $("hopBtn");
+  const shown = choice === "default"
+    ? `Room (${hopBudgetLabel(roomBudget)})`
+    : choice === "solo" ? "Solo" : hopBudgetLabel(choice);
+  $("hopBtnLabel").textContent = choice === "solo" ? "◎ Solo" : `⛓ Hops: ${shown}`;
+  btn.classList.toggle("override", choice !== "default");
+  btn.title = choice === "solo"
+    ? "Solo applies once: only one selected seat responds. The other seat cannot lurk or react, but can read the transcript on a later turn."
+    : choice === "default"
+      ? `Room default (${hopBudgetLabel(roomBudget)}): ${hopBudgetDetail(roomBudget)}.`
+      : `Next message only (${hopBudgetLabel(choice)}): ${hopBudgetDetail(choice)}. Taskless Pair controls do not consume it.`;
+  $("hopRoomDefault").textContent = `Currently ${hopBudgetLabel(roomBudget)} — ${hopBudgetDetail(roomBudget)}`;
+  document.querySelectorAll("#hopMenu [data-hop-choice]").forEach((option) => {
+    option.setAttribute("aria-checked", String(option.dataset.hopChoice === choice));
+  });
+
+  const both = document.querySelector('.chip[data-t="both"]');
+  if (both) {
+    both.disabled = choice === "solo";
+    both.title = choice === "solo"
+      ? "Solo requires one seat. The other seat will not react, but can read the message in the transcript later."
+      : "Send to both seats";
+  }
+
+  // Solo cannot inherit @both. Fall back to Auto—not a particular seat—so
+  // Parley keeps its normal routing rule instead of quietly choosing the first
+  // provider in the list. Explicit @both text remains intact and is blocked at
+  // Send; only the selected routing chip changes here.
+  if (choice === "solo" && state.chip === "both") {
+    state.chipRevision++;
+    selectChip("auto");
+  }
+
+  const runs = state.summary && Array.isArray(state.summary.hopRuns) ? state.summary.hopRuns : [];
+  const run = runs.length ? runs[runs.length - 1] : null;
+  const progress = $("hopProgress");
+  if (!run) {
+    progress.hidden = true;
+    progress.classList.remove("capped");
+    progress.textContent = "";
+  } else {
+    const used = Math.max(0, Number(run.used) || 0);
+    const budget = normalizedHopBudget(run.budget, -1);
+    const capped = run.phase === "capped" || run.phase === "safety";
+    const capNote = capped ? (run.phase === "safety" || budget === -1 ? " · safety stop" : " · limit") : "";
+    progress.hidden = false;
+    progress.classList.toggle("capped", capped);
+    progress.textContent = `Hops ${used}/${hopBudgetLabel(budget)}${capNote}`;
+    progress.title = `Latest active exchange${run.rootN == null ? "" : ` (message ${run.rootN})`} has used ${used} ` +
+      `of ${budget === -1 ? "the until-settled policy (with a safety stop)" : budget} agent-to-agent hops` +
+      (capped ? (budget === -1 ? " and reached the safety stop" : " and reached its limit") : "") + ".";
+  }
+}
+function selectHopChoice(choice, bumpRevision = true) {
+  const normalized = choice === "default" || choice === "solo"
+    ? choice : String(normalizedHopBudget(choice, -1));
+  if (bumpRevision) state.hopRevision++;
+  state.hopChoice = normalized;
+  closeHopMenu();
+  renderHopControl();
+  updateRouteHint();
+}
+$("hopBtn").onclick = () => {
+  if ($("hopWrap").classList.contains("open")) closeHopMenu();
+  else openHopMenu();
+};
+$("hopMenu").addEventListener("click", (e) => {
+  const option = e.target.closest("[data-hop-choice]");
+  if (!option) return;
+  selectHopChoice(option.dataset.hopChoice);
+  input.focus();
+});
+window.addEventListener("resize", closeHopMenu);
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeHopMenu(); });
 function updateRouteHint() {
   if (!state.summary) return;
-  const explicit = guessTextTarget($("input").value);
+  const raw = $("input").value;
+  const explicit = guessTextTarget(raw);
   const pair = state.summary.pair;
-  if (pair && !explicit && !$("input").value.trim().startsWith("/")) {
-    $("routeHint").textContent = `→ ${pair.worker} · 🔁 ${pair.reviewer} reviews`;
+  const soloProblem = soloTargetProblem(raw, !!(state.draftImages.length || state.draftFiles.length));
+  const soloPairCommand = !!soloProblem && /^\/pair\b/i.test(raw.trim()) &&
+    !/^\/pair\s+(?:end|stop|off)\b/i.test(raw.trim());
+  $("routeHint").classList.toggle("warn", !!soloProblem);
+  if (pair && !explicit && !raw.trim().startsWith("/")) {
+    const dozing = [pair.worker, pair.reviewer].filter(seatAsleep);
+    $("routeHint").textContent = `→ ${pair.worker} · 🔁 ${pair.reviewer} reviews` +
+      (soloProblem ? " · ⚠ Solo needs one explicit @seat" :
+        dozing.length ? ` · 😴 ${dozing.join(" + ")} asleep — pair needs both` : "");
     return;
   }
   const t = explicit
     || (state.chip !== "auto" ? state.chip : (state.summary.lastAddressed || state.summary.cfg.defaultAgent));
   const disc = t === "both" && (state.summary.cfg.mode || "talk") === "work" ? " · discussion (no edits)" : "";
-  $("routeHint").textContent = "→ " + (t === "both" ? state.summary.seats.join(" + ") : t) + disc;
+  const targets = t === "both" ? state.summary.seats : [t];
+  $("routeHint").textContent = "→ " + (t === "both" ? state.summary.seats.join(" + ") : t) +
+    disc + (soloProblem
+      ? (soloPairCommand ? " · ⚠ Solo can't run pair mode" : " · ⚠ Solo needs one seat")
+      : sleepHint(targets));
 }
 function selectChip(target) {
+  if (state.hopChoice === "solo" && String(target) === "both") return false;
   const chips = [...document.querySelectorAll(".chip")];
   const chip = chips.find((candidate) => candidate.dataset.t === String(target));
   if (!chip) return false;
@@ -2232,7 +2639,7 @@ function connect(resyncOnOpen = false) {
     else if (msg.type === "queue") {
       setQueue(msg.size, msg.items, msg.dispatches);
     }
-    else if (msg.type === "lurk") whisper(msg.agent, msg.error, msg.hop, msg.skipped);
+    else if (msg.type === "lurk") whisper(msg.agent, msg.error, msg.hop, msg.skipped, msg.asleep, msg.held, msg.queued);
     else if (msg.type === "status") {
       if (state.summary) { // keep busy state truthful between room summaries
         const b = state.summary.busy || [];
@@ -2260,6 +2667,7 @@ function connect(resyncOnOpen = false) {
       }
       if (msg.phase === "start") ensureLive(msg.agent, msg.startedAt);
       else if (msg.phase === "listening") ensureLive(msg.agent, msg.startedAt, "is listening 👂");
+      else if (msg.phase === "catching-up") ensureLive(msg.agent, msg.startedAt, "is catching up 👂");
       else if (msg.phase === "review") ensureLive(msg.agent, msg.startedAt, "is reviewing 🔁");
       else if (msg.phase === "fix") ensureLive(msg.agent, msg.startedAt, "is fixing 🔁");
       else if (msg.phase === "hop") ensureLive(msg.agent, msg.startedAt, "is following up ⛓");
@@ -2323,6 +2731,14 @@ async function loadRoom(name) {
   state.resyncVersion++;
   state.eventVersion++;
   const roomName = data.room.name || name;
+  if (roomName !== state.room) {
+    // Message policy overrides are drafts scoped to the room where they were
+    // chosen. This revision also prevents an old room's successful send from
+    // resetting a newer choice made after the switch.
+    state.hopRevision++;
+    state.hopChoice = "default";
+    closeHopMenu();
+  }
   state.room = roomName;
   history.replaceState(null, "", roomName === "default" ? location.pathname : "?room=" + encodeURIComponent(roomName));
   // Keep an explicit destination if it exists in the destination room. Only a
@@ -2346,7 +2762,10 @@ async function loadRoom(name) {
   state.providers = data.room.providers || state.providers;
   renderAll({ preserveTransient: false });
   applySummary(data.room);
-  connect();
+  // Opening a room can itself resume a persisted lurk catch-up. Re-pull once
+  // the event stream is attached so an unusually fast catch-up cannot finish
+  // in the GET→SSE gap and leave this tab with a stale entry/receipt snapshot.
+  connect(true);
   await refreshRooms();
 }
 
@@ -2596,6 +3015,36 @@ async function handleSlash(text) {
     } catch (e) { toast(e.message, true); }
     return true;
   }
+  // The 😴 pill toggles with one click, which is what the motivating case (you
+  // just saw a 429) wants. The command exists for the optional reason, which
+  // is worth recording when it's a quota rather than a passing hiccup.
+  if (cmd === "/sleep" || cmd === "/wake") {
+    const seats = (state.summary && state.summary.seats) || [];
+    const named = /^@?([a-z0-9_-]+)/i.exec(rest);
+    const agent = named && seats.includes(named[1].toLowerCase()) ? named[1].toLowerCase() : null;
+    if (!agent) {
+      localSystemNote(`Which seat? Try <b>${esc(cmd)} @${esc(seats[0] || "claude")}</b>` +
+        (cmd === "/sleep" ? " <i>optional reason</i>" : ""));
+      return true;
+    }
+    const reason = rest.slice(named[0].length).trim();
+    try {
+      const res = await api("/api/seat/sleep", {
+        room: state.room, agent, asleep: cmd === "/sleep",
+        ...(cmd === "/sleep" && reason ? { reason } : {}),
+      });
+      // /wake stays wake-only: one command, one outcome, and no menu here to
+      // pick the other. Say what that means for anything held rather than
+      // letting the user assume it was answered — the ☀ menu on the pill is
+      // where Wake & deliver lives.
+      toast(cmd === "/sleep"
+        ? `😴 ${agent} is asleep${reason ? ` — ${reason}` : ""}`
+        : res.held
+          ? `☀ ${agent} is awake — ${res.held} held message${res.held === 1 ? "" : "s"} ${res.held === 1 ? "is" : "are"} now ordinary context, not a request`
+          : `☀ ${agent} is awake — nothing was replayed`);
+    } catch (e) { toast(e.message, true); }
+    return true;
+  }
   if (cmd === "/summarize") {
     input.value = (rest ? rest + " " : "") + "Summarize this room's discussion so far: decisions made, open questions, and next steps. Be concise.";
     await send();
@@ -2608,8 +3057,9 @@ async function handleSlash(text) {
       "<b>/pair start @agent [task]</b> — pair mode: that agent works, the other reviews every message you send<br>" +
       "<b>/pair end</b> — leave pair mode (also the End button in the banner)<br>" +
       "<b>/note [text]</b> — standing room note both agents see every turn (empty clears)<br>" +
+      "<b>/sleep @agent [reason]</b> — stop launching that seat (rate limited?); <b>/wake @agent</b> brings it back<br>" +
       "<b>/summarize [@agent]</b> — ask for a recap of the room<br>" +
-      "<b>👂</b> on a pill = lurk · <b>💬/🔨</b> = talk/work mode · dots under messages = who heard what");
+      "<b>👂</b> on a pill = lurk · <b>😴</b> = sleep/wake that seat · <b>💬/🔨</b> = talk/work mode · dots under messages = who heard what");
     return true;
   }
   localSystemNote(`Unknown command <b>${esc(cmd)}</b> — try <b>/help</b>`);
@@ -2629,12 +3079,20 @@ async function send() {
   const sentTarget = state.chip;
   const sentResync = state.resyncVersion;
   const chipRevision = state.chipRevision;
+  const sentHopChoice = state.hopChoice;
+  const hopRevision = state.hopRevision;
   const sendVersion = ++state.sendVersion;
+  const relayControlOnly = pairControlOnly(text, !!(imageDrafts.length || fileDrafts.length));
   if (text.startsWith("/")) {
+    const problem = /^\/pair\b/i.test(text)
+      ? soloTargetProblem(text, !!(imageDrafts.length || fileDrafts.length)) : "";
+    if (problem) { toast(problem, true); return; }
     input.value = ""; autosize(); hideMention();
     const handled = await handleSlash(text);
     if (handled) return;
   } else {
+    const problem = soloTargetProblem(text);
+    if (problem) { toast(problem, true); return; }
     input.value = ""; autosize(); hideMention();
   }
   state.sending = true;
@@ -2650,12 +3108,23 @@ async function send() {
       mime: draft.file.type || "application/octet-stream",
       data: await fileBase64(draft.file),
     })));
-    const r = await api("/api/message", { room: sentRoom, text, target: sentTarget, images, files });
+    const body = { room: sentRoom, text, target: sentTarget, images, files };
+    // Pair controls append no user turn, so they neither consume nor transmit
+    // the one-shot relay policy selected for the next actual message.
+    if (!relayControlOnly && sentHopChoice === "solo") body.solo = true;
+    else if (!relayControlOnly && sentHopChoice !== "default") {
+      body.hopBudget = normalizedHopBudget(sentHopChoice, -1);
+    }
+    const r = await api("/api/message", body);
     clearDraftImages(imageDrafts.map((draft) => draft.id));
     clearDraftFiles(fileDrafts.map((draft) => draft.id));
     if (r.explicit && r.target && state.room === sentRoom && state.resyncVersion === sentResync &&
         state.chipRevision === chipRevision && state.sendVersion === sendVersion) {
       selectChip(r.target);
+    }
+    if (!relayControlOnly && sentHopChoice !== "default" && state.room === sentRoom &&
+        state.hopRevision === hopRevision && state.sendVersion === sendVersion) {
+      selectHopChoice("default");
     }
     if (r.queued) toast(`⏳ Queued (#${r.position}) — sends when the target lane is free.`);
     // Partly delivered: the free seat is already answering, the busy one is next.
@@ -3075,7 +3544,7 @@ function openSettings() {
   $("s_default").innerHTML = s.seats.map((x) => `<option>${esc(x)}</option>`).join("");
   $("s_default").value = s.cfg.defaultAgent || s.seats[0];
   $("s_timeout").value = Math.round((s.cfg.timeoutMs || 300000) / 1000);
-  $("s_maxhops").value = s.cfg.maxHops || 0;
+  $("s_hopbudget").value = String(normalizedHopBudget(s.cfg.hopBudget, -1));
   $("s_pairrounds").value = s.cfg.pairRounds || 0;
   $("overlay").classList.add("open");
 }
@@ -3086,6 +3555,11 @@ $("overlay").addEventListener("click", (e) => { if (e.target === $("overlay")) c
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeSettings(); });
 $("mSave").onclick = async () => {
   const s = state.summary; if (!s) return;
+  const roomHopBudget = Number($("s_hopbudget").value);
+  if (!Number.isSafeInteger(roomHopBudget) || roomHopBudget < -1) {
+    toast("Hop budget must be -1 (until settled) or a non-negative whole number.", true);
+    return;
+  }
   const agents = {};
   for (const a of s.seats) {
     agents[a] = {};
@@ -3120,7 +3594,7 @@ $("mSave").onclick = async () => {
   const config = {
     defaultAgent: $("s_default").value,
     timeoutMs: Math.max(10, Number($("s_timeout").value) || 300) * 1000,
-    maxHops: Math.min(8, Math.max(0, Number($("s_maxhops").value) || 0)),
+    hopBudget: roomHopBudget,
     pairRounds: Math.min(99, Math.max(0, Number($("s_pairrounds").value) || 0)),
     projectDir: $("s_projdir").value.trim() || null,
     roomNote: $("s_roomnote").value.trim() || null,

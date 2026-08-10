@@ -20,7 +20,7 @@ Each room is a folder under `~/.parley/<room>/`:
 
 ```
 room.json        config (see below)
-state.json       session ids + per-agent cursors
+state.json       sessions, per-agent cursors, per-seat sleep and persisted lurk catch-up state
 events.jsonl     machine-readable transcript (source of truth)
 transcript.md    human-readable transcript (what "Download transcript" serves)
 workspace/       shared folder; both agent CLIs run with this as cwd
@@ -31,6 +31,8 @@ workspace/       shared folder; both agent CLIs run with this as cwd
 ```json
 {
   "defaultAgent": "claude",
+  "hopBudget": -1,
+  "pairRounds": 0,
   "timeoutMs": 900000,
   "agents": {
     "claude": { "command": "claude", "model": null, "permissionMode": "auto", "extraArgs": [] },
@@ -42,6 +44,8 @@ workspace/       shared folder; both agent CLIs run with this as cwd
 - **`model`** overrides the CLI's default model (`--model` / `-m`) and **`effort`** sets reasoning effort (claude `--effort`, codex `model_reasoning_effort`). Both are **free-text comboboxes**, and the suggestions are discovered rather than hardcoded: Codex maintains `~/.codex/models_cache.json`, so Parley lists exactly the models your CLI knows about and the reasoning levels each supports — new OpenAI models appear without a Parley update. Claude Code keeps no such list, so its suggestions are static aliases (`opus`, `sonnet`, …) plus the effort levels including `ultracode`. Anything you type is passed straight through; an unrecognized value simply comes back as the CLI's own error in the chat.
 - **`command`** lets you point a seat at a different binary or path.
 - **`lurk`** / **`lurkStyle`** / **`lurkPrompt`** — see [conversation.md](conversation.md#lurk-mode-).
+- **`hopBudget`** controls agent-to-agent handoffs per user message: `-1` means until settled (with the emergency safety stop), `0` means none, and any positive integer is an exact limit. Rooms written with the legacy `maxHops` key are migrated on load; its old `0 = until settled` becomes `hopBudget: -1`. Settings accepts any safe whole number; the one-message composer control deliberately offers only quick overrides through `8` without editing `room.json`.
+- **`pairRounds`** is separate from `hopBudget`: `0` means review until approved, while a positive value caps Pair fix/review rounds.
 - **`permissionMode`** (Claude) and **`sandbox`** (Codex) — see [permissions.md](permissions.md).
 
 ## Rooms and seats
@@ -84,6 +88,8 @@ Attachment-only messages work too, Retry reuses the same stored bytes, and a fai
 | `/pair start [rounds] @agent [task]` | Start a pair session — see [conversation.md](conversation.md#pair-mode-) |
 | `/pair end` | End pair mode |
 | `/note <text>` | Set the room note; no text clears it |
+| `/sleep @agent [reason]` | Stop launching that seat — see [conversation.md](conversation.md#sleeping-a-seat-) |
+| `/wake @agent` | Bring it back; nothing is replayed |
 | `/summarize` | Recap of decisions and open questions |
 | `/help` | List commands |
 
@@ -92,6 +98,8 @@ Attachment-only messages work too, Retry reuses the same stored bytes, and a fai
 ## Elsewhere in the UI
 
 Live "thinking…" indicators and streamed reply text; markdown rendering with copy-able code blocks; multiple rooms in the sidebar, each with its own config, sessions and transcript; **New conversation** to archive the transcript and reset both agents' sessions; a **Retry** button on failed turns; hover any message for a copy button; very long replies collapse with "Show more"; the tab title shows ● when replies land while you're in another window; and one click to **download the room transcript as Markdown** or **open the shared workspace folder**.
+
+The hops control beside the composer applies to the **next accepted user message**: Room default, Solo, `∞`, or `0`–`8`. A taskless `/pair start` or `/pair end` changes Pair mode without consuming that choice. Solo permits exactly one selected responder for that message, so it cannot be combined with `@both` or a Pair turn; the suppressed seat can still receive the message later as ordinary transcript context. While an exchange is active, the adjacent status shows server-counted launched handoffs against that message's snapshotted budget.
 
 ## Adding a provider
 

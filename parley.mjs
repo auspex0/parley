@@ -26,7 +26,16 @@ const UI_FILE = path.join(__dirname, "ui", "index.html");
 // already-running Node process did not understand.
 const UI_HTML = fs.readFileSync(UI_FILE, "utf8");
 // 5: busyInfo provenance, queue snapshots with queueGroupId, scoped Stop.
-const RUNTIME_PROTOCOL = "5";
+// 6: per-seat sleep — summary carries each seat's sleep state and, while
+//    asleep, the size of the backlog its next turn will carry; plus the count
+//    of messages held for it, and the `deliver` option on wake. The count and
+//    the option are why this is a protocol change and not an additive field: a
+//    cached older UI would tell the user a message to a sleeping seat "won't
+//    send" while the server is accepting and holding it.
+// 7: persisted lurk catch-up/outcomes and live hop progress; `hopBudget` also
+//    replaces the old zero-is-unlimited `maxHops` contract, and messages may
+//    carry a one-shot relay policy (including Solo).
+const RUNTIME_PROTOCOL = "7";
 const IS_WIN = process.platform === "win32";
 
 const IMAGE_TYPES = new Map([
@@ -198,13 +207,44 @@ function defaultConfig(seats = DEFAULT_SEATS) {
   return {
     defaultAgent: seats[0],
     mode: "talk",     // "talk" (chat, conservative permissions) | "work" (agents may write/run in the workspace)
-    maxHops: 0,       // agent-to-agent follow-ups per user message (0 = no configured limit)
+    hopBudget: -1,    // agent-to-agent follow-ups per user message (-1 = until settled, 0 = none)
     pairRounds: 0,    // review rounds per message in pair mode (0 = until the reviewer approves)
     projectDir: null, // absolute path of a real project to work in (null = room's own sandbox workspace)
     roomNote: null,   // standing instruction prepended to every prompt (set via Settings or /note)
     timeoutMs: 900000,
     agents: Object.fromEntries(seats.map((s) => [s, { ...providerOf(s).defaults }])),
   };
+}
+
+// One vocabulary everywhere: -1 means "until settled" (still fenced by the
+// emergency safety ceiling), 0 means no relay calls, and positive values are
+// exact budgets. Room Settings deliberately permits any safe positive integer;
+// the compact composer picker exposes only its quick 0–8 choices. The old
+// `maxHops` key used 0 for "until settled", so callers migrating that key must
+// translate its zero before using this normalizer.
+function normalizeHopBudget(value, fallback = -1) {
+  const n = Number(value);
+  if (!Number.isSafeInteger(n) || n < -1) return fallback;
+  return n;
+}
+
+function requireRoomHopBudget(value, label = "hopBudget") {
+  const n = typeof value === "number" ? value
+    : (typeof value === "string" && value.trim() !== "" ? Number(value) : NaN);
+  if (!Number.isSafeInteger(n) || n < -1) {
+    throw Object.assign(new Error(`${label} must be -1 (until settled) or a non-negative integer`), { status: 400 });
+  }
+  return n;
+}
+
+// The one-message API is intentionally narrower than the room default: the
+// composer is a quick choice, not an unbounded per-message cost control.
+function requireMessageHopBudget(value, label = "message hopBudget") {
+  const n = requireRoomHopBudget(value, label);
+  if (n > 8) {
+    throw Object.assign(new Error(`${label} must be -1 (until settled) or an integer from 0 to 8`), { status: 400 });
+  }
+  return n;
 }
 function defaultState(seats = DEFAULT_SEATS) {
   return {
@@ -215,6 +255,10 @@ function defaultState(seats = DEFAULT_SEATS) {
     // Persisted, because "nobody received this" has to stay true on every
     // later turn, not just for the exchange that was cancelled.
     cancelledDeliveries: {},
+    // Terminal outcomes for a lurk obligation that was selected but could not
+    // complete. Successful/caught-up receipts outrank these historical ranges
+    // in the UI, so they never need destructive invalidation.
+    lurkOutcomes: [],
     pair: null,     // { worker, reviewer, rounds, roundsSource } while pair mode is on
     codexLastWarned: false,
     // Current normalized room-note state. The revision advances on both edits
@@ -225,6 +269,11 @@ function defaultState(seats = DEFAULT_SEATS) {
     agents: Object.fromEntries(seats.map((s) => [s, {
       sessionRef: null,
       cursor: 0,
+      // null while awake, else { since, reason }. A *condition* — temporary and
+      // externally caused — rather than part of how the seat is configured, so
+      // it lives here beside the cursor it has to stay consistent with instead
+      // of in cfg.agents[s] next to `lurk`. Legacy state files merge to null.
+      asleep: null,
       // Prompt-delivery fields are deliberately absent: defaults would be
       // merged into legacy state and claim a live session heard instructions
       // it never received. They are written together only after a successful
@@ -1195,10 +1244,25 @@ function loadRoom(name, seatChoice, create = false) {
 
   const cfgFile = path.join(dir, "room.json");
   let cfg;
+  let cfgMigrated = false;
   if (fs.existsSync(cfgFile)) {
     const raw = readJSON(cfgFile); // throws on bad JSON — never clobber
+    // `maxHops: 0` meant "until settled" through 1.0.x. A new key makes the
+    // migration idempotent: once `hopBudget` exists, a genuine zero stays zero
+    // on every later load instead of being mistaken for legacy data again.
+    if (!Object.prototype.hasOwnProperty.call(raw, "hopBudget")) {
+      raw.hopBudget = Object.prototype.hasOwnProperty.call(raw, "maxHops")
+        ? (Number(raw.maxHops) === 0 ? -1 : normalizeHopBudget(raw.maxHops, -1))
+        : -1;
+      cfgMigrated = true;
+    }
+    if (Object.prototype.hasOwnProperty.call(raw, "maxHops")) {
+      delete raw.maxHops;
+      cfgMigrated = true;
+    }
     const seats = Object.keys(raw.agents || {}).filter((k) => PROVIDERS[k]).slice(0, 2);
     cfg = pruneSeats(deepMerge(defaultConfig(seats.length === 2 ? seats : DEFAULT_SEATS), raw));
+    cfg.hopBudget = normalizeHopBudget(cfg.hopBudget, -1);
     // A hand-edited unknown value must fail closed to Parley's room default,
     // rather than becoming an ambiguous permission state in the UI.
     if (cfg.agents.claude && !CLAUDE_PERMISSION_MODES.has(cfg.agents.claude.permissionMode)) {
@@ -1207,6 +1271,7 @@ function loadRoom(name, seatChoice, create = false) {
     // Rooms created before deep reasoning levels existed carry the old
     // five-minute cap, which now kills healthy turns; lift only that value.
     if (cfg.timeoutMs === 300000) cfg.timeoutMs = 900000;
+    if (cfgMigrated) writeJSON(cfgFile, cfg);
   } else {
     cfg = defaultConfig(seatChoice && seatChoice.length === 2 ? seatChoice : DEFAULT_SEATS);
     writeJSON(cfgFile, cfg);
@@ -1247,6 +1312,18 @@ function loadRoom(name, seatChoice, create = false) {
       stateMigrated = true;
     }
     state.roomNoteRevision = revision;
+  }
+  // Sleep survives restarts for free by living in state, so a hand-edited or
+  // legacy value has to normalize to one of the two shapes the runtime
+  // understands: null, or { since, reason }. A bare `true` still means asleep.
+  for (const id of seats) {
+    const seat = state.agents[id];
+    const raw = seat.asleep;
+    const normalized = raw ? { since: raw.since || null, reason: cleanSleepReason(raw.reason) } : null;
+    if (JSON.stringify(raw === undefined ? null : raw) !== JSON.stringify(normalized)) {
+      seat.asleep = normalized;
+      stateMigrated = true;
+    }
   }
   if (state.agents.claude) {
     const expectedScope = effectiveClaudePermissionMode(cfg.agents.claude, cfg.mode);
@@ -1318,12 +1395,16 @@ function loadRoom(name, seatChoice, create = false) {
     pending: [],
     pendingSeq: 1,
     exchanges: 0,      // ordinary chains in flight, gaps between turns included
+    // Active per-message relay counters. These are runtime progress only: the
+    // immutable policy itself is persisted on the root user entry.
+    hopRuns: new Map(),
     // Stop all is a line drawn in time, not a flag. Every chain remembers the
     // count it started under and abandons itself once the count moves past it;
     // a boolean would be cleared by the next message the user sent, letting a
     // chain that was already stopped wake up and hop.
     stopEpoch: 0,
     pairActive: null,     // { worker, reviewer } while a pair session runs
+    catchUpScheduled: false,
   };
   rooms.set(name, room);
   return room;
@@ -1678,6 +1759,17 @@ function roomSummary(room) {
       sessionRef: room.state.agents[a].sessionRef ? String(room.state.agents[a].sessionRef).slice(0, 8) : null,
       cursor: room.state.agents[a].cursor,
       command: cmdStatus[a],
+      asleep: isAsleep(room, a),
+      sleep: sleepState(room, a),
+      // Only while asleep: this is the one moment the size of the seat's next
+      // turn is knowable in advance, and it costs a scan of the entry list.
+      pending: isAsleep(room, a) ? pendingForSeat(room, a) : null,
+      // Not gated on sleep, unlike `pending`: after Wake only the seat is awake
+      // and these are still undelivered, so the count has to stay visible until
+      // a turn actually advances the cursor. Held is a *subset* of pending —
+      // never render them as if they sum.
+      held: heldForSeat(room, a).length,
+      catchUp: catchUpState(room, a),
     }])),
     pair: pairSnapshot(room),
     // Settings affect the next room-sourced cycle. If a cycle is already in
@@ -1699,6 +1791,8 @@ function roomSummary(room) {
     // spans a withdrawn entry, so without this the UI cheerfully reports that
     // the seat caught up on a message it was never shown.
     cancelledDeliveries: { ...(room.state.cancelledDeliveries || {}) },
+    lurkOutcomes: [...(room.state.lurkOutcomes || [])],
+    hopRuns: [...(room.hopRuns || new Map()).values()].map((run) => ({ ...run })),
     queued: queueSize(room),
     // `queued` counts deliveries, which is what the lanes owe; one @both held
     // for both seats is two of them. Anything the user reads has to count
@@ -1828,11 +1922,21 @@ function isLiveCancellationNotice(room, e) {
   return isCancellationNotice(e) && liveCancellationWithdrawals(room, e).length > 0;
 }
 
+// The second class of system entry agents must see, and for the same reason as
+// the first: it changes what the surrounding conversation means. A seat that
+// was called and never launched leaves a hole — the other agent's own lurk
+// instruction says its silence "will be read as agreement with what was said"
+// — and the sleeping seat itself only learns on waking that it was asked
+// anything at all, because these entries are still ahead of its cursor.
+function isSleepNotice(e) {
+  return e.kind === "system" && !!(e.meta && e.meta.sleep);
+}
+
 function deltaEntries(room, agent, excludeTurn) {
   const cur = room.state.agents[agent].cursor;
   return room.entries.filter((e) =>
     e.n > cur && e.n !== excludeTurn && e.author !== agent &&
-    (e.kind !== "system" || isLiveCancellationNotice(room, e)));
+    (e.kind !== "system" || isLiveCancellationNotice(room, e) || isSleepNotice(e)));
 }
 
 // Which seats never got a message, because the user cancelled it while it was
@@ -1888,27 +1992,51 @@ function cancellationNoticeLines(room, agent, e, explained) {
   return lines;
 }
 
-function buildDelta(room, agent, excludeTurn, entries = deltaEntries(room, agent, excludeTurn), attachmentContext = null) {
+function buildDelta(room, agent, excludeTurn, entries = deltaEntries(room, agent, excludeTurn), attachmentContext = null, renderOpts = {}) {
   const lines = [];
   const explained = new Set(); // turns this delta already explained as cancelled
+  const catchUpRoots = renderOpts.catchUpRoots instanceof Set ? renderOpts.catchUpRoots : null;
+  const catchUpEntryIndex = catchUpRoots ? new Map(room.entries.map((entry) => [entry.n, entry])) : null;
+  const catchUpScopeFor = (entry) => {
+    if (!catchUpRoots) return "";
+    const rootN = transcriptRootN(room, entry, catchUpEntryIndex);
+    return rootN && catchUpRoots.has(rootN)
+      ? ` · catch-up eligible root #${rootN}`
+      : rootN ? ` · context-only root #${rootN}` : " · context only";
+  };
   for (const e of entries) {
     if (e.kind === "activity") {
-      lines.push(relayMessage(`system activity (${e.author})`, e.text));
+      // Activity entries predate root provenance, so an unrooted one is context
+      // only in catch-up mode rather than an ambiguous invitation to react.
+      lines.push(relayMessage(`system activity (${e.author})${catchUpScopeFor(e)}`, e.text));
     } else if (isCancellationNotice(e)) {
       lines.push(...cancellationNoticeLines(room, agent, e, explained));
+    } else if (isSleepNotice(e)) {
+      // Relayed, not spoken: the same quoted block every other participant's
+      // words travel in, so a sleep notice can't be forged by an agent writing
+      // one into its own reply.
+      lines.push(relayMessage("Parley system", e.text));
     } else if (withdrawnFrom(room, agent, e)) {
       lines.push(withdrawalLine(room, agent, e));
       explained.add(e.n);
       continue; // no body and no attachments: this seat never received either
     } else if (e.kind === "user") {
       const to = e.target === "both" ? "both" : e.target === agent ? "you" : e.target;
+      // A delayed lurk receives the complete delta so it can see whether an
+      // earlier concern was superseded, but only roots that actually selected
+      // this seat as a lurker are invitations to interject. Mark that boundary
+      // in the delivery copy without mutating the transcript itself.
+      const catchUpScope = catchUpScopeFor(e);
       const note = withdrawalNote(room, agent, e);
       if (note) explained.add(e.n);
       if (note) lines.push(note.trim());
-      lines.push(relayMessage(`user (to ${to})`, e.text,
+      lines.push(relayMessage(`user (to ${to})${catchUpScope}`, e.text,
         attachmentPromptLines(room, [e], attachmentContext)));
     } else {
-      lines.push(relayMessage(e.author, e.text,
+      // Replies can interleave when user lanes are busy. Preserve their durable
+      // replyTo/replyRoot association in the delivery copy so a Solo response
+      // cannot be mistaken for part of an eligible lurk exchange.
+      lines.push(relayMessage(`${e.author}${catchUpScopeFor(e)}`, e.text,
         attachmentPromptLines(room, [e], attachmentContext)));
     }
   }
@@ -1923,12 +2051,24 @@ function notePrefix(room) {
   return `[Current room note from the user — supersedes earlier room notes]\n${relayMessage("user room note", note)}\n[End current room note]\n\n`;
 }
 
-function buildPrompt(room, deltaLines, userTurn, attachmentContext = null) {
+// `heldCount` marks a wake & deliver: this message was addressed to the seat
+// while it slept, and everything that arrived afterwards sits above it in the
+// delta at its real position. Said for a single held message too — staleness
+// comes from the elapsed gap, not the count, and sleep here is quota-shaped, so
+// it is measured in hours.
+function buildPrompt(room, deltaLines, userTurn, attachmentContext = null, heldCount = 0) {
   const head = notePrefix(room);
+  const many = heldCount > 1;
+  const held = heldCount >= 1
+    ? `[${many ? `${heldCount} messages were` : "This message was"} held for you while you slept` +
+      `${many ? "; the earlier ones appear above in the order they arrived" : ""}. ` +
+      `Room activity after ${many ? "them" : "it"} may have superseded ${many ? "parts of them" : "it"}. ` +
+      `Address what is still relevant, and say so where later context overtook ${many ? "a request" : "it"}.]\n\n`
+    : "";
   const current = relayMessage("user (to you)", userTurn.text,
     attachmentPromptLines(room, [userTurn], attachmentContext));
-  if (!deltaLines.length) return `${head}${current}`;
-  return `${head}[Room activity since your last turn]\n${deltaLines.join("\n")}\n[End of room activity]\n\n${current}`;
+  if (!deltaLines.length) return `${head}${held}${current}`;
+  return `${head}[Room activity since your last turn]\n${deltaLines.join("\n")}\n[End of room activity]\n\n${held}${current}`;
 }
 
 // @both in a work room is a table discussion: reads allowed, mutations not.
@@ -1946,7 +2086,109 @@ const STEP_STOPPED = Symbol("step-stopped");
 // than advertising Retry or silently disappearing.
 const STEP_INCOMPLETE = Symbol("step-incomplete");
 
+// ---- sleeping seats ----
+//
+// A rate-limited seat could still be invoked from five different places, and
+// the protection has to live in one of them. `findHopTarget` in particular
+// returns an explicit @tag target with no gate of its own, so turning lurk off
+// never protected a limited seat: the other agent writing "@claude" into a
+// reply was enough to spend another 429.
+//
+// Sleep is manual only. Parley never infers it from a provider error, because
+// the adapters have CLI exit codes and stderr text, not a stable
+// provider-independent rate-limit signal — and the failure is already in front
+// of the user, who decides.
+function isAsleep(room, agent) {
+  const seat = room.state.agents[agent];
+  return !!(seat && seat.asleep);
+}
+function sleepState(room, agent) {
+  const seat = room.state.agents[agent];
+  return (seat && seat.asleep) || null;
+}
+// What the seat would be shown the next time it is deliberately delivered to.
+// Waking replays nothing and moves no cursor, so this is exactly the backlog
+// the first turn after waking carries: *context* pending, not a predictable
+// token cost.
+function pendingForSeat(room, agent) {
+  return deltaEntries(room, agent, -1).length;
+}
+
+// The messages the user addressed to this seat while it slept — a filtered view
+// of the transcript, never a parallel store. `meta.audience.asleep` is already
+// written by the dispatch split, and the seat's cursor is the delivered
+// watermark, so this survives a restart for free and empties itself the moment
+// a turn actually advances the cursor.
+//
+// Deliberately not gated on `isAsleep`: after Wake only, the seat is awake and
+// these messages still have not been delivered. Hiding them then would be a lie
+// the user cannot see through.
+function heldForSeat(room, agent) {
+  const seat = room.state.agents[agent];
+  const last = room.entries.length ? room.entries[room.entries.length - 1].n : 0;
+  if (!seat || seat.cursor >= last) return []; // nothing past the watermark to scan
+  return deltaEntries(room, agent, -1).filter((e) =>
+    e.kind === "user" && !!(e.meta && e.meta.audience && Array.isArray(e.meta.audience.asleep) &&
+      e.meta.audience.asleep.includes(agent)));
+}
+
+// A step that never launched because its seat is asleep. Distinct from a
+// failure and from a Stop: nothing broke and the user interrupted nothing, so
+// a pair cycle pauses on it instead of advertising Retry.
+const SEAT_ASLEEP = Symbol("seat-asleep");
+
+// The skip is durable, not merely broadcast. An occupied lurker now receives a
+// persisted catch-up obligation, but a sleeping seat is deliberately unable to
+// launch until the user wakes it; treating that as ordinary delayed delivery
+// would manufacture consensus in the meantime. The UI half still rides the
+// same lurk-status channel used by catch-up and pass events.
+// `opts.held` marks the one case where the message *was* accepted: the user
+// addressed a sleeping seat, and it is waiting rather than lost. These notices
+// are themselves durable and ride the seat's own delta (`isSleepNotice`), so
+// getting this wrong is a correctness bug, not wording polish — on waking, the
+// seat would read "that message was not delivered to it" directly above a
+// message that is about to be delivered to it. Autonomous traffic (hop, lurk,
+// pair review/fix) keeps the original text verbatim: those really are dropped.
+function noteSleepSkip(room, agent, kind, opts = {}) {
+  const held = !!opts.held;
+  broadcast(room, { type: "lurk", agent, spoke: false, skipped: !held, asleep: true, ...(held ? { held: true } : {}) });
+  const from = (opts.trigger && opts.trigger.author) || "the other agent";
+  const text = held
+    ? `📥 ${agent} is asleep — held until wake. Silence here is not agreement.`
+    : kind === "hop"
+      ? `😴 ${agent} is asleep — ${from}'s call to it was not delivered, so the silence here is not agreement.`
+      : kind === "lurk"
+        ? `😴 ${agent} is asleep — it did not overhear this exchange.`
+        : kind === "review" || kind === "fix"
+          ? `😴 ${agent} is asleep — the pair ${kind} was not delivered to it.`
+          : `😴 ${agent} is asleep — that message was not delivered to it.`;
+  appendEntry(room, {
+    kind: "system", author: "system", text,
+    meta: {
+      agent,
+      sleep: {
+        event: held ? "held" : "skip", agent, kind,
+        ...(opts.sourceN === undefined || opts.sourceN === null ? {} : { sourceN: opts.sourceN }),
+      },
+    },
+  });
+}
+
+// The one authoritative gate: every launch function asks it before claiming the
+// seat. The filters at the dispatch sites are UX only — they let the room
+// answer immediately instead of scheduling a run that would refuse later — and
+// none of them is load-bearing. Sleep applies to future launches only; a turn
+// already running finishes, and Stop remains the separate explicit action.
+function refuseIfAsleep(room, agent, kind, opts = {}) {
+  if (!isAsleep(room, agent)) return false;
+  noteSleepSkip(room, agent, kind, opts);
+  return true;
+}
+
 async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) {
+  if (refuseIfAsleep(room, agent, "turn", { sourceN: userTurn.n })) {
+    return opts.signalAsleep ? SEAT_ASLEEP : null;
+  }
   const startedAt = Date.now();
   const gen = room.generation;
   // An ordinary turn answers the user message directly, so the immediate
@@ -1975,7 +2217,7 @@ async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) 
       [userTurn, ...unseen.slice().reverse()], nativeImageBudget(agent));
     const delta = buildDelta(room, agent, userTurn.n, unseen, providerInputs);
     const images = providerInputs.images;
-    const basePrompt = buildPrompt(room, delta, userTurn, providerInputs);
+    const basePrompt = buildPrompt(room, delta, userTurn, providerInputs, opts.heldCount || 0);
     // Scope, prompt note and Claude isolation are all derived together, per
     // attempt: the recovery retry below launches a second process that may
     // start under a mode the first one never saw.
@@ -2107,21 +2349,34 @@ function lurkInstruction(cfgAgent) {
 const LURK_PASS = /^[\s\W]*pass[\s\W]*$/i;
 
 async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE, opts = {}) {
+  if (refuseIfAsleep(room, agent, "lurk", { sourceN: userTurnN > 0 ? userTurnN : null })) return null;
   const startedAt = Date.now();
   const gen = room.generation;
   const heardFrom = room.state.agents[agent].cursor;
   const unseen = deltaEntries(room, agent, -1);
   if (!unseen.length) return;
   const lastSeen = room.entries.length ? room.entries[room.entries.length - 1].n : 0;
+  const catchUpRootSet = new Set((opts.catchUpRoots || [])
+    .map((n) => Number(n) || 0).filter((n) => n > 0));
+  const catchUpRootEntries = opts.catchUp
+    ? [...catchUpRootSet].map((n) => room.entries.find((entry) => entry.n === n && entry.kind === "user"))
+      .filter(Boolean)
+    : [];
+  const ordinarySource = unseen.filter((e) => e.kind !== "system").pop() || unseen[unseen.length - 1];
+  const catchUpThroughN = Number(opts.catchUpThroughN) || lastSeen;
+  const catchUpEntryIndex = opts.catchUp ? new Map(room.entries.map((entry) => [entry.n, entry])) : null;
+  const catchUpSource = opts.catchUp ? [...room.entries].reverse().find((entry) =>
+    entry.n <= catchUpThroughN && entry.kind !== "system" &&
+    transcriptRootN(room, entry, catchUpEntryIndex) === userTurnN) : null;
   // A lurker reacts to the exchange, so the immediate trigger is the last
   // thing it overheard, while the root stays the user message that started it.
   const run = beginRun(room, agent, {
-    phase: "listening", startedAt,
+    phase: opts.catchUp ? "catching-up" : "listening", startedAt,
     rootN: userTurnN > 0 ? userTurnN : null,
     // The last thing it actually overheard someone say. A cancellation notice
     // rides in the same delta but is Parley speaking, not a participant, so it
     // makes a poor "replying to" target.
-    sourceN: (unseen.filter((e) => e.kind !== "system").pop() || unseen[unseen.length - 1]).n,
+    sourceN: (catchUpSource || ordinarySource).n,
     chain: opts.chain || null,
   });
   const onStream = (text) => broadcast(room, { type: "stream", agent, text });
@@ -2131,13 +2386,33 @@ async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE, opts = 
 
   let providerInputs = null;
   try {
-    providerInputs = stageProviderInputs(room, agent, unseen.slice().reverse(), nativeImageBudget(agent));
-    const delta = buildDelta(room, agent, -1, unseen, providerInputs);
+    providerInputs = stageProviderInputs(room, agent,
+      [...catchUpRootEntries.slice().reverse(), ...unseen.slice().reverse()], nativeImageBudget(agent));
+    const delta = buildDelta(room, agent, -1, unseen, providerInputs,
+      opts.catchUp ? { catchUpRoots: catchUpRootSet } : {});
     const images = providerInputs.images;
     const workHint = room.cfg.mode === "work"
       ? "\nThe shared workspace (your working directory) contains the work being discussed — you may read files there to verify claims before judging."
       : "";
-    const head = `${notePrefix(room)}[Room activity since your last turn]\n${delta.join("\n")}\n[End of room activity]\n\n${lurkInstruction(room.cfg.agents[agent])}${workHint}`;
+    const unseenNs = new Set(unseen.map((entry) => entry.n));
+    const previouslyDeliveredRoots = opts.catchUp
+      ? catchUpRootEntries.filter((entry) => !unseenNs.has(entry.n))
+      : [];
+    const priorRootBlock = previouslyDeliveredRoots.length
+      ? "\n\n[Catch-up eligible roots already delivered before this delta]\n" +
+        previouslyDeliveredRoots.map((entry) => relayMessage(`catch-up eligible root #${entry.n}`, entry.text,
+          attachmentPromptLines(room, [entry], providerInputs))).join("\n") +
+        "\n[End previously delivered catch-up roots]"
+      : "";
+    const catchUp = opts.catchUp
+      ? "\n\n(Delivery note: you were enabled as a lurker but were occupied when these exchanges finished. " +
+        "This is one coalesced catch-up over everything you missed. Only entries labelled `catch-up eligible root` " +
+        "belong to exchanges that selected you to react; entries labelled `context only` (including Solo or " +
+        "otherwise unselected traffic) are background for judging whether an eligible issue is stale or resolved. " +
+        "Never interject solely about context-only traffic. Interject only if an eligible issue remains actionable now; " +
+        `otherwise reply exactly [pass].)${priorRootBlock}`
+      : "";
+    const head = `${notePrefix(room)}[Room activity since your last turn]\n${delta.join("\n")}\n[End of room activity]\n\n${lurkInstruction(room.cfg.agents[agent])}${catchUp}${workHint}`;
     // Re-derived per attempt — see makeScope.
     const scopeNow = () => ({ discussion: scope.now(), readOnly: true });
     let turnScope = scopeNow();
@@ -2189,7 +2464,10 @@ async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE, opts = 
         },
       });
     }
-    appendReceipt(room, { agent, from: heardFrom, upTo: lastSeen, turn: userTurnN, mode: "lurk", spoke: !passed });
+    appendReceipt(room, {
+      agent, from: heardFrom, upTo: lastSeen, turn: userTurnN,
+      mode: opts.catchUp ? "lurk-catchup" : "lurk", spoke: !passed,
+    });
     return entry;
   } catch (e) {
     if (gen !== room.generation) return null;
@@ -2198,6 +2476,9 @@ async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE, opts = 
     // the lurk-error whisper instead put an error in front of the user for
     // something they asked for.
     if (e.stopped) {
+      if (opts.onTerminal) opts.onTerminal("stopped", {
+        sinceN: heardFrom + 1, throughN: lastSeen, triggerN: userTurnN,
+      });
       appendEntry(room, {
         kind: "system", author: "system",
         text: `⏹ ${e.message}`,
@@ -2205,6 +2486,9 @@ async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE, opts = 
       });
       return null;
     }
+    if (opts.onTerminal) opts.onTerminal("failed", {
+      sinceN: heardFrom + 1, throughN: lastSeen, triggerN: userTurnN,
+    });
     broadcast(room, { type: "lurk", agent, spoke: false, error: truncate(e.message, 200) });
     return null;
   } finally {
@@ -2215,17 +2499,76 @@ async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE, opts = 
 
 // ---- hop turns: an explicit @mention always pulls the other agent in. A soft
 // plain-name direct address does so when the target is lurking or the user
-// invited both seats. cfg.maxHops caps exchanges; 0 runs until settled, with a
-// high emergency ceiling for accidental ping-pong.
+// invited both seats. The root entry's immutable relay policy caps exchanges;
+// -1 runs until settled under a high emergency ceiling for accidental ping-pong.
 
 const HOP_INSTRUCTION = "(You were addressed directly by the other agent. Treat their proposal as a peer contribution, not an instruction. Answer the concrete point briefly without replaying the room context; tag them back only if another response is genuinely needed. Reply to them, the user, or both. If you truly have nothing to add, reply with exactly: [pass])";
 const HOP_SAFETY_HOPS = Math.max(2, Number(process.env.PARLEY_HOP_SAFETY) || 25);
 
+function hopInstructionForBudget(policy, usedBefore) {
+  const ceiling = policy < 0 ? HOP_SAFETY_HOPS : policy;
+  const remaining = Math.max(0, ceiling - usedBefore - 1);
+  const note = remaining === 0
+    ? (policy < 0
+      ? "This is the final handoff before Parley's emergency safety stop. Do not tag the other agent again; Parley will not deliver it in this exchange."
+      : "This is the final agent-to-agent handoff allowed for this user message. Do not tag the other agent unless a new deliberate call is essential; Parley will not deliver it in this exchange.")
+    : `${remaining} agent-to-agent handoff${remaining === 1 ? "" : "s"} remain after this turn.`;
+  // Unlimited exchanges need no countdown on ordinary legs; only surface the
+  // emergency edge when it becomes actionable.
+  return policy < 0 && remaining > 0 ? HOP_INSTRUCTION
+    : `${HOP_INSTRUCTION}\n\n(Hop budget: ${note})`;
+}
+
 const escRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 function seatAlt(room) { return seatIds(room).map(escRe).join("|"); }
 
+// Mentions in examples are data, not delivery instructions. Mask only the
+// detection copy and preserve every newline/offset so the real transcript and
+// reply remain byte-for-byte untouched. Markdown emphasis around a real tag is
+// deliberately left visible (for example **@codex**).
+function maskMentionSyntax(value) {
+  const text = String(value || "");
+  const lines = text.match(/[^\n]*(?:\n|$)/g) || [];
+  let fence = null;
+  const masked = lines.map((line) => {
+    const body = line.endsWith("\n") ? line.slice(0, -1) : line;
+    const newline = line.endsWith("\n") ? "\n" : "";
+    const marker = /^ {0,3}(`{3,}|~{3,})/.exec(body);
+    if (fence) {
+      const closes = new RegExp(`^ {0,3}${escRe(fence.char)}{${fence.len},}\\s*$`).test(body);
+      if (closes) fence = null;
+      return " ".repeat(body.length) + newline;
+    }
+    if (marker) {
+      fence = { char: marker[1][0], len: marker[1].length };
+      return " ".repeat(body.length) + newline;
+    }
+    if (/^\s*>/.test(body)) return " ".repeat(body.length) + newline;
+
+    const chars = [...body];
+    for (let i = 0; i < chars.length;) {
+      if (chars[i] !== "`") { i++; continue; }
+      let width = 1;
+      while (chars[i + width] === "`") width++;
+      let close = -1;
+      for (let j = i + width; j < chars.length;) {
+        if (chars[j] !== "`") { j++; continue; }
+        let found = 1;
+        while (chars[j + found] === "`") found++;
+        if (found === width) { close = j + found; break; }
+        j += found;
+      }
+      if (close < 0) { i += width; continue; }
+      for (let j = i; j < close; j++) chars[j] = " ";
+      i = close;
+    }
+    return chars.join("") + newline;
+  }).join("");
+  return masked;
+}
+
 function findHopTarget(room, entry, opts = {}) {
-  const text = (entry && entry.text) || "";
+  const text = maskMentionSyntax((entry && entry.text) || "");
   // Markdown emphasis counts as a boundary: agents routinely bold or italicise
   // the tag ("**@codex**"), and that must still read as a real call.
   const explicit = text.matchAll(new RegExp(`(^|[\\s(.,;:!?"'\`*_~])@(${seatAlt(room)})\\b`, "gi"));
@@ -2318,6 +2661,13 @@ const NO_SCOPE = { on: false, now: () => false };
 const HOP_FAILED = Symbol("hop-failed");
 
 async function runHopTurn(room, agent, triggerEntry, rootN, scope = NO_SCOPE, opts = {}) {
+  // A pair review or fix names its own step, so the skip says which one never
+  // ran rather than calling it a hop.
+  if (refuseIfAsleep(room, agent,
+    opts.phase === "review" || opts.phase === "fix" ? opts.phase : "hop",
+    { trigger: triggerEntry, sourceN: triggerEntry.n })) {
+    return opts.signalFailure ? SEAT_ASLEEP : null;
+  }
   const startedAt = Date.now();
   const gen = room.generation;
   // A hop, review or fix answers one specific reply, which is rarely the user
@@ -2377,6 +2727,10 @@ async function runHopTurn(room, agent, triggerEntry, rootN, scope = NO_SCOPE, op
     let res;
     let epoch = seatEpoch(room, agent); // per attempt — see applyAdapterSession
     try {
+      // Everything that can refuse or fail while staging is behind us. Charge
+      // the logical hop at the adapter boundary; a native resume-recovery retry
+      // remains part of this same delivered turn and does not charge twice.
+      if (opts.onLaunch) opts.onLaunch();
       res = await adapters[agent](room, {
         prompt, briefing, onStream, onActivity, images, inputDir: providerInputs.dir,
         allowEmpty: !!opts.allowEmpty, ...turnScope,
@@ -2536,7 +2890,10 @@ function parsePair(text) {
   if (!/^\/pair\b/i.test(t)) return null;
   const rest = t.replace(/^\/pair\b\s*/i, "");
   if (/^(end|stop|off)\b/i.test(rest)) return { action: "end" };
-  const m = /^(?:start\s*)?(?:(\d{1,2})\s+)?([\s\S]*)$/i.exec(rest) || [];
+  // `start` and `rounds` are tokens, not prefixes: `start3` and `3@claude`
+  // stay task text. A rounds token may end the command so `/pair start 3`
+  // can arm the mode without manufacturing a task named "3".
+  const m = /^(?:start\b\s*)?(?:(\d{1,2})(?:\s+|$))?([\s\S]*)$/i.exec(rest) || [];
   const rounds = m[1] === undefined ? null : Math.min(99, Math.max(0, Number(m[1])));
   return { action: "start", rounds, task: (m[2] || "").trim() };
 }
@@ -2566,6 +2923,7 @@ function finishPairWork(room, active, gen) {
   if (room.pairActive === active) room.pairActive = null;
   if (gen === room.generation) drainLanes(room);
   broadcast(room, { type: "room", room: roomSummary(room) });
+  if (gen === room.generation) scheduleCatchUps(room);
 }
 
 function makePairRetryable(room, rootN, pair) {
@@ -2732,6 +3090,14 @@ async function pairReviewLoop(room, pair, trigger, rootN, gen, offset = 0, chain
     });
     if (gen !== room.generation || chainHalted(room, chain)) return;
     if (review === STEP_STOPPED) return;
+    // Pausing, never substituting: the reviewer's job does not pass to the
+    // worker, and an unreviewed cycle is not an approved one. Checked ahead of
+    // pairStepIncomplete, which reads any non-entry as "produced nothing".
+    if (review === SEAT_ASLEEP) {
+      pausePairForUser(room, pair, rootN, reviewer,
+        "is asleep, so the review never ran and nothing was approved — wake it first");
+      return;
+    }
     if (review === HOP_FAILED) {
       pausePairAfterFailure(room, pair, rootN, reviewer, "review");
       return;
@@ -2781,6 +3147,11 @@ async function pairReviewLoop(room, pair, trigger, rootN, gen, offset = 0, chain
     });
     if (gen !== room.generation || chainHalted(room, chain)) return;
     if (trigger === STEP_STOPPED) return;
+    if (trigger === SEAT_ASLEEP) {
+      pausePairForUser(room, pair, rootN, worker,
+        "is asleep, so the fix never ran and the review is still outstanding — wake it first");
+      return;
+    }
     if (trigger === HOP_FAILED) {
       pausePairAfterFailure(room, pair, rootN, worker, "fix");
       return;
@@ -2810,9 +3181,14 @@ async function runPairCycle(room, userTurn, pair, gen, chain) {
   try {
     const work = await runAgentTurn(room, active.worker, userTurn, NO_SCOPE, {
       instruction: pairWorkNote(active.reviewer),
-      signalStop: true, allowEmpty: true, chain,
+      signalStop: true, signalAsleep: true, allowEmpty: true, chain,
     }); // the work itself
     if (work === STEP_STOPPED) return;
+    if (work === SEAT_ASLEEP) {
+      pausePairForUser(room, active, userTurn.n, active.worker,
+        "is asleep, so the work never ran — wake it first");
+      return;
+    }
     if (work && gen === room.generation && !chainHalted(room, chain)) {
       if (pairStepIncomplete(work)) {
         pausePairForUser(room, active, userTurn.n, active.worker, work === STEP_INCOMPLETE
@@ -2841,6 +3217,13 @@ async function runPairCycle(room, userTurn, pair, gen, chain) {
 async function continuePair(room, requestedCapN = null) {
   const pair = pairSnapshot(room);
   if (!pair) throw Object.assign(new Error("pair mode isn't on"), { status: 400 });
+  // A continuation is a fix followed by another review, so it needs both roles
+  // — the same reason a pair turn refuses rather than running half-staffed.
+  const dozing = [pair.worker, pair.reviewer].filter((a) => isAsleep(room, a));
+  if (dozing.length) {
+    throw Object.assign(new Error(`${dozing.join(" and ")} ${dozing.length > 1 ? "are" : "is"} asleep — ` +
+      `pair mode needs both seats. Wake ${dozing.length > 1 ? "them" : "it"} to continue.`), { status: 409 });
+  }
   // Continue starts a fresh cycle straight into both seats without going
   // through the lane queue, so everything the lanes still owe the user has to
   // have cleared first — including a delivery accepted but not yet started.
@@ -2888,7 +3271,10 @@ async function continuePair(room, requestedCapN = null) {
       // or Retry is handed this cycle's old root and rewinds past newer work.
       if (gen !== room.generation || chainHalted(room, chain)) return;
       if (fix === STEP_STOPPED) return;
-      if (fix === HOP_FAILED) {
+      if (fix === SEAT_ASLEEP) {
+        pausePairForUser(room, active, rootN, active.worker,
+          "is asleep, so the fix never ran and the review is still outstanding — wake it first");
+      } else if (fix === HOP_FAILED) {
         pausePairAfterFailure(room, active, rootN, active.worker, "fix");
       } else if (fix && !pairStepIncomplete(fix)) {
         const fixSignal = pairSignal(fix.text);
@@ -2939,7 +3325,7 @@ function planMessage(room, raw, targetSel) {
 // Synchronous validation + kickoff; agent turns continue in the background
 // and surface over SSE. Throws (with .status) on invalid input so the HTTP
 // route can report it.
-function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles) {
+function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles, rawRelay = {}) {
   const raw0 = String(rawText || "").trim();
   if (raw0.length > MAX_MESSAGE_TEXT) {
     throw Object.assign(new Error(`message text must be ${MAX_MESSAGE_TEXT.toLocaleString()} characters or shorter`), { status: 413 });
@@ -2950,6 +3336,21 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles) {
   // drift apart (that disagreement is exactly what made asides queue wrongly).
   const plan = planMessage(room, raw0, targetSel);
   const { pairCmd, starting: startingPair, target, text } = plan;
+  const hasHopOverride = Object.prototype.hasOwnProperty.call(rawRelay, "hopBudget");
+  const hopOverride = hasHopOverride ? requireMessageHopBudget(rawRelay.hopBudget) : null;
+  const solo = rawRelay.solo === true;
+  const tasklessPairStart = startingPair && !text && !prepared.length;
+  // Solo is incompatible with a pair *cycle*, not with the controls that merely
+  // arm or end pair mode. Those controls append no user turn and have no relay
+  // policy to apply, so a one-shot composer choice must not block them.
+  if (solo && (target === "both" || (plan.asPairTurn && !tasklessPairStart))) {
+    throw Object.assign(new Error("Solo needs one ordinary addressee; it cannot be used with @both or a pair turn"), { status: 400 });
+  }
+  const relayPolicy = {
+    hopBudget: solo ? 0 : (hasHopOverride ? hopOverride : normalizeHopBudget(room.cfg.hopBudget, -1)),
+    source: solo ? "solo" : (hasHopOverride ? "message" : "room"),
+    solo,
+  };
 
   if (pairCmd && pairCmd.action === "end") {
     if (prepared.length) throw Object.assign(new Error("attachments cannot be added to /pair end"), { status: 400 });
@@ -2973,6 +3374,47 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles) {
   if (startingPair && target === "both") throw Object.assign(new Error("/pair needs a single worker — tag one agent"), { status: 400 });
   if (!text && !prepared.length && !startingPair) throw Object.assign(new Error("empty message"), { status: 400 });
   if (target !== "both" && !room.cfg.agents[target]) throw Object.assign(new Error(`unknown target: ${target}`), { status: 400 });
+
+  // Only a pair turn still refuses before an entry exists. Everything else is
+  // *held*: the message lands in the thread at the moment it was sent, marked
+  // held, and is delivered when the user wakes the seat — so the transcript
+  // keeps the real order and the request is answered in one turn rather than
+  // bounced back at the user to re-send later. This runs ahead of the
+  // /pair start block below because arming a mode and then rejecting its task
+  // would leave the room half-configured.
+  //
+  // A pair turn cannot split or wait: pair mode pauses rather than substituting
+  // the awake seat for the sleeping role or running a cycle with half of it
+  // missing, and there is no single seat to hold the work for.
+  const dozing = seatIds(room).filter((a) => isAsleep(room, a));
+  if (dozing.length && (startingPair || plan.asPairTurn)) {
+    // Always both seats of the pairing this message would run under: the one
+    // being created, or the one already in force. A start is named from the
+    // command rather than from `plan.pair` — which `parsePlan` does synthesize
+    // for a start, but reading it here would make this gate depend on that, and
+    // the failure mode if it ever stopped is a start judged on the tagged worker
+    // alone: mode armed, worker run, task nobody could review.
+    const needed = startingPair
+      ? [target, otherSeat(room, target)]
+      : [plan.pair.worker, plan.pair.reviewer];
+    const blocked = needed.filter((a) => dozing.includes(a));
+    if (blocked.length) {
+      const who = blocked.map((a) => {
+        const reason = (sleepState(room, a) || {}).reason;
+        return reason ? `${a} (${reason})` : a;
+      }).join(" and ");
+      const plural = blocked.length > 1;
+      // "/pair end" is only an escape hatch if the mode is actually on, which a
+      // refused *first* start leaves it not; and there is no awake seat to fall
+      // back to when both are asleep.
+      const escape = blocked.length === needed.length ? "."
+        : room.state.pair ? ", or /pair end and tag the awake seat directly."
+          : ", or tag the awake seat directly instead of pairing.";
+      throw Object.assign(new Error(`${who} ${plural ? "are" : "is"} asleep — ` +
+        `pair mode needs both seats. Wake ${plural ? "them" : "it"}${escape}`),
+      { status: 409 });
+    }
+  }
 
   // Turning pair mode on: it stays on for every later message until /pair end.
   if (startingPair) {
@@ -3006,7 +3448,15 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles) {
   const effectiveTarget = asPairTurn ? pair.worker : target;
 
   const allSeats = seatIds(room);
-  const agents = effectiveTarget === "both" ? [...allSeats] : [effectiveTarget];
+  const requested = effectiveTarget === "both" ? [...allSeats] : [effectiveTarget];
+  // Only reachable for @both: every other shape was refused above. The message
+  // is real and one seat did receive it, so what the other one missed is
+  // recorded against the entry rather than quietly dropped.
+  // The message is real and is kept for whoever was asleep. For a split @both
+  // one seat receives it now and the other's copy waits; for a message aimed
+  // only at a sleeping seat, `agents` empties and nothing launches at all.
+  const sleeping = requested.filter((a) => isAsleep(room, a));
+  const agents = requested.filter((a) => !sleeping.includes(a));
   // Every turn is appended and snapshotted the moment it is accepted, in the
   // order the user sent it; only the *work* waits. An ordinary turn holds a
   // delivery per occupied seat — including all of them, which is how a @both
@@ -3019,8 +3469,15 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles) {
   if (!asPairTurn && agents.some((a) => room.busy.has(a) && !deferred.has(a))) {
     throw Object.assign(new Error(`${effectiveTarget} is still busy — try again in a moment`), { status: 409 });
   }
-  const listeners = asPairTurn ? [] // the reviewer is already in the loop
-    : allSeats.filter((a) => !agents.includes(a) && room.cfg.agents[a].lurk);
+  // Nobody lurks on a message that was delivered to nobody: with `agents` empty
+  // the only remaining candidates are the sleeping addressee and the seat the
+  // user pointedly did *not* write to, and launching the latter is exactly the
+  // invocation holding exists to avoid. Sleeping seats are excluded outright —
+  // the lurk filter downstream would drop them anyway, but not before writing a
+  // second notice saying the message was never delivered, next to the one
+  // saying it is being held.
+  const listeners = asPairTurn || solo || !agents.length ? [] // the reviewer is already in the loop
+    : allSeats.filter((a) => !agents.includes(a) && !sleeping.includes(a) && room.cfg.agents[a].lurk);
   const discussion = effectiveTarget === "both" && room.cfg.mode === "work";
   const attachments = persistAttachments(room, prepared);
   let userTurn;
@@ -3028,7 +3485,8 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles) {
     userTurn = appendEntry(room, {
       kind: "user", author: "user", target: effectiveTarget, text,
       meta: {
-        audience: { addressed: agents, lurking: listeners },
+        audience: { addressed: agents, lurking: listeners, ...(sleeping.length ? { asleep: sleeping } : {}) },
+        ...(!asPairTurn ? { relay: relayPolicy } : {}),
         ...(attachments.length ? { attachments } : {}),
         ...(discussion ? { discussion: true } : {}),
         ...(asPairTurn ? { pair: { rounds: pair.rounds, worker: pair.worker, reviewer: pair.reviewer } } : {}),
@@ -3045,6 +3503,18 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles) {
     ...(attachments.length ? { attachments } : {}),
   };
   saveState(room);
+  // Recorded after the entry it is about, so the thread reads in the order it
+  // happened: the message, then which seat is holding it until it wakes.
+  for (const a of sleeping) noteSleepSkip(room, a, "turn", { sourceN: userTurn.n, held: true });
+  // Held for everyone it was addressed to: the entry, the notice and the badge
+  // are the whole of the work, and there is no exchange to open. Returning here
+  // rather than letting the block below degrade on an empty `agents` makes
+  // "nothing launches" structural — no chain, no dispatch id, and no exchange
+  // counted for a message with no participants.
+  if (!agents.length) {
+    broadcast(room, { type: "room", room: roomSummary(room) });
+    return { target: effectiveTarget, explicit: plan.explicit, held: sleeping };
+  }
   const scope = makeScope(room, userTurn.n, effectiveTarget, discussion);
   // One id per accepted dispatch, not per message: a message that produces a
   // second batch later gets a second id, so cancelling one never reaches the
@@ -3092,6 +3562,11 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles) {
   // in one of those gaps, so anything that must not change underneath a single
   // exchange — the project folder — asks about this, not about `busy`.
   room.exchanges++;
+  const hopRun = {
+    id: queueGroupId, rootN: userTurn.n, used: 0,
+    budget: relayPolicy.hopBudget, phase: "running",
+  };
+  room.hopRuns.set(queueGroupId, hopRun);
   (async () => {
    try {
     // One entry, one coordinator, one delivery per addressed seat. A free seat
@@ -3109,17 +3584,24 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles) {
     // no exchange to continue: no hops, and no lurk check either — a lurker
     // chiming in about a message the user cancelled is the whole bug. A split
     // @both whose other half already ran keeps its chain.
-    if (chain.cancelled && !chain.delivered) return;
+    if (chain.cancelled && !chain.delivered) {
+      for (const a of listeners) noteLurkOutcome(room, a, userTurn.n, "cancelled");
+      return;
+    }
+    if (chainHalted(room, chain)) {
+      for (const a of listeners) noteLurkOutcome(room, a, userTurn.n, "stopped");
+      return;
+    }
     const invoked = new Set(agents);
 
-    // Bounded exchange loop. maxHops budgets agent-triggered follow-ups —
+    // Bounded exchange loop. hopBudget budgets agent-triggered follow-ups —
     // an open-ended chain that needs a counter. A lurker's spoken chime always
     // earns the other agent one reply back (right of reply); that step is
     // structurally bounded (lurkers evaluate exactly once per user message —
     // no re-lurking, or two polite agents would ping-pong forever), so it
     // doesn't consume the budget. Lurk's cost is lurk's own toggle.
-    const configuredHops = Math.min(8, Math.max(0, room.cfg.maxHops | 0));
-    const maxHops = configuredHops || HOP_SAFETY_HOPS;
+    const configuredBudget = relayPolicy.hopBudget;
+    const hopLimit = configuredBudget < 0 ? HOP_SAFETY_HOPS : configuredBudget;
     const allowPlain = userTurn.target === "both";
     let hops = 0, capped = false;
     const queue = [];
@@ -3131,35 +3613,67 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles) {
         const trigger = queue.shift();
         const target = findHopTarget(room, trigger, { allowPlain });
         if (!target) continue;
+        // Ahead of the budget check: a call that was never delivered must not
+        // spend a hop. This is the hole the gate was built for — an explicit
+        // @tag routes here with no lurk check of its own.
+        if (isAsleep(room, target)) {
+          noteSleepSkip(room, target, "hop", { trigger, sourceN: trigger.n });
+          continue;
+        }
         // A seat delivered to late read this reply in its own delta and has
         // already answered it, so hopping would be the same agent replying
         // twice to one message. Its cursor is the test: anything it has not
         // seen yet — a later reply, a chime — still hops normally.
         if (deferred.has(target) && room.state.agents[target].cursor >= trigger.n) continue;
-        if (hops >= maxHops) { capped = true; return; }
+        if (hops >= hopLimit) { capped = true; return; }
         if (seatOccupied(room, target) && !(await waitForHopSeat(room, target, gen, chain))) {
           broadcast(room, { type: "lurk", agent: target, spoke: false, skipped: true });
           continue;
         }
-        hops++;
-        const reply = await runHopTurn(room, target, trigger, userTurn.n, scope, { chain });
+        const reply = await runHopTurn(room, target, trigger, userTurn.n, scope, {
+          chain,
+          instruction: hopInstructionForBudget(configuredBudget, hops),
+          onLaunch: () => {
+            hops++;
+            hopRun.used = hops;
+            broadcast(room, { type: "room", room: roomSummary(room) });
+          },
+        });
         if (gen !== room.generation) return;
         invoked.add(target);
         if (reply) queue.push(reply);
       }
     };
     await drainMentions();
-    if (gen !== room.generation || chainHalted(room, chain)) return;
+    if (gen !== room.generation) return;
+    if (chainHalted(room, chain)) {
+      for (const a of listeners) noteLurkOutcome(room, a, userTurn.n, "stopped");
+      return;
+    }
 
     const lurkers = listeners.filter((a) => !invoked.has(a)).filter((a) => {
-      if (seatOccupied(room, a)) { // busy in another lane — the delta catches it up later
-        broadcast(room, { type: "lurk", agent: a, spoke: false, skipped: true });
+      // Asked before busy: a sleeping seat is not busy, and the busy path's
+      // "the delta catches it up later" is exactly what does not hold here.
+      if (isAsleep(room, a)) {
+        noteSleepSkip(room, a, "lurk", { sourceN: userTurn.n });
+        return false;
+      }
+      if (!room.cfg.agents[a].lurk) {
+        noteLurkOutcome(room, a, userTurn.n, "disabled");
+        return false;
+      }
+      if (seatOccupied(room, a)) {
+        const throughN = room.entries.length ? room.entries[room.entries.length - 1].n : userTurn.n;
+        queueLurkCatchUp(room, a, userTurn.n, throughN);
         return false;
       }
       return true;
     });
     const chimeResults = lurkers.length
-      ? await Promise.allSettled(lurkers.map((a) => runListenerTurn(room, a, userTurn.n, scope, { chain })))
+      ? await Promise.allSettled(lurkers.map((a) => runListenerTurn(room, a, userTurn.n, scope, {
+        chain,
+        onTerminal: (reason, range) => persistLurkOutcome(room, a, range, reason),
+      })))
       : [];
     if (gen !== room.generation || chainHalted(room, chain)) return;
 
@@ -3168,6 +3682,10 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles) {
       for (const chime of chimes) {
         if (chainHalted(room, chain)) break;
         const target = findHopTarget(room, chime, { allowPlain }) || otherSeat(room, chime.author);
+        if (isAsleep(room, target)) {
+          noteSleepSkip(room, target, "hop", { trigger: chime, sourceN: chime.n });
+          continue;
+        }
         if (seatOccupied(room, target) && !(await waitForHopSeat(room, target, gen, chain))) {
           broadcast(room, { type: "lurk", agent: target, spoke: false, skipped: true });
           continue;
@@ -3182,23 +3700,263 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles) {
     }
 
     if (capped) {
+      hopRun.phase = configuredBudget < 0 ? "safety" : "capped";
       appendEntry(room, {
         kind: "system", author: "system",
-        text: configuredHops > 0
-          ? `⛓ Agent-hop budget reached (${configuredHops}) — raise "Agent-to-agent hops" in Settings for longer exchanges.`
-          : `🛑 Agent-hop safety stop after ${HOP_SAFETY_HOPS} exchanges — the agents may be stuck in a loop.`,
+        text: configuredBudget === 0
+          ? "Agent-to-agent reply not delivered — hops are off for this message. The reply remains in the transcript for later context."
+          : configuredBudget > 0
+            ? `⛓ Agent-hop budget reached (${configuredBudget}) — choose a higher per-message cap for a longer exchange.`
+            : `🛑 Agent-hop safety stop after ${HOP_SAFETY_HOPS} exchanges — the agents may be stuck in a loop.`,
+        meta: { relayCap: { rootN: userTurn.n, budget: configuredBudget, used: hops } },
       });
+      broadcast(room, { type: "room", room: roomSummary(room) });
     }
 
     drainLanes(room); // messages the user queued while the table was busy
    } finally {
-     room.exchanges--;
+     room.exchanges = Math.max(0, room.exchanges - 1);
+     room.hopRuns.delete(queueGroupId);
      broadcast(room, { type: "room", room: roomSummary(room) });
+     scheduleCatchUps(room);
    }
   })();
   // after kickoff, so the summary includes the now-busy agents
   broadcast(room, { type: "room", room: roomSummary(room) });
   return { target: effectiveTarget, explicit: plan.explicit, deferred: [...deferred] };
+}
+
+// ---- guaranteed lurk catch-up ----
+//
+// Lurk is a delivery promise (the UI says the seat overhears every exchange),
+// not a best-effort pulse. If a selected listener is occupied, keep one
+// coalesced obligation per seat. It deliberately stays outside `room.pending`:
+// that lane is arrival-ordered user work and must always run first.
+function catchUpState(room, agent) {
+  const seat = room.state.agents[agent];
+  const raw = seat && seat.pendingCatchUp;
+  if (!raw) return null;
+  const sinceN = Number(raw.sinceN) || 0;
+  const throughN = Number(raw.throughN) || 0;
+  const triggerN = Number(raw.triggerN) || throughN;
+  const revision = Math.max(1, Number(raw.revision) || 1);
+  return throughN > 0 ? { sinceN, throughN, triggerN, revision, at: raw.at || null } : null;
+}
+
+// The accepted user entry already records which seats were selected to lurk.
+// Re-derive the actionable roots from that durable fact so Solo and unrelated
+// traffic can ride in the full delta as context without becoming invitations to
+// speak. No second persisted list is needed, and cursor advancement naturally
+// removes roots that another successful invocation has already delivered.
+function transcriptRootN(room, entry, entryIndex = null) {
+  if (!entry) return 0;
+  const byN = entryIndex || new Map(room.entries.map((item) => [item.n, item]));
+  const seen = new Set();
+  let current = entry;
+  while (current && !seen.has(current.n)) {
+    seen.add(current.n);
+    if (current.kind === "user") return current.n;
+    const meta = current.meta || {};
+    const explicit = Number(meta.replyRoot) || 0;
+    if (explicit) return explicit;
+    const parent = Number(meta.replyTo) || 0;
+    if (!parent) return 0;
+    current = byN.get(parent) || null;
+  }
+  return 0;
+}
+
+function catchUpRoots(room, agent, pending) {
+  if (!pending) return [];
+  // Do not clamp this to the *current* cursor. A concurrent invocation can have
+  // delivered the user root but not the addressed agent's later reply; the
+  // obligation still covers that unseen reply and must retain its root.
+  const from = Math.max(1, Number(pending.sinceN) || 1);
+  const through = Number(pending.throughN) || 0;
+  const cursor = (room.state.agents[agent] && room.state.agents[agent].cursor) || 0;
+  const unseenFrom = Math.max(from, cursor + 1);
+  const entryIndex = new Map(room.entries.map((entry) => [entry.n, entry]));
+  const rootsWithCoveredEntries = new Set(room.entries
+    .filter((entry) => entry.n >= unseenFrom && entry.n <= through)
+    .map((entry) => transcriptRootN(room, entry, entryIndex)).filter(Boolean));
+  return room.entries.filter((entry) => entry.kind === "user" && entry.n <= through &&
+    (entry.n >= unseenFrom || rootsWithCoveredEntries.has(entry.n)) &&
+    Array.isArray(entry.meta && entry.meta.audience && entry.meta.audience.lurking) &&
+    entry.meta.audience.lurking.includes(agent));
+}
+
+const CATCH_UP_RETURN_INSTRUCTION = "(The other agent just spoke during a delayed lurk catch-up. " +
+  "You have one structurally bounded right of reply. Address only what materially needs a response; " +
+  "otherwise reply exactly [pass]. This is the final automatically delivered leg: tagging the other agent " +
+  "will not schedule another response.)";
+
+function recordLurkOutcome(room, agent, range, reason) {
+  if (!range) return;
+  const list = Array.isArray(room.state.lurkOutcomes) ? room.state.lurkOutcomes : [];
+  list.push({
+    agent,
+    fromN: Math.max(0, Number(range.sinceN) || 0),
+    throughN: Math.max(0, Number(range.throughN) || 0),
+    triggerN: Math.max(0, Number(range.triggerN) || 0),
+    reason: String(reason || "failed"),
+    at: tsLocal(),
+  });
+  // Status history is UI provenance, not the transcript. Bound it so a room
+  // that runs for years does not grow state.json without limit.
+  room.state.lurkOutcomes = list.slice(-200);
+}
+
+function noteLurkOutcome(room, agent, triggerN, reason, throughN = null) {
+  const cursor = (room.state.agents[agent] && room.state.agents[agent].cursor) || 0;
+  const end = throughN === null
+    ? (room.entries.length ? room.entries[room.entries.length - 1].n : cursor)
+    : Number(throughN) || cursor;
+  if (end <= cursor) return false;
+  recordLurkOutcome(room, agent, {
+    sinceN: cursor + 1, throughN: end, triggerN: Number(triggerN) || end,
+  }, reason);
+  saveState(room);
+  broadcast(room, { type: "room", room: roomSummary(room) });
+  return true;
+}
+
+function persistLurkOutcome(room, agent, range, reason) {
+  if (!range || Number(range.throughN) <= Number(range.sinceN) - 1) return false;
+  recordLurkOutcome(room, agent, range, reason);
+  saveState(room);
+  broadcast(room, { type: "room", room: roomSummary(room) });
+  return true;
+}
+
+function queueLurkCatchUp(room, agent, sourceN, throughN) {
+  const seat = room.state.agents[agent];
+  if (!seat || isAsleep(room, agent) || !room.cfg.agents[agent].lurk) return false;
+  const end = Math.max(Number(throughN) || 0, Number(sourceN) || 0);
+  if (room.state.agents[agent].cursor >= end) return false;
+  const prior = catchUpState(room, agent);
+  seat.pendingCatchUp = {
+    // The catch-up invocation receives the full delta, so the honest lower
+    // bound is the first entry beyond the seat's cursor, not merely this root.
+    sinceN: prior ? prior.sinceN : room.state.agents[agent].cursor + 1,
+    throughN: Math.max(prior ? prior.throughN : 0, end),
+    triggerN: Math.max(1, Number(sourceN) || (prior ? prior.triggerN : end)),
+    revision: prior ? prior.revision + 1 : 1,
+    at: prior ? prior.at : tsLocal(),
+  };
+  saveState(room);
+  broadcast(room, { type: "lurk", agent, spoke: false, queued: true });
+  broadcast(room, { type: "room", room: roomSummary(room) });
+  scheduleCatchUps(room);
+  return true;
+}
+
+function cancelLurkCatchUp(room, agent, reason, opts = {}) {
+  const seat = room.state.agents[agent];
+  const pending = catchUpState(room, agent);
+  if (!seat || !pending) return false;
+  delete seat.pendingCatchUp;
+  if (opts.record !== false) recordLurkOutcome(room, agent, pending, reason);
+  saveState(room);
+  broadcast(room, { type: "room", room: roomSummary(room) });
+  return true;
+}
+
+function scheduleCatchUps(room) {
+  // One scheduled scan is enough; every completion schedules another. The
+  // room object is captured intentionally, while a generation check inside
+  // the runner prevents an archived conversation from writing into the next.
+  if (room.catchUpScheduled) return;
+  room.catchUpScheduled = true;
+  setImmediate(() => {
+    room.catchUpScheduled = false;
+    for (const agent of seatIds(room)) maybeRunCatchUp(room, agent);
+  });
+}
+
+function maybeRunCatchUp(room, agent) {
+  const pending = catchUpState(room, agent);
+  if (!pending) return;
+  // Wait for every accepted user exchange to settle. This both gives user work
+  // priority and lets several misses coalesce into one complete room delta.
+  if (room.exchanges > 0 || room.pairActive || room.pending.length || seatOccupied(room, agent)) return;
+  if (isAsleep(room, agent)) return cancelLurkCatchUp(room, agent, "asleep");
+  if (!room.cfg.agents[agent].lurk) return cancelLurkCatchUp(room, agent, "disabled");
+  if (room.state.agents[agent].cursor >= pending.throughN) {
+    return cancelLurkCatchUp(room, agent, "superseded", { record: false });
+  }
+  const actionable = catchUpRoots(room, agent, pending);
+  if (!actionable.length) {
+    return cancelLurkCatchUp(room, agent, "superseded", { record: false });
+  }
+
+  const gen = room.generation;
+  const before = room.state.agents[agent].cursor;
+  const attempt = { ...pending };
+  const catchUpRootNs = actionable.map((entry) => entry.n);
+  const triggerN = catchUpRootNs[catchUpRootNs.length - 1];
+  const chain = newChain(room);
+  let terminalReason = null;
+  room.exchanges++;
+  Promise.resolve(runListenerTurn(room, agent, triggerN, NO_SCOPE, {
+    chain, catchUp: true, catchUpRoots: catchUpRootNs, catchUpThroughN: attempt.throughN,
+    onTerminal: (reason) => { terminalReason = reason; },
+  }))
+    .then(async (chime) => {
+      // A spoken live lurk earns one right of reply outside hopBudget. A delayed
+      // lurk is the same semantic event, so keep that guarantee while bounding
+      // it structurally: this one return is never inspected for another hop.
+      if (!chime || gen !== room.generation || chainHalted(room, chain)) return;
+      const target = findHopTarget(room, chime, { allowPlain: true }) || otherSeat(room, chime.author);
+      if (isAsleep(room, target)) {
+        noteSleepSkip(room, target, "hop", { trigger: chime, sourceN: chime.n });
+        return;
+      }
+      if (seatOccupied(room, target) && !(await waitForHopSeat(room, target, gen, chain))) return;
+      if (gen !== room.generation || chainHalted(room, chain)) return;
+      await runHopTurn(room, target, chime, triggerN, NO_SCOPE, {
+        chain, readOnly: true, instruction: CATCH_UP_RETURN_INSTRUCTION,
+        meta: { catchUpReturn: true },
+      });
+    })
+    .catch(() => { terminalReason ||= "failed"; })
+    .finally(() => {
+      room.exchanges = Math.max(0, room.exchanges - 1);
+      // A fresh conversation owns a fresh state object. The old closure must
+      // unwind its runtime count, then leave that new state completely alone.
+      if (gen !== room.generation) return;
+      const live = catchUpState(room, agent);
+      if (room.state.agents[agent].cursor > before) {
+        if (live && room.state.agents[agent].cursor >= live.throughN) {
+          cancelLurkCatchUp(room, agent, "superseded", { record: false });
+        } else if (live) {
+          live.sinceN = room.state.agents[agent].cursor + 1;
+          room.state.agents[agent].pendingCatchUp = live;
+          saveState(room);
+        }
+      } else if (live) {
+        // Sleep only blocks future launches; it does not end the catch-up that
+        // was already running. If that attempt then fails or is stopped, record
+        // what ended it rather than the ambient state the seat entered later.
+        const reason = terminalReason || (chainHalted(room, chain) ? "stopped"
+          : isAsleep(room, agent) ? "asleep" : "failed");
+        // Only the range this invocation attempted becomes terminal. A later
+        // exchange may have extended the obligation while the adapter was
+        // running; retain that newer tail instead of silently deleting it.
+        recordLurkOutcome(room, agent, attempt, reason);
+        const extended = live.throughN > attempt.throughN;
+        if (extended) {
+          // The attempted range is terminal and gets no automatic retry. Keep
+          // only entries appended after its upper bound as the newer obligation.
+          live.sinceN = Math.max(room.state.agents[agent].cursor + 1, attempt.throughN + 1);
+          room.state.agents[agent].pendingCatchUp = live;
+        } else {
+          delete room.state.agents[agent].pendingCatchUp;
+        }
+        saveState(room);
+      }
+      broadcast(room, { type: "room", room: roomSummary(room) });
+      scheduleCatchUps(room);
+    });
 }
 
 // ---- per-seat lanes ----
@@ -3314,7 +4072,10 @@ function deferDelivery(room, agent, userTurn, scope, dispatch = {}) {
 // also claims its seats, so nothing behind it in those lanes can overtake it —
 // that single rule is what keeps arrival order across both item kinds.
 function drainLanes(room) {
-  if (!room.pending.length) return;
+  if (!room.pending.length) {
+    scheduleCatchUps(room);
+    return;
+  }
   const claimed = new Set([...room.busy.keys()]);
   const still = [], go = [], drop = [];
   for (const item of room.pending) {
@@ -3339,6 +4100,7 @@ function drainLanes(room) {
   // Both runners mark the seat busy synchronously, so nothing can slip into the
   // gap between leaving this queue and the seat being claimed.
   for (const item of go) item.run();
+  scheduleCatchUps(room);
 }
 
 function releaseSeat(room, agent, run = null) {
@@ -3347,7 +4109,10 @@ function releaseSeat(room, agent, run = null) {
   broadcast(room, { type: "status", agent, phase: "done", ...(run ? { runId: run.runId } : {}) });
   broadcast(room, { type: "room", room: roomSummary(room) });
   // Deferred by a tick so the turn that just ended finishes unwinding first.
-  if (room.pending.length) setImmediate(() => drainLanes(room));
+  setImmediate(() => {
+    if (room.pending.length) drainLanes(room);
+    scheduleCatchUps(room);
+  });
 }
 
 function clearPending(room) {
@@ -3376,6 +4141,7 @@ function cancelQueued(room, groupId = null) {
   // vanish. Say what happened instead — both the user and the agents reading
   // the room then know the message was withdrawn before anyone received it.
   recordWithdrawals(room, drop);
+  scheduleCatchUps(room);
   return drop.length;
 }
 
@@ -3383,7 +4149,7 @@ function cancelQueued(room, groupId = null) {
 // live cancellation notices cross the ordinary system-entry boundary, and the
 // original message still needs a durable per-seat placeholder on every later
 // delta and recovery replay.
-function recordWithdrawals(room, dropped) {
+function recordWithdrawals(room, dropped, cause = null) {
   const items = dropped.filter((item) => item.sourceN !== undefined && item.sourceN !== null);
   if (!items.length) return;
   if (!room.state.cancelledDeliveries) room.state.cancelledDeliveries = {};
@@ -3406,10 +4172,15 @@ function recordWithdrawals(room, dropped) {
     ? `that message was not delivered to ${withdrawals[0].agents.join(" and ")}`
     : withdrawals.map((record) =>
       `message #${record.sourceN} was not delivered to ${record.agents.join(" and ")}`).join("; ");
+  // One consolidated note whatever emptied the queue, so a seat put to sleep
+  // with work still owed says why in the same breath as what was dropped.
+  const asleepSeat = (cause && cause.asleep) || null;
   appendEntry(room, {
     kind: "system", author: "system",
-    text: `⏹ Cancelled before delivery — ${detail}.`,
-    meta: { cancelledQueue: true, withdrawals },
+    text: asleepSeat
+      ? `⏹ ${asleepSeat} was put to sleep with work still queued — ${detail}.`
+      : `⏹ Cancelled before delivery — ${detail}.`,
+    meta: { cancelledQueue: true, withdrawals, ...(asleepSeat ? { asleepSeat } : {}) },
   });
   // Receipt dots derive from the room summary. The queue event was emitted
   // before these durable markers existed, so publish the new snapshot now.
@@ -3433,6 +4204,144 @@ function clearWithdrawals(room, n, seats) {
   broadcast(room, { type: "room", room: roomSummary(room) });
 }
 
+// ---- sleep and wake ----
+// The two state changes themselves. Both are persisted as entries, not merely
+// broadcast: a restart that kept only the broadcasts would leave a transcript
+// where a seat goes quiet and later starts talking again with nothing in the
+// record explaining either.
+
+const MAX_SLEEP_REASON = 120;
+function cleanSleepReason(value) {
+  const reason = String(value === undefined || value === null ? "" : value).replace(/\s+/g, " ").trim();
+  return reason ? reason.slice(0, MAX_SLEEP_REASON) : null;
+}
+
+// Everything the lanes still owe this seat, taken out now rather than left to
+// wait for a seat that will never take it and then fail after the active turn
+// ends. A queued pair cycle claims both seats, so sleeping either one drops it
+// — which is the same "pair pauses" rule, applied before the cycle starts.
+function takeQueuedForSeat(room, agent) {
+  if (!room.pending.length) return [];
+  const keep = [], drop = [];
+  for (const item of room.pending) (item.agents.includes(agent) ? drop : keep).push(item);
+  if (!drop.length) return [];
+  room.pending = keep;
+  broadcastQueue(room);
+  for (const item of drop) item.abandon();
+  return drop;
+}
+
+function sleepSeat(room, agent, reason) {
+  if (isAsleep(room, agent)) return { changed: false, asleep: true, cancelled: 0 };
+  const clean = cleanSleepReason(reason);
+  room.state.agents[agent].asleep = { since: tsLocal(), reason: clean };
+  const runningCatchUp = room.runs.get(agent) && room.runs.get(agent).phase === "catching-up";
+  if (!runningCatchUp) cancelLurkCatchUp(room, agent, "asleep");
+  saveState(room);
+  const dropped = takeQueuedForSeat(room, agent);
+  appendEntry(room, {
+    kind: "system", author: "system",
+    text: `😴 ${agent} is asleep${clean ? ` — ${clean}` : ""}. Nothing will be launched for it — no message, ` +
+      `no direct call from ${otherSeat(room, agent)}, no lurk — until you wake it.` +
+      (room.busy.has(agent) ? " The response it is writing now still finishes; Stop ends that separately." : ""),
+    meta: { agent, sleep: { event: "asleep", agent, reason: clean } },
+  });
+  if (dropped.length) recordWithdrawals(room, dropped, { asleep: agent });
+  broadcast(room, { type: "room", room: roomSummary(room) });
+  return { changed: true, asleep: true, cancelled: dropped.length };
+}
+
+function wakeSeat(room, agent, opts = {}) {
+  // Already awake is a no-op, but not necessarily an empty one: Wake only
+  // leaves messages held on an awake seat, and a second /wake should report
+  // them rather than say there is nothing outstanding.
+  if (!isAsleep(room, agent)) {
+    return { changed: false, asleep: false, pending: 0, held: heldForSeat(room, agent).length };
+  }
+  // Counted before the wake entry exists, so it matches the number the Wake
+  // control was showing when it was clicked.
+  const pending = pendingForSeat(room, agent);
+  const held = heldForSeat(room, agent).length;
+  // Only claimed when a delivery is actually being launched for it, so the
+  // sentence stays true under Wake only — where the cursor really does not move
+  // and the held messages really do become ordinary context.
+  const delivering = !!opts.delivering && held > 0;
+  room.state.agents[agent].asleep = null;
+  saveState(room);
+  appendEntry(room, {
+    kind: "system", author: "system",
+    text: delivering
+      ? `☀ ${agent} is awake, answering the ${held} message${held === 1 ? "" : "s"} held for it in one turn. ` +
+        `The ${pending} entr${pending === 1 ? "y" : "ies"} from while it slept ${pending === 1 ? "rides" : "ride"} along as context, ` +
+        `in the order ${pending === 1 ? "it" : "they"} arrived.`
+      : `☀ ${agent} is awake. Nothing was replayed and its cursor did not move: its next turn carries ` +
+        `the ${pending} entr${pending === 1 ? "y" : "ies"} from while it slept as ordinary context.` +
+        (held ? ` The ${held} message${held === 1 ? "" : "s"} held for it ${held === 1 ? "is" : "are"} part of that context — ` +
+          `${held === 1 ? "it was" : "they were"} not delivered as ${held === 1 ? "a request" : "requests"}.` : ""),
+    meta: { agent, sleep: { event: "awake", agent, pending, held, delivering } },
+  });
+  broadcast(room, { type: "room", room: roomSummary(room) });
+  return { changed: true, asleep: false, pending, held };
+}
+
+// Wake a seat and answer, in one turn, whatever the user addressed to it while
+// it slept. The launch is not a new primitive: it is the same "old root, current
+// room context" shape Retry already uses (see the note in `runAgentTurn` about
+// replayed roots), so the messages that arrived after the held one stay in the
+// delta at their real position and the seat can tell a stale request from a
+// live one.
+function wakeAndDeliver(room, agent) {
+  // Preflight before any mutation. A sleeping seat can still be busy — sleep
+  // deliberately lets an in-flight response finish — and waking first would
+  // leave the seat awake with its work undelivered and its sleep state already
+  // gone. Refusing here matches `handleRetry`, and keeps the held messages
+  // provably still held.
+  if (room.pairActive || seatOccupied(room, agent)) {
+    throw Object.assign(new Error(`${agent} is still finishing a turn — wake it in a moment`), { status: 409 });
+  }
+  const held = heldForSeat(room, agent);
+  if (!held.length) return { ...wakeSeat(room, agent), delivered: false };
+  const root = held[held.length - 1];
+  const result = wakeSeat(room, agent, { delivering: true });
+
+  // `target` is the woken seat, never `root.target`. A held @both whose awake
+  // half already answered would otherwise make `retryTargets` return both seats
+  // against an empty `done` map, so a failed delivery here would offer a Retry
+  // that re-runs work the awake seat has already completed. Narrowing is the
+  // durable fix rather than carrying the old `done` forward: once `lastUser` has
+  // moved on to newer traffic that map is gone entirely.
+  //
+  // The @both no-edit boundary has to be latched here for the same reason.
+  // `handleRetry` re-derives scope as `makeScope(room, lu.n, lu.target, ...)`
+  // and never sees `root.target`, while the latch inside `makeScope` only fires
+  // for `target === "both"` — so with the target narrowed, a Retry could no
+  // longer acquire the boundary. Without this line, a Talk-mode @both held for a
+  // sleeping seat, a flip to Work, and a delivery that fails before the launch
+  // path consults the scope would add up to a Retry running with write access.
+  const boundary = rootDiscussion(room, root.n) || (root.target === "both" && room.cfg.mode === "work");
+  room.state.lastUser = {
+    n: root.n, text: root.text || "", target: agent, done: {},
+    pair: false, discussion: boundary,
+    ...(root.meta && Array.isArray(root.meta.attachments) && root.meta.attachments.length
+      ? { attachments: root.meta.attachments } : {}),
+  };
+  // `lastAddressed` is deliberately untouched: this completes a dispatch the
+  // user already made rather than being a fresh act of addressing someone, and
+  // rewriting it would re-route their next untagged message.
+  saveState(room);
+
+  // Scope still reconstructs from the root's own target — this launch *is* the
+  // other half of that @both, and it runs under the boundary that message had.
+  const scope = makeScope(room, root.n, root.target, boundary);
+  clearWithdrawals(room, root.n, [agent]); // it is being delivered after all
+  Promise.allSettled([runAgentTurn(room, agent, root, scope, { heldCount: held.length })])
+    .then(() => drainLanes(room));
+  return { ...result, delivered: true, deliveredN: root.n };
+}
+
+// Retry launches straight into a seat, so a sleeping one is not a retry target
+// — and `canRetry` has to say so, or the button offers work the room would
+// refuse. handleRetry re-derives *why* nothing is eligible for its message.
 function retryTargets(room) {
   const lu = room.state.lastUser;
   if (!lu) return [];
@@ -3441,10 +4350,32 @@ function retryTargets(room) {
     // Eligibility belongs to the stored turn, not whichever worker the mode
     // names now. A taskless role switch must not make approved work retryable;
     // a genuinely failed old turn may still execute under the new roles.
-    return pair && !(lu.done && lu.done[lu.target]) ? [pair.worker] : [];
+    if (!pair || (lu.done && lu.done[lu.target])) return [];
+    return [pair.worker, pair.reviewer].some((a) => isAsleep(room, a)) ? [] : [pair.worker];
   }
   const agents = lu.target === "both" ? seatIds(room) : [lu.target];
-  return agents.filter((a) => !(lu.done && lu.done[a]));
+  return agents.filter((a) => !(lu.done && lu.done[a]) && !isAsleep(room, a));
+}
+
+// The seats a retry would have targeted but cannot, so the refusal names the
+// sleeping seat instead of the useless "nothing to retry".
+function retryBlockedBySleep(room) {
+  const lu = room.state.lastUser;
+  if (!lu) return [];
+  if (lu.pair && room.state.pair) {
+    const pair = pairSnapshot(room);
+    if (!pair || (lu.done && lu.done[lu.target])) return [];
+    return [pair.worker, pair.reviewer].filter((a) => isAsleep(room, a));
+  }
+  const agents = lu.target === "both" ? seatIds(room) : [lu.target];
+  return agents.filter((a) => !(lu.done && lu.done[a]) && isAsleep(room, a));
+}
+
+function asleepRefusal(room, agents, detail) {
+  const plural = agents.length > 1;
+  return Object.assign(
+    new Error(`${agents.join(" and ")} ${plural ? "are" : "is"} asleep — ${detail(plural ? "them" : "it")}`),
+    { status: 409 });
 }
 
 function handleRetry(room) {
@@ -3460,6 +4391,12 @@ function handleRetry(room) {
     n: lu.n, text: lu.text, target: lu.target,
     ...(Array.isArray(lu.attachments) ? { meta: { attachments: lu.attachments } } : {}),
   };
+  // Refuse by name only when sleep is the *whole* reason nothing is eligible.
+  // A split @both whose awake half failed is still retryable for that half.
+  const dozing = retryBlockedBySleep(room);
+  if (dozing.length && !retryTargets(room).length) {
+    throw asleepRefusal(room, dozing, (them) => `wake ${them} to retry that turn.`);
+  }
   // A pair retry uses the mode active now, never a persisted old snapshot. This
   // is important after `/pair start @other` switches the worker/reviewer.
   if (lu.pair && room.state.pair) {
@@ -3583,6 +4520,7 @@ function handleStop(room, opts = {}) {
   // rather than raising a flag, so every chain running now abandons itself and
   // no later message can undo that by clearing a shared boolean.
   room.stopEpoch++;
+  for (const a of seatIds(room)) cancelLurkCatchUp(room, a, "cancelled");
   // Silence means the queue goes too. Held deliveries settle so the chain
   // waiting on them closes out instead of hanging on a turn that will never
   // run — and they are recorded as withdrawn, exactly as an explicit cancel is.
@@ -3844,7 +4782,12 @@ function handleNewConversation(room) {
     }
   }
   room.generation++;
+  // Sleep is a fact about the seat's provider account, not about the
+  // conversation, so archiving does not quietly make a rate-limited seat
+  // invocable again. Everything else — cursors, sessions, pair — starts fresh.
+  const stillAsleep = Object.fromEntries(seatIds(room).map((a) => [a, sleepState(room, a)]));
   room.state = defaultState(seatIds(room));
+  for (const a of seatIds(room)) room.state.agents[a].asleep = stillAsleep[a];
   room.state.roomNoteValue = normalizeRoomNote(room.cfg.roomNote);
   room.state.roomNoteRevision = room.state.roomNoteValue === null ? 0 : 1;
   if (room.state.agents.claude) {
@@ -3853,6 +4796,7 @@ function handleNewConversation(room) {
   }
   room.entries = [];
   room.receipts = [];
+  room.hopRuns.clear();
   // No withdrawal record here, unlike Stop-everything: the entry a held
   // delivery would have delivered is being archived along with the rest of the
   // conversation, and the fresh state has nothing to be truthful about.
@@ -4038,7 +4982,11 @@ const server = http.createServer(async (req, res) => {
     if (route === "GET /api/room") {
       const wanted = url.searchParams.get("name") || "default";
       const room = loadRoom(wanted, undefined, wanted === "default");
-      return json(res, 200, { room: roomSummary(room), entries: room.entries, receipts: room.receipts });
+      const snapshot = { room: roomSummary(room), entries: room.entries, receipts: room.receipts };
+      // Deliberate room activation resumes a persisted catch-up. Merely listing
+      // rooms must never launch agents in every room on disk.
+      scheduleCatchUps(room);
+      return json(res, 200, snapshot);
     }
 
     if (route === "GET /api/attachment") {
@@ -4074,22 +5022,34 @@ const server = http.createServer(async (req, res) => {
       });
       res.write(":connected\n\n");
       room.clients.add(res);
+      scheduleCatchUps(room);
       const ping = setInterval(() => { try { res.write(":ping\n\n"); } catch { /* closed */ } }, 20000);
       req.on("close", () => { clearInterval(ping); room.clients.delete(res); });
       return;
     }
 
     if (route === "POST /api/message") {
-      const { room: name, text, target, images, files } = await readBody(req, MAX_MESSAGE_BODY_BYTES);
+      const body = await readBody(req, MAX_MESSAGE_BODY_BYTES);
+      const { room: name, text, target, images, files } = body;
       const room = loadRoom(name || "default");
       const raw = String(text || "").trim();
+      const relay = {};
+      if (Object.prototype.hasOwnProperty.call(body, "hopBudget")) {
+        relay.hopBudget = requireMessageHopBudget(body.hopBudget);
+      }
+      if (Object.prototype.hasOwnProperty.call(body, "solo")) {
+        if (typeof body.solo !== "boolean") {
+          throw Object.assign(new Error("solo must be true or false"), { status: 400 });
+        }
+        relay.solo = body.solo;
+      }
       // Every message is accepted here and now: validated, applied (a /pair
       // command takes effect immediately), appended in send order and
       // snapshotted for Retry. Only the work waits — a per-seat delivery for an
       // ordinary turn, the whole cycle for a pair turn. Nothing is ever held as
       // raw text, because text appended later lands after messages the user
       // sent afterwards and takes the retry slot with it.
-      const outcome = handleUserMessage(room, raw, target, images, files) || {}; // replies arrive over SSE
+      const outcome = handleUserMessage(room, raw, target, images, files, relay) || {}; // replies arrive over SSE
       if (outcome.pairQueued) return json(res, 200, {
         queued: true, position: room.pending.length,
         target: outcome.target, explicit: !!outcome.explicit,
@@ -4123,6 +5083,23 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ...result, agent: result.agent });
     }
 
+    if (route === "POST /api/seat/sleep") {
+      const body = await readBody(req);
+      const room = loadRoom(body.room || "default");
+      const agent = String(body.agent || "").toLowerCase();
+      if (!seatIds(room).includes(agent)) return json(res, 400, { error: `unknown agent: ${body.agent}` });
+      // Idempotent on purpose: a second click, or a second tab, reports the
+      // state the user asked for rather than an error they would answer by
+      // clicking again. `deliver` keeps that property: called on a seat that is
+      // already awake it skips the wake entry and delivers whatever is still
+      // held — which is exactly the state Wake only leaves behind, and the same
+      // outcome a second click was asking for.
+      const result = body.asleep === false
+        ? (body.deliver ? wakeAndDeliver(room, agent) : wakeSeat(room, agent))
+        : sleepSeat(room, agent, body.reason);
+      return json(res, 200, { ok: true, agent, ...result, room: roomSummary(room) });
+    }
+
     if (route === "POST /api/queue/cancel") {
       const body = await readBody(req);
       const room = loadRoom(body.room || "default");
@@ -4144,6 +5121,7 @@ const server = http.createServer(async (req, res) => {
       const prevMode = room.cfg.mode || "talk";
       const prevProjectDir = room.cfg.projectDir || null;
       const prevRoomNote = normalizeRoomNote(room.cfg.roomNote);
+      const prevLurk = Object.fromEntries(seatIds(room).map((id) => [id, !!room.cfg.agents[id].lurk]));
       const prevClaudePermission = room.cfg.agents.claude
         ? effectiveClaudePermissionMode(room.cfg.agents.claude, prevMode)
         : null;
@@ -4153,10 +5131,23 @@ const server = http.createServer(async (req, res) => {
       const prevSandboxes = Object.fromEntries(sandboxSeats.map((id) => [id, room.cfg.agents[id].sandbox || "read-only"]));
       // Validate into a candidate first — a rejected patch must leave the
       // live room untouched.
-      const next = pruneSeats(deepMerge(defaultConfig(seatIds(room)), deepMerge(room.cfg, config || {})));
+      const configPatch = { ...(config || {}) };
+      // Old clients and scripts may still PATCH `maxHops`. Preserve their old
+      // zero-means-unlimited contract while every new surface uses hopBudget.
+      if (!Object.prototype.hasOwnProperty.call(configPatch, "hopBudget") &&
+          Object.prototype.hasOwnProperty.call(configPatch, "maxHops")) {
+        configPatch.hopBudget = Number(configPatch.maxHops) === 0
+          ? -1 : normalizeHopBudget(configPatch.maxHops, room.cfg.hopBudget);
+      }
+      delete configPatch.maxHops;
+      if (Object.prototype.hasOwnProperty.call(configPatch, "hopBudget")) {
+        configPatch.hopBudget = requireRoomHopBudget(configPatch.hopBudget);
+      }
+      const next = pruneSeats(deepMerge(defaultConfig(seatIds(room)), deepMerge(room.cfg, configPatch)));
       next.timeoutMs = Math.max(10000, Number(next.timeoutMs) || 300000);
       next.mode = next.mode === "work" ? "work" : "talk";
-      next.maxHops = Math.min(8, Math.max(0, Number(next.maxHops) || 0));
+      next.hopBudget = normalizeHopBudget(next.hopBudget, -1);
+      delete next.maxHops;
       next.pairRounds = Math.min(99, Math.max(0, Number(next.pairRounds) || 0));
       for (const [id, agentCfg] of Object.entries(next.agents)) {
         const issue = extraArgsViolation(id, agentCfg.extraArgs || []);
@@ -4239,6 +5230,12 @@ const server = http.createServer(async (req, res) => {
       const hadSession = Object.fromEntries(seatIds(room).map((id) =>
         [id, !!room.state.agents[id].sessionRef]));
       room.cfg = next;
+      for (const id of seatIds(room)) {
+        const runningCatchUp = room.runs.get(id) && room.runs.get(id).phase === "catching-up";
+        if (prevLurk[id] && !room.cfg.agents[id].lurk && !runningCatchUp) {
+          cancelLurkCatchUp(room, id, "disabled");
+        }
+      }
       const nextRoomNote = normalizeRoomNote(next.roomNote);
       const roomNoteChanged = prevRoomNote !== nextRoomNote;
       if (roomNoteChanged) {
