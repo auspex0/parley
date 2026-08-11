@@ -23,7 +23,7 @@ It drives the **official Claude Code and Codex CLIs through your existing CLI lo
 
 An agent can stay in earshot while you talk to the other one, and interject **only when it has something real** — an uncorrected error, a disagreement, a risk you glossed over. Otherwise it stays quiet.
 
-Point that at a work room and you get continuous, unprompted code review: one agent codes, the other watches every file write and shell command, reads the workspace to verify, and speaks up when something is actually wrong.
+Point that at a work room and you get continuous, unprompted code review: one agent codes, the other watches every file write and shell command, reads the workspace to verify, and speaks up when something is actually wrong. If the listener is occupied when the exchange finishes, Parley persists one coalesced catch-up for it; user-addressed work runs first, then the listener gets the full missed delta in one attempt rather than silently losing the lurk.
 
 Whether it speaks is the model's own judgment — there is no keyword trigger. A per-agent dial sets the bar: `quiet` (only outright problems), `balanced` (adds real disagreements and critical caveats), `vocal` (adds better approaches too). Or write your own criteria.
 
@@ -71,13 +71,14 @@ Each agent has its own **lane**: tag them back-to-back and they genuinely work a
 
 ## The rest of it
 
-- **Agent-to-agent hops** — an agent that @mentions the other in a reply gets answered; `maxHops` budgets the back-and-forth, and a lurker's chime-in always earns one right of reply.
+- **Agent-to-agent hops** — an agent that @mentions the other in a reply gets answered. The room `hopBudget` is `-1` for “until settled” (with an emergency safety stop), `0` for no handoffs, or any positive integer as an exact cap. The compact one-message composer control offers quick overrides through `8`, or **Solo** so only one selected seat responds. Mentions in inline/fenced code and blockquotes never become accidental calls. Pair review rounds and a lurker's bounded right of reply are separate controls.
 - **Pair mode 🔁** — `/pair start @claude build X`: one agent works, the other reviews by actually reading the files, then approves or sends it back for a fix round. A failed review is never treated as approval.
+- **Sleep a seat 😴** — hit a usage limit? Sleep that seat and the other keeps working. Nothing launches it — not your message, not a queued delivery, not an `@tag` from the other agent — until you wake it. Your requests are held in their original place and autonomous skips are recorded, so silence is never read as agreement. Waking alone replays nothing; if held requests exist, **Wake & deliver** handles them together in one turn.
 - **Talk rooms and work rooms 🔨** — Talk is conversational with conservative permissions. Work lets agents edit files and run commands, rendered as inline chat lines (`✏️ Write server.js`, `▶ npm test`, `⚠ exited 1`) — the chat is the interface, your editor is the viewer. `@both` in a work room is a discussion, not a work order.
 - **Linked project folders 📁** — point a room at a real project; both agents work there and pick up its `CLAUDE.md` / `AGENTS.md`.
 - **Attachments 📎** — paste, drag or clip in images, patches, logs and docs; images use each CLI's native image input.
   *Personal highlight: that little attachment paperclip. Shoutout to Codex.*
-- **Receipt dots** — under every message: who heard it live, who lurked it, who caught up later, who hasn't seen it yet — including deliveries you cancelled.
+- **Receipt dots** — under every message: who heard it live, who lurked it, who is queued to catch up, who caught up later, who hasn't seen it yet — including deliveries you cancelled and terminal lurk outcomes.
 - **Per-reply token counts** — output (and Codex reasoning) tokens straight from the CLI, not model self-reporting.
 - **Two seats, extensible providers** — adding another CLI agent is one adapter function and a registry entry.
 
@@ -89,7 +90,7 @@ Each agent has its own **lane**: tag them back-to-back and they genuinely work a
 - **Conservative by default.** Talk rooms run Claude with its normal print-mode permissions and Codex in the `read-only` sandbox. Work mode loosens that only for the agent you name; Full access for either provider is host-level trust and sits behind a deliberate confirmation.
 - Reviewer, listener and discussion turns run read-only **where the provider can enforce it** — Claude is switched to Plan and kept out of any bypass-enabled session. Codex's equivalent lives inside its existing sandboxed thread, so it's a workflow instruction, **not an OS-level boundary**.
 
-`npm test` boots a real server against fake agent CLIs and exercises routing, the delta protocol, sessions, lurk, hops, pair, lanes, work mode and cancellation — no provider login, no tokens spent. CI runs it on Ubuntu and Windows, Node 20 and 22.
+`npm test` boots a real server against fake agent CLIs and exercises routing, the delta protocol, sessions, lurk, hops, pair, lanes, work mode, seat sleep and cancellation — no provider login, no tokens spent. CI runs it on Ubuntu and Windows, Node 20 and 22.
 
 ## Docs
 

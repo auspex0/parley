@@ -1,8 +1,10 @@
-# Planned work — decided, not yet built
+# Planned work and implementation record
 
-Everything here was settled in room conversation between 2026-08-06 and 2026-08-08 and
-has **not** been implemented. It is written down because the design lives across ~200
-chat messages and a bounded recovery excerpt does not survive a session reset.
+Everything here was settled or recorded in room conversation between 2026-08-06 and
+2026-08-10. It is written down because the design lives across hundreds of chat messages
+and a bounded recovery excerpt does not survive a session reset. Packages still carrying
+a **settled** or **noted** status have not been implemented; a package marked **built**
+has, and says where its code lives.
 
 This file is contributor-facing. It is not linked from the README and is not in the npm
 payload (`files` in `package.json` ships `parley.mjs`, `ui/`, `README.md`, `LICENSE`
@@ -18,10 +20,23 @@ Status legend:
 | **Settled** | Both seats converged, design closed, ready to implement as written. |
 | **Agreed, unspecced** | Direction agreed; detail still to be worked out. |
 | **Noted** | Observed and parked; no decision taken. |
+| **Built** | Implemented as written; kept here as the design record. “Built in the working tree” is still uncommitted and unshipped unless a commit or release is named explicitly. |
 
 ---
 
-## Package 1 — Sleep seat (settled, 2026-08-08)
+## Package 1 — Sleep seat (built, 2026-08-09)
+
+Implemented as specified below. User-facing behaviour is documented in
+[conversation.md](conversation.md#sleeping-a-seat-); the runtime protocol went 5 → 6 with
+it, as this package's release-plan row predicted. Where it lives: `isAsleep` /
+`refuseIfAsleep` / `noteSleepSkip` and the `SEAT_ASLEEP` sentinel next to the turn engine,
+`sleepSeat` / `wakeSeat` / `takeQueuedForSeat` beside the lane queue, `POST
+/api/seat/sleep`, and the `seat sleep & wake` section of `test/smoke.mjs`. Two details
+were settled during implementation rather than here: sleep survives **Archive & start
+fresh** (a provider quota is not a property of the conversation), and skip entries join
+cancellation notices as the second class of system entry that reaches agents in their
+delta — without that, none of the "silence is not agreement" reasoning below actually
+reaches the other seat.
 
 **The problem.** A rate-limited seat can still be invoked. `findHopTarget`
 (`parley.mjs:2231`) returns an explicit `@tag` target with no lurk check — lurk only
@@ -53,13 +68,25 @@ room eats a 429.
 - **Nothing is silently dropped.** The skip must `appendEntry(..., kind: "system")`, not
   just `broadcast`. There is already a skip channel —
   `broadcast(room, { type: "lurk", agent, spoke: false, skipped: true })` at `3141`,
-  `3156`, `3172` — reuse it for the UI, but do not stop there. That busy-skip
-  deliberately writes nothing to the thread because the comment at `3155` is right: the
-  seat is merely busy and *"the delta catches it up later."* A sleeping seat has no
-  later. Reusing the busy path as-is produces false consensus: the other agent's own lurk
-  prompt says silence "will be read as agreement with what was said."
-- **Routing.** Directly addressing a sleeping seat is rejected *before* a user entry is
-  created. `@both` delivers to the awake seat and records the sleeping-seat skip.
+  `3156`, `3172` — reuse it for the UI, but do not stop there. A sleeping seat has no
+  automatic later invocation, so reusing an ephemeral skip would produce false
+  consensus: the other agent's own lurk prompt says silence "will be read as agreement
+  with what was said." **Later superseded for occupied lurkers too:** Package 10 records
+  a persisted, coalesced catch-up obligation instead of accepting “the delta catches it
+  up later” as sufficient. The delta preserves content, but only an invocation fulfils
+  the promise that lurk actually overhears it.
+- **Routing.** ~~Directly addressing a sleeping seat is rejected *before* a user entry is
+  created.~~ **Superseded during implementation:** the message is now *held* instead of
+  refused. Refusing meant the user had to hold the request themselves and re-send it
+  later, at which point the room had no record that they had ever asked. Holding keeps
+  the transcript honest about when the request was made, and lets the seat answer it in
+  one turn on wake with the later traffic still in its real position, so it can tell a
+  stale request from a live one. Only a **pair turn** still refuses, because pair mode
+  has no single seat to hold the work for. `@both` still splits: the awake seat is
+  delivered to and the sleeping seat's copy is held.
+  Held-for-seat needed **no new state** — it is `deltaEntries` past the seat's cursor
+  filtered by the `meta.audience.asleep` the split already wrote — so it survives
+  restarts for free and clears itself when a turn advances the cursor.
 - **Pair mode pauses** rather than substituting or continuing with the sleeping role.
 - **Sleep applies to future launches only.** Stopping current work stays a separate
   explicit action. Mostly moot in the motivating case — a 429 means the turn already
@@ -78,6 +105,21 @@ room eats a 429.
   *context* pending, not as a predictable token cost. This is the one place the size of
   the first wake turn is knowable in advance, and that turn is the largest in the room
   arriving right after the quota event that caused the sleep.
+  **Extended during implementation:** the pill also shows how many of those entries are
+  messages *addressed to that seat* (`asleep · 3 held · 14 pending`). Held is a subset of
+  pending and must never be rendered as if the two sum. Unlike `pending`, the held count
+  is **not** gated on being asleep — after **Wake only** the seat is awake and those
+  messages are still undelivered, so hiding the count then would be a lie the user cannot
+  see through.
+- **Wake is two actions when anything is held**, chosen from a small menu rather than a
+  `confirm()`: **Wake & deliver** answers everything held in one turn, **Wake only**
+  leaves it as ordinary context. The choice has three outcomes counting "not now", which
+  is one more than a confirm dialog can express — its Cancel would have to double as one
+  of the two wakes. Wake & deliver preflights (`pairActive`/`seatOccupied`) *before*
+  clearing sleep, so a refusal leaves the held work provably still held.
+  Per-message discard of a held message is **not** in this package — it belongs with
+  Package 3's queue controls, which already own the discard vocabulary. Wake only is the
+  escape hatch until then.
 - **Sleep and wake entries are symmetric.** Both persisted, not just broadcast; otherwise
   a restart leaves a transcript showing a seat going quiet and never explaining why it
   started talking again.
@@ -221,7 +263,12 @@ radius of one click flips on sub-second timing the user cannot see.
 
 ---
 
-## Package 6 — Mention parsing and hop budget (agreed, deferred by the user 2026-08-07)
+## Package 6 — Mention parsing and final-hop warning (built in the working tree, uncommitted 2026-08-10)
+
+Implemented in the current working tree; **not committed or shipped**. The routing mask
+lives beside `findHopTarget`, and the per-turn warning is composed at the hop launch site.
+The broader budget vocabulary and composer control that made the warning user-selectable
+are recorded separately in Package 11.
 
 In the user's stated priority order:
 
@@ -232,15 +279,12 @@ In the user's stated priority order:
    create or destroy a vocative boundary. Sanitize once, then run both the explicit and
    soft passes over that copy. This is a real behaviour change, not a pure bugfix:
    someone occasionally backticks a name while genuinely meaning to tag.
-2. **Final-hop warning.** `HOP_INSTRUCTION` is a static const and the `hops` counter never
-   leaves `drainMentions` (`parley.mjs:3067`), so this is plumbing, not a string edit:
-   compute the terminal condition at the call site and thread it through `runHopTurn`.
-   The cap check at `3082` fires *before* the hop and returns, so the correct site is
-   `3087`, where `hops + 1 >= maxHops` means "this invocation is the last permitted one."
-   Terminal wording, not advisory. Agreed it fires on the implicit safety cap too
-   (`maxHops = configuredHops || HOP_SAFETY_HOPS`, `3065`) — the hop genuinely is the last
-   one either way, and staying silent would make the prompt lie by omission exactly where
-   a runaway chain most needs the pressure.
+2. **Final-hop warning.** `HOP_INSTRUCTION` used to be static while the counter lived only
+   inside the relay loop. The launch site now composes the turn-specific instruction:
+   finite budgets say how many handoffs remain, the last permitted invocation says it is
+   final, and an `∞` exchange gets the same terminal pressure on the implicit emergency
+   safety edge without a noisy countdown on every earlier leg. The relay still enforces
+   the limit; this is guidance, not authority.
 
 Already shipped, listed only so it is not re-opened: emphasis-wrapped tags
 (`**@codex**`) were fixed in `fb1ee48` by adding `*_~` to the leading boundary class.
@@ -285,47 +329,161 @@ visible to a first-time user. Order:
 
 ---
 
+## Package 9 — Backlog (noted, 2026-08-09)
+
+Raised in room conversation, no design taken. **Not `1.1.0` scope** — listed so they stop
+living only in chat.
+
+- **Refresh the provider model catalog without restarting Parley.** `providerCatalog()`
+  memoises into `catalogCache` (`parley.mjs:175`) for the life of the process, so when the
+  Codex CLI rewrites `~/.codex/models_cache.json` — a new model, an updated reasoning
+  level — the picker keeps offering the old list until Parley is restarted. Only the
+  `codex` seat is affected; `PROVIDERS.claude.models` (`parley.mjs:116`) is a static alias
+  list because Claude Code publishes no equivalent catalog. Undecided: explicit refresh
+  control vs. TTL vs. invalidate-on-settings-open, and whether a seat mid-run should ever
+  see the list change under it.
+- **Longer-term room memory / decision ledger.** A durable record of what a room settled,
+  so a design does not exist only as ~200 chat messages that a session reset truncates —
+  the same gap this file was hand-written to cover. Undecided at every level: what earns a
+  ledger entry, who writes it, whether it feeds back into agent context, and how it stays
+  honest when the room later reverses itself.
+
+---
+
+## Package 10 — Guaranteed lurk catch-up (built in the working tree, uncommitted 2026-08-10)
+
+Implemented in the current working tree; **not committed or shipped**.
+
+**The bug.** The audience snapshot already recorded that a seat was selected to lurk, but
+the fan-out checked `seatOccupied` only once, after the addressed exchange finished. A
+seat that was running or still had user work in its lane received only an ephemeral
+`skipped` event. Becoming free a moment later did not re-fire the lurk. Its unchanged
+cursor meant a future turn could eventually include the missed text, but if no future
+trigger arrived there was no invocation at all — weaker than the UI promise that a
+lurking seat “overhears every exchange.”
+
+**Built shape.** Occupancy delays a selected lurk instead of discarding it:
+
+- **One persisted obligation per seat.** `state.agents[seat].pendingCatchUp` records the
+  first unseen entry, the latest entry to cover, and the exchange root. Further misses
+  extend the range instead of creating N model calls. It survives a restart.
+- **Not a user-lane item.** The obligation stays outside `room.pending`, whose ordering is
+  reserved for work the user explicitly asked for. It runs only after every accepted
+  user exchange, Pair cycle and queued delivery has settled and the seat is free. User
+  work therefore always wins.
+- **One full-delta attempt.** The listener sees the whole chronological delta rather than
+  a frozen, stale slice for each missed exchange. Only user roots whose accepted audience
+  selected this seat to lurk are marked actionable; Solo and otherwise-unselected traffic
+  remains context-only, so it can prove that a concern became stale without becoming a
+  reason to interject. A normal successful turn that already advances the seat's cursor
+  through the recorded range supersedes the obligation before it launches.
+- **One attempt, no retry loop.** Speaking and `[pass]` both advance the cursor and write
+  the ordinary lurk receipt. Before launch, sleep or disabling lurk cancels the pending
+  obligation and records why; an already-running catch-up follows Sleep's ordinary
+  future-launch rule and may finish unless stopped. Provider failure or Stop ends an
+  attempt without moving the cursor and records a durable, bounded `lurkOutcomes` range
+  for the receipt UI. A later deliberate turn can still heal the gap. An obligation
+  extended while an attempt is running keeps its newer tail. Archive & start fresh clears
+  it with the old conversation.
+- **Visible truth.** The seat pill and receipt dot distinguish “catch-up queued” from
+  “hasn't seen this yet”; after a terminal outcome they say why it did not run. A later
+  receipt or cursor advance outranks that historical outcome, so status repairs itself
+  without destructive cleanup.
+- **One bounded return.** If the delayed listener speaks, the other seat gets one read-only
+  right of reply after its user lane clears. That return is outside `hopBudget` and final:
+  it is not scanned for another automatic tag, so catch-up cannot create a ping-pong loop.
+
+This supersedes Package 1's earlier rationale that an occupied lurker could simply be
+skipped because “the delta catches it up later.” Delta delivery preserves the text, but
+without a later invocation it does not preserve the promise to overhear.
+
+---
+
+## Package 11 — Per-message hop control and Solo (built in the working tree, uncommitted 2026-08-10)
+
+Implemented in the current working tree; **not committed or shipped**. This is the live
+composer control requested for questions where the user wants to shorten or suppress an
+agent debate without changing the room for later messages.
+
+- **Unambiguous room config.** New `hopBudget` uses one vocabulary: `-1` means `∞` / until
+  settled under the emergency safety ceiling, `0` means no agent-to-agent handoffs, and
+  any positive whole number is an exact launch limit. Settings accepts any safe integer,
+  while the compact composer offers quick one-message choices through `8`. The old `maxHops` key used `0` for “until settled”; a
+  new key makes migration idempotent, translating legacy zero to `hopBudget: -1` and
+  preserving the old meaning for older clients that still submit `maxHops`. `pairRounds`
+  is deliberately unchanged: Pair cycles consult it and never `hopBudget`.
+- **Snapshotted per message.** The control beside the composer offers **Room default**,
+  **Solo**, `∞`, and `0`–`8`. An override is stored on the accepted user entry, so changing
+  Settings or the next message's control cannot rewrite a queued exchange. It resets to
+  Room default only after the next accepted user message; a failed send preserves the choice,
+  and taskless Pair start/end controls do not consume it.
+- **Server-authoritative counting.** Models do not count their own tags. The relay charges
+  only an invocation it actually launches: the user's initial addressed turn is free; an
+  asleep target or a late seat that already read the trigger spends nothing; a launched
+  call that later fails still spends one. At the cap, the target is not invoked, but the
+  tagging reply remains in the transcript and reaches it later as ordinary context.
+- **Guidance and live feedback.** Finite turns are told how many handoffs remain, the last
+  allowed turn is labelled final, and the `∞` path gets the same warning at the emergency
+  safety edge. A live counter beside the composer reports launched handoffs for the latest
+  active exchange, and the capped transcript note distinguishes an intentional limit from
+  the safety stop.
+- **Solo is not budget zero.** `0` still permits a configured lurker and its structurally
+  bounded right of reply. Solo suppresses both lurk and agent handoffs so exactly one
+  selected seat responds. It is rejected for `@both` and Pair turns. The other seat is
+  excluded from reacting, not from history: it can still read the message in a later
+  delta, and no lurk catch-up obligation is created for the deliberate exclusion.
+- **Separate accounting domains.** A lurker's spoken chime-in earns the other seat one
+  bounded right of reply outside `hopBudget`. A live lurk's further explicit tag is
+  budgeted normally; a delayed coalesced catch-up's single return is final because there
+  is no one original message budget to resume. Pair review/fix rounds remain governed by
+  `pairRounds`.
+
+The runtime protocol moves 6 → 7 with this working-tree implementation because room
+summaries now expose catch-up status, terminal lurk outcomes and live hop progress, while
+accepted user entries carry their immutable relay policy. That internal stale-tab fence
+is not a package semver decision.
+
+---
+
 ## Release plan
 
-**Where the code actually is.** `parley-room@1.0.1` already contains the prompt contract,
-pair escalation, the flicker repair, scrollback pagination and the branch chip. The
-published `gitHead` (`27b77dd`) is on a separate lineage from `main` after a rebase, so
-`git log 27b77dd..main` *looks* like unreleased code and is not — blob hashes are the
-honest test: `parley.mjs` and `ui/` are byte-identical between the published tarball and
-`main`. The only real diff against what is published is `README.md` and `package.json`.
+**Where the code actually is.** `parley-room@1.0.2` is the published latest, and its
+`gitHead` (`804b692`) is on `main` — so the lineage trap that applied to `1.0.1` is gone
+and `git log 804b692..main` is now an honest read of what is unreleased. Blob hashes stay
+the reliable test if that ever stops being true.
 
 **Recommended sequence:**
 
-1. **`1.0.2` — patch, metadata only.** The live npm page currently shows a *broken image*:
-   the published README references `docs/parley-demo.gif` by relative path, npm resolves
-   relative paths against the default branch, and that file was deleted in `735b0b8`. The
-   fix is a publish, not cleanup. Bundle the README wording already agreed, and the
-   `oxipng`/`pngquant` pass on the two ~750 KB stills. Deferred by the user on 2026-08-08
-   — "we'll bump when there is actually something important" — so this rides along with
-   whatever lands next rather than shipping alone.
-2. **`1.1.0` — minor, the whole feature batch above.** Packages 1–5 are additive: new
-   seat state, new queue controls, new per-message actions, corrected stop semantics. No
-   config key changes meaning, no CLI flag is removed, no room on disk stops loading.
-   That is a minor under semver, and bundling them is right because they interlock —
-   Redirect creates exactly the amber state Package 2 defines, Sleep reuses the skip
-   channel Package 2 makes durable, and Package 3's retry and Package 4's redirect share
-   one dispatch primitive.
+1. **`1.0.2` — shipped 2026-08-08 (`804b692`), patch, metadata only.** The npm page was
+   showing a *broken image*: the published README referenced `docs/parley-demo.gif` by
+   relative path, npm resolves relative paths against the default branch, and that file
+   was deleted in `735b0b8`. The republish fixed the images and the tarball is now five
+   files. Kept here for the record — nothing in this step is outstanding.
+2. **`1.1.0` — minor, the feature batch above.** The working tree currently contains
+   Packages 1, 6, 10 and 11; none is committed or shipped. The remaining 1–5 work is
+   still additive. Package 11 replaces room config `maxHops` with `hopBudget`, but it is a
+   backward-compatible migration rather than a break: legacy rooms are rewritten on
+   load (`maxHops: 0` keeps its old “until settled” meaning as `hopBudget: -1`) and older
+   clients posting `maxHops` retain the legacy semantics. No room on disk stops loading
+   and no CLI flag is removed. That remains a minor under semver.
 3. **Not a major.** `2.0.0` should be reserved for something that actually breaks a user:
    a room-state format that old versions cannot read, a renamed CLI flag, a changed
-   default permission scope. Nothing here does that. The internal runtime protocol *will*
-   need a bump (5 → 6) because packages 2–4 change client-visible payload shapes, but
-   that is a stale-tab reload, not a semver event — the two numbers are unrelated and
-   should stay that way.
+   default permission scope. Nothing here does that. The internal runtime protocol moved
+   5 → 6 for Sleep and is 7 in the current working tree for catch-up and relay progress;
+   that is a stale-tab reload fence, not a semver event — the two numbers are unrelated
+   and should stay that way.
 
 **Sequencing.** Treat 1–5 as a shared **1.1 milestone**, not an indivisible release.
-Nothing here should be held hostage to scope growth in the packages after it.
+Packages 6, 10 and 11 are a coherent relay/lurk slice already built beside Sleep in the
+working tree. Nothing should be held hostage to scope growth in a later package.
 
 | Stage | Contents | Notes |
 |---|---|---|
-| 1 | Sleep (1), durable status model (2), stop-button semantics (5) | Sleep depends on nothing in package 2 — its skip is its own `appendEntry`, and the existing `broadcast(… skipped: true)` sites cover the UI half. Package 5 depends on nothing at all and is ~3 lines plus a rewrite of `test/smoke.mjs:1175-1182`; it goes early because it is the highest-frequency interaction in the app and is otherwise the first thing to slip. **Runtime protocol 5 → 6 lands here** — Sleep alone changes the summary payload (seat state for the edge filters and the Sleep/Wake control), so the bump is certain regardless of what else ships in this stage. |
+| 1 | ~~Sleep (1)~~ **built**, durable status model (2), stop-button semantics (5) | Sleep landed first and depended on nothing in package 2, as predicted — its skip is its own `appendEntry`, and the existing `broadcast(… skipped: true)` sites covered the UI half. **Runtime protocol 5 → 6 landed with it**, for exactly the predicted reason: the summary now carries each seat's sleep state, and its pending-backlog count while asleep. Package 5 depends on nothing at all and is ~3 lines plus a rewrite of `test/smoke.mjs:1175-1182`; it goes early because it is the highest-frequency interaction in the app and is otherwise the first thing to slip. |
 | 2 | `dispatchFromSource` (4), queue controls (3), Ask again / Redirect (4) | The single-head-of-lane-producer invariant must be enforced **when the primitive lands**, not retrofitted after Retry is already calling it. Packages 3 and 4 are the ones that render into package 2's amber and per-seat status. |
-| 3 | Mention masking and final-hop warning (6), parked UI items (7) | Small, independent, can slip without cost. |
+| 3 | ~~Mention masking and final-hop warning (6)~~ **built**, parked UI items (7) | Package 6 is present but uncommitted. The unrelated parked UI set can still slip without cost. |
+| Relay/lurk extension | ~~Guaranteed lurk catch-up (10), per-message hop control and Solo (11)~~ **built** | Present in the working tree, uncommitted and unshipped. Runtime protocol 6 → 7 lands with this slice because summaries add catch-up/outcome/progress state. |
 
-If stage 2 or 3 exposes unresolved behaviour, release the completed stage-1 work as
-`1.1.0` and move the rest to `1.2.0`. Nothing in packages 3–6 needs to change if it slips
-a release.
+If stage 2 or the remaining stage-3 UI work grows, the completed built slices can still
+ship as `1.1.0` and the rest move to `1.2.0`. Nothing in Packages 3–5 or 7 needs to change
+for Packages 1, 6, 10 and 11 to stand on their own.

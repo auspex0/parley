@@ -34,7 +34,7 @@ function ok(name, cond, detail) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 let TOKEN = ""; // read out of the served page, exactly as the browser does
-const RUNTIME_PROTOCOL = "5";
+const RUNTIME_PROTOCOL = "7";
 
 async function api(method, route, body) {
   const res = await fetch(base + route, method === "GET"
@@ -86,7 +86,8 @@ function rawStatus(route, { method = "GET", host, origin, token = TOKEN, protoco
 const room = (name) => api("GET", `/api/room?name=${encodeURIComponent(name)}`).then((r) => r.data);
 const roomStatus = (name) => api("GET", `/api/room?name=${encodeURIComponent(name)}`).then((r) => r.status);
 const cfg = (name, config) => api("POST", "/api/config", { room: name, config });
-const say = (name, text, target = "auto") => api("POST", "/api/message", { room: name, text, target });
+const say = (name, text, target = "auto", relay = {}) =>
+  api("POST", "/api/message", { room: name, text, target, ...relay });
 
 async function useFakes(name) {
   await cfg(name, { agents: { claude: { command: FAKE }, codex: { command: FAKE } } });
@@ -1138,6 +1139,148 @@ async function checkFolderPickerUi() {
 // one replayed every visible message's entrance animation while it was being
 // read. "Extends in place" is a claim about node identity, which no string in
 // the source can show — so the run functions are run against a small DOM.
+// Waking a seat that is holding messages is a three-way choice — deliver, wake
+// only, or change your mind — and a native confirm() has only two buttons, so
+// its Cancel would have to double as one of the two wakes. That the menu offers
+// both wakes, and that each sends the right request, is behaviour rather than a
+// string in the source: the handlers are run against a small DOM.
+function checkWakeMenuUi() {
+  const src = fs.readFileSync(path.join(here, "..", "ui", "index.html"), "utf8");
+  const from = src.indexOf("function closeWakeMenu(");
+  const to = src.indexOf('$("wakeMenu").addEventListener(');
+  const block = from >= 0 && to > from ? src.slice(from, to) : "";
+  ok("the wake menu source block is where the test expects it", !!block);
+
+  const menu = {
+    innerHTML: "", style: {},
+    offsetWidth: 210,
+    _classes: new Set(),
+    classList: {
+      add: (c) => menu._classes.add(c),
+      remove: (c) => menu._classes.delete(c),
+      contains: (c) => menu._classes.has(c),
+    },
+  };
+  const posted = [];
+  const toasts = [];
+  let confirmed = 0;
+  const scope = {
+    $: () => menu,
+    esc: (s) => String(s),
+    toast: (t) => toasts.push(t),
+    api: async (path, body) => { posted.push({ path, body }); return { delivered: !!body.deliver, held: 2 }; },
+    state: { room: "r" },
+    confirm: () => { confirmed++; return true; },
+    window: { innerWidth: 1200 },
+  };
+  const make = new Function(...Object.keys(scope),
+    `${block}; return { openWakeMenu, closeWakeMenu, wakeSeatFromMenu };`);
+  const api = make(...Object.values(scope));
+
+  const moon = { getBoundingClientRect: () => ({ right: 400, bottom: 60 }) };
+  api.openWakeMenu(moon, "codex", 2);
+  const items = menu.innerHTML.match(/data-wake="([a-z]+)"/g) || [];
+  ok("waking a seat with held messages offers both wakes, not a yes/no",
+    items.length === 2 && menu.innerHTML.includes('data-wake="deliver"') &&
+    menu.innerHTML.includes('data-wake="only"') && menu._classes.has("open"),
+    JSON.stringify({ items, open: menu._classes.has("open") }));
+  ok("…and names what each one does to the held messages",
+    /answers the 2 held messages in one turn/.test(menu.innerHTML) &&
+    /become ordinary context/.test(menu.innerHTML), menu.innerHTML);
+
+  return (async () => {
+    await api.wakeSeatFromMenu("codex", true);
+    ok("Wake & deliver asks the server to deliver",
+      posted.length === 1 && posted[0].body.deliver === true &&
+      posted[0].body.asleep === false && posted[0].body.agent === "codex",
+      JSON.stringify(posted));
+    ok("…and says so, rather than claiming nothing was replayed",
+      /answering 2 held messages/.test(toasts[0] || ""), JSON.stringify(toasts));
+    ok("…and closes the menu behind it", !menu._classes.has("open"));
+
+    await api.wakeSeatFromMenu("codex", false);
+    ok("Wake only wakes without delivering",
+      posted.length === 2 && posted[1].body.deliver === undefined &&
+      posted[1].body.asleep === false,
+      JSON.stringify(posted[1]));
+    ok("neither wake path falls back to a two-button confirm()",
+      confirmed === 0 && !block.includes("confirm("), String(confirmed));
+  })();
+}
+
+async function checkSoloPairControlUi() {
+  const src = fs.readFileSync(path.join(here, "..", "ui", "index.html"), "utf8");
+  const from = src.indexOf("function pairControlOnly(");
+  const to = src.indexOf("function closeHopMenu(", from);
+  const block = from >= 0 && to > from ? src.slice(from, to) : "";
+  const state = {
+    hopChoice: "solo", chip: "auto",
+    summary: { pair: null, lastAddressed: "claude", cfg: { defaultAgent: "claude" } },
+  };
+  const guessTextTarget = (raw) => {
+    const text = String(raw || "").toLowerCase();
+    if (text.includes("@both") || (text.includes("@claude") && text.includes("@codex"))) return "both";
+    if (text.includes("@claude")) return "claude";
+    if (text.includes("@codex")) return "codex";
+    return null;
+  };
+  let soloTargetProblem = null, pairControlOnly = null;
+  try {
+    ({ soloTargetProblem, pairControlOnly } = new Function("state", "guessTextTarget",
+      `${block}\nreturn { soloTargetProblem, pairControlOnly };`)(state, guessTextTarget));
+  } catch { /* assertion below reports extraction failure */ }
+  const allowed = [
+    "/pair", "/pair start", "/pair start 3", "/pair start @claude",
+    "/pair start 12 @codex", "/pair start **@claude**",
+  ];
+  const rejected = [
+    ["/pair start @claude do the task", false],
+    ["/pair start 3@claude", false],
+    ["/pair start3 @claude", false],
+    ["/pair start @both", false],
+    ["/pair start @unknown", false],
+    ["/pair start @claude", true],
+  ];
+  ok("Solo UI allows only genuinely taskless Pair-start controls",
+    !!soloTargetProblem && allowed.every((text) => !soloTargetProblem(text, false)) &&
+    rejected.every(([text, attached]) => !!soloTargetProblem(text, attached)),
+    soloTargetProblem ? JSON.stringify({
+      allowed: allowed.map((text) => [text, soloTargetProblem(text, false)]),
+      rejected: rejected.map(([text, attached]) => [text, attached, soloTargetProblem(text, attached)]),
+    }) : "soloTargetProblem did not extract");
+
+  const sendFrom = src.indexOf("async function send()");
+  const sendTo = src.indexOf('$("sendBtn").onclick = send;', sendFrom);
+  const sendBlock = sendFrom >= 0 && sendTo > sendFrom ? src.slice(sendFrom, sendTo) : "";
+  const input = { value: "/pair start @claude" };
+  const sentBodies = [];
+  let policyResets = 0;
+  Object.assign(state, {
+    room: "r", sending: false, draftImages: [], draftFiles: [],
+    resyncVersion: 0, chipRevision: 0, hopRevision: 0, sendVersion: 0,
+  });
+  const sendScope = {
+    state, input, pairControlOnly, soloTargetProblem,
+    $: () => ({ disabled: false }),
+    autosize: () => {}, hideMention: () => {}, toast: () => {},
+    handleSlash: async () => false,
+    fileBase64: async () => "", clearDraftImages: () => {}, clearDraftFiles: () => {},
+    normalizedHopBudget: (value, fallback) => Number.isInteger(Number(value)) ? Number(value) : fallback,
+    api: async (_path, body) => { sentBodies.push(body); return {}; },
+    selectChip: () => {},
+    selectHopChoice: () => { policyResets++; state.hopChoice = "default"; },
+  };
+  let send = null;
+  try {
+    send = new Function(...Object.keys(sendScope), `${sendBlock}\nreturn send;`)(...Object.values(sendScope));
+    await send();
+  } catch { /* assertion below reports harness failure */ }
+  ok("a taskless Pair control neither transmits nor consumes the armed one-shot Solo policy",
+    !!send && sentBodies.length === 1 && !("solo" in sentBodies[0]) &&
+    !("hopBudget" in sentBodies[0]) && state.hopChoice === "solo" && policyResets === 0,
+    JSON.stringify({ sentBodies, hopChoice: state.hopChoice, policyResets }));
+}
+
 function checkActivityRunUi() {
   const src = fs.readFileSync(path.join(here, "..", "ui", "index.html"), "utf8");
   const from = src.indexOf("function activityRunKey(");
@@ -1498,6 +1641,8 @@ async function main() {
   if (process.env.PARLEY_SKIP_NATIVE_PICKER !== "1") await checkFolderPicker();
   await checkFolderPickerUi();
   checkActivityRunUi();
+  await checkWakeMenuUi();
+  await checkSoloPairControlUi();
 
   console.log("routing & the delta protocol");
   await useFakes("default");
@@ -2086,6 +2231,752 @@ async function main() {
   ok("a positive hop limit caps the exchange",
     limitedHopEntries.filter((e) => e.kind === "agent" && e.meta && e.meta.hop).length === 1 &&
     limitedHopEntries.some((e) => e.kind === "system" && /Agent-hop budget reached \(1\)/i.test(e.text)));
+
+  console.log("\nhop policy, per-message overrides & Solo");
+
+  // New rooms speak the new vocabulary directly. Legacy room files used
+  // maxHops:0 for "until settled"; migration has to translate that exactly
+  // once so a genuine hopBudget:0 can survive every later reload.
+  await api("POST", "/api/rooms", { name: "hop-default" });
+  let hopPolicyRoom = await room("hop-default");
+  ok("new rooms default to hopBudget -1 (until settled)",
+    hopPolicyRoom.room.cfg.hopBudget === -1 && !("maxHops" in hopPolicyRoom.room.cfg),
+    JSON.stringify(hopPolicyRoom.room.cfg));
+
+  const legacyHopDir = path.join(ROOT, "legacy-hop-budget");
+  fs.mkdirSync(path.join(legacyHopDir, "workspace"), { recursive: true });
+  fs.writeFileSync(path.join(legacyHopDir, "room.json"), JSON.stringify({
+    defaultAgent: "claude", mode: "talk", maxHops: 0, pairRounds: 0,
+    projectDir: null, roomNote: null, timeoutMs: 900000,
+    agents: {
+      claude: { command: FAKE, lurk: false },
+      codex: { command: FAKE, lurk: false },
+    },
+  }, null, 2));
+  hopPolicyRoom = await room("legacy-hop-budget");
+  const migratedHopCfg = JSON.parse(fs.readFileSync(path.join(legacyHopDir, "room.json"), "utf8"));
+  ok("legacy maxHops 0 migrates durably to hopBudget -1",
+    hopPolicyRoom.room.cfg.hopBudget === -1 && !("maxHops" in hopPolicyRoom.room.cfg) &&
+    migratedHopCfg.hopBudget === -1 && !("maxHops" in migratedHopCfg),
+    JSON.stringify({ summary: hopPolicyRoom.room.cfg, disk: migratedHopCfg }));
+
+  await api("POST", "/api/rooms", { name: "hop-zero" });
+  await useFakes("hop-zero");
+  await cfg("hop-zero", { hopBudget: 0, agents: { claude: { lurk: false }, codex: { lurk: false } } });
+  const persistedZero = JSON.parse(fs.readFileSync(path.join(ROOT, "hop-zero", "room.json"), "utf8"));
+  ok("a genuine hopBudget 0 is stored as zero, not remigrated to unlimited",
+    persistedZero.hopBudget === 0 && !("maxHops" in persistedZero), JSON.stringify(persistedZero));
+  await say("hop-zero", "@claude PINGPONG");
+  d = await idle("hop-zero");
+  const zeroHops = d.entries.filter((e) => e.kind === "agent" && e.meta && e.meta.hop);
+  const zeroCaps = d.entries.filter((e) => e.kind === "system" && e.meta && e.meta.relayCap);
+  ok("hopBudget 0 blocks the first agent handoff and writes one cap note",
+    zeroHops.length === 0 && zeroCaps.length === 1 &&
+    zeroCaps[0].meta.relayCap.budget === 0 && zeroCaps[0].meta.relayCap.used === 0,
+    JSON.stringify({ hops: zeroHops, caps: zeroCaps }));
+
+  await api("POST", "/api/rooms", { name: "hop-exact" });
+  await useFakes("hop-exact");
+  await cfg("hop-exact", { hopBudget: 2, agents: { claude: { lurk: false }, codex: { lurk: false } } });
+  await say("hop-exact", "@claude PINGPONG");
+  d = await idle("hop-exact");
+  ok("a positive hopBudget counts launched handoffs exactly",
+    d.entries.filter((e) => e.kind === "agent" && e.meta && e.meta.hop).length === 2 &&
+    d.entries.some((e) => e.meta && e.meta.relayCap &&
+      e.meta.relayCap.budget === 2 && e.meta.relayCap.used === 2),
+    JSON.stringify(d.entries.filter((e) => e.meta && (e.meta.hop || e.meta.relayCap))));
+
+  await cfg("hop-exact", { hopBudget: 42 });
+  const persistedLargeBudget = JSON.parse(fs.readFileSync(path.join(ROOT, "hop-exact", "room.json"), "utf8"));
+  d = await room("hop-exact");
+  ok("room Settings accepts and persists an exact hop budget above the composer's quick range",
+    d.room.cfg.hopBudget === 42 && persistedLargeBudget.hopBudget === 42,
+    JSON.stringify({ summary: d.room.cfg.hopBudget, disk: persistedLargeBudget.hopBudget }));
+
+  // The selector is a one-message snapshot, not a live edit of room config.
+  // Prove both override directions, then hold one behind a busy seat and mutate
+  // Settings while it waits: its root entry remains the authority.
+  await api("POST", "/api/rooms", { name: "hop-override-up" });
+  await useFakes("hop-override-up");
+  await cfg("hop-override-up", { hopBudget: 0, agents: { claude: { lurk: false }, codex: { lurk: false } } });
+  await say("hop-override-up", "@claude PINGPONG", "auto", { hopBudget: 2 });
+  d = await idle("hop-override-up");
+  ok("a per-message positive override beats a room budget of zero",
+    d.entries.filter((e) => e.kind === "agent" && e.meta && e.meta.hop).length === 2 &&
+    d.entries.find((e) => e.kind === "user").meta.relay.hopBudget === 2,
+    JSON.stringify(d.entries));
+
+  await api("POST", "/api/rooms", { name: "hop-override-down" });
+  await useFakes("hop-override-down");
+  await cfg("hop-override-down", { hopBudget: 2, agents: { claude: { lurk: false }, codex: { lurk: false } } });
+  await say("hop-override-down", "@claude PINGPONG", "auto", { hopBudget: 0 });
+  d = await idle("hop-override-down");
+  ok("a per-message zero override beats a positive room budget",
+    !d.entries.some((e) => e.kind === "agent" && e.meta && e.meta.hop) &&
+    d.entries.find((e) => e.kind === "user").meta.relay.hopBudget === 0,
+    JSON.stringify(d.entries));
+
+  await api("POST", "/api/rooms", { name: "hop-snapshot" });
+  await useFakes("hop-snapshot");
+  await cfg("hop-snapshot", { hopBudget: 0, agents: { claude: { lurk: false }, codex: { lurk: false } } });
+  await say("hop-snapshot", "@claude SLEEP:1800 SAY:BLOCKER");
+  await waitRoom("hop-snapshot", (x) => x.room.busy.includes("claude"), "snapshot blocker to start");
+  const snapAccepted = await say("hop-snapshot", "@claude PINGPONG", "auto", { hopBudget: 2 });
+  ok("a per-message relay policy can be accepted while its seat is queued",
+    snapAccepted.status === 200 && Array.isArray(snapAccepted.data.deferred) &&
+    snapAccepted.data.deferred.includes("claude"), JSON.stringify(snapAccepted.data));
+  const snapBeforeCfg = await room("hop-snapshot");
+  const snapRoot = snapBeforeCfg.entries.find((e) => e.kind === "user" && e.text === "PINGPONG");
+  await cfg("hop-snapshot", { hopBudget: -1 });
+  d = await idle("hop-snapshot", 40000);
+  const snapHops = d.entries.filter((e) => e.kind === "agent" && e.meta && e.meta.hop &&
+    e.meta.replyRoot === snapRoot.n);
+  ok("a queued message keeps its accepted override across later config changes",
+    snapRoot.meta.relay.hopBudget === 2 && snapHops.length === 2 &&
+    d.entries.some((e) => e.meta && e.meta.relayCap && e.meta.relayCap.rootN === snapRoot.n &&
+      e.meta.relayCap.budget === 2),
+    JSON.stringify({ root: snapRoot, hops: snapHops }));
+
+  await api("POST", "/api/rooms", { name: "hop-invalid" });
+  await useFakes("hop-invalid");
+  const invalidEntryCount = (await room("hop-invalid")).entries.length;
+  const invalidRelayBodies = [
+    { hopBudget: -2 }, { hopBudget: 9 }, { hopBudget: 1.5 },
+    { hopBudget: "not-a-budget" }, { solo: "yes" },
+  ];
+  const invalidRelayResults = [];
+  for (const relay of invalidRelayBodies) {
+    invalidRelayResults.push(await say("hop-invalid", "@claude SAY:SHOULDNOTLAND", "auto", relay));
+  }
+  ok("invalid hopBudget and Solo types are rejected before appending an entry",
+    invalidRelayResults.every((r) => r.status === 400) &&
+    (await room("hop-invalid")).entries.length === invalidEntryCount,
+    JSON.stringify(invalidRelayResults.map((r) => ({ status: r.status, data: r.data }))));
+
+  await api("POST", "/api/rooms", { name: "solo-policy" });
+  await useFakes("solo-policy");
+  await cfg("solo-policy", { hopBudget: -1, agents: { codex: { lurk: true } } });
+  const soloMark = (await room("solo-policy")).entries.length;
+  await say("solo-policy", "@claude PINGPONG", "auto", { solo: true });
+  d = await idle("solo-policy");
+  const soloSlice = d.entries.slice(soloMark);
+  const soloRoot = soloSlice.find((e) => e.kind === "user");
+  ok("Solo launches only the selected seat and suppresses both hops and lurk",
+    soloSlice.filter((e) => e.kind === "agent").length === 1 &&
+    soloSlice.some((e) => e.kind === "agent" && e.author === "claude") &&
+    !soloSlice.some((e) => e.kind === "agent" && e.author === "codex") &&
+    !d.receipts.some((r) => r.turn === soloRoot.n && (r.mode === "lurk" || r.mode === "hop")) &&
+    soloRoot.meta.relay.solo === true && soloRoot.meta.relay.hopBudget === 0 &&
+    soloRoot.meta.audience.lurking.length === 0,
+    JSON.stringify({ entries: soloSlice, receipts: d.receipts }));
+  const beforeSoloReject = d.entries.length;
+  const soloBoth = await say("solo-policy", "@both SAY:NEVERBOTH", "auto", { solo: true });
+  const soloPair = await say("solo-policy", "/pair start @claude SAY:NEVERPAIR", "auto", { solo: true });
+  d = await room("solo-policy");
+  ok("Solo rejects @both and pair turns before entries or pair state are created",
+    soloBoth.status === 400 && soloPair.status === 400 &&
+    d.entries.length === beforeSoloReject && !d.room.pair,
+    JSON.stringify({ both: soloBoth.data, pair: soloPair.data, entries: d.entries.slice(beforeSoloReject) }));
+
+  await api("POST", "/api/rooms", { name: "solo-pair-end" });
+  await useFakes("solo-pair-end");
+  await say("solo-pair-end", "/pair start @claude");
+  const soloPairEnd = await say("solo-pair-end", "/pair end", "auto", { solo: true });
+  const soloPairEnded = await room("solo-pair-end");
+  ok("Solo does not block /pair end, which is a control rather than a pair turn",
+    soloPairEnd.status === 200 && !soloPairEnded.room.pair &&
+    soloPairEnded.entries.some((e) => e.kind === "system" && e.meta && e.meta.pairMode === "off"),
+    JSON.stringify({ response: soloPairEnd.data, pair: soloPairEnded.room.pair }));
+
+  await api("POST", "/api/rooms", { name: "solo-pair-start" });
+  await useFakes("solo-pair-start");
+  const beforeSoloPairStart = await room("solo-pair-start");
+  const soloPairStart = await say("solo-pair-start", "/pair start @claude", "auto", { solo: true });
+  const soloPairStarted = await room("solo-pair-start");
+  ok("sticky Solo allows a taskless /pair start control without creating a user turn",
+    soloPairStart.status === 200 && soloPairStarted.room.pair &&
+    soloPairStarted.room.pair.worker === "claude" && soloPairStarted.room.pair.reviewer === "codex" &&
+    soloPairStarted.entries.filter((e) => e.kind === "user").length ===
+      beforeSoloPairStart.entries.filter((e) => e.kind === "user").length &&
+    soloPairStarted.entries.some((e) => e.kind === "system" && e.meta && e.meta.pairMode === "on") &&
+    !soloPairStarted.entries.some((e) => e.kind === "agent"),
+    JSON.stringify({ response: soloPairStart.data, pair: soloPairStarted.room.pair,
+      entries: soloPairStarted.entries }));
+
+  const pairParserAllowed = [
+    ["solo-pair-rounds-only", "/pair start 3"],
+    ["solo-pair-emphasis", "/pair start **@claude**"],
+  ];
+  const pairParserAllowedResults = [];
+  for (const [name, text] of pairParserAllowed) {
+    await api("POST", "/api/rooms", { name });
+    await useFakes(name);
+    const before = await room(name);
+    const accepted = await say(name, text, "auto", { solo: true });
+    const after = await room(name);
+    pairParserAllowedResults.push({ name, text, accepted, before, after });
+  }
+  ok("server Pair parsing accepts rounds-only and emphasized-target taskless controls under Solo",
+    pairParserAllowedResults.every(({ accepted, before, after }) =>
+      accepted.status === 200 && !!after.room.pair &&
+      after.entries.filter((e) => e.kind === "user").length ===
+        before.entries.filter((e) => e.kind === "user").length &&
+      !after.entries.some((e) => e.kind === "agent")),
+    JSON.stringify(pairParserAllowedResults.map(({ name, text, accepted, after }) => ({
+      name, text, status: accepted.status, pair: after.room.pair, entries: after.entries,
+    }))));
+
+  const pairParserRejected = [
+    ["solo-pair-joined-rounds", "/pair start 3@claude"],
+    ["solo-pair-joined-start", "/pair start3 @claude"],
+  ];
+  const pairParserRejectedResults = [];
+  for (const [name, text] of pairParserRejected) {
+    await api("POST", "/api/rooms", { name });
+    await useFakes(name);
+    const before = await room(name);
+    const rejected = await say(name, text, "auto", { solo: true });
+    const after = await room(name);
+    pairParserRejectedResults.push({ name, text, rejected, before, after });
+  }
+  ok("server Pair parsing keeps joined start/round prefixes as task text and rejects them under Solo",
+    pairParserRejectedResults.every(({ rejected, before, after }) =>
+      rejected.status === 400 && !after.room.pair && after.entries.length === before.entries.length),
+    JSON.stringify(pairParserRejectedResults.map(({ name, text, rejected, after }) => ({
+      name, text, status: rejected.status, response: rejected.data, entries: after.entries,
+    }))));
+
+  // Source-level routing probes are appropriate here because the standard
+  // fake emits only one fixed markdown shape. They execute the real masking
+  // and target parser from parley.mjs, preserving the integration tests above
+  // for the surrounding exchange machinery.
+  {
+    const src = fs.readFileSync(SERVER, "utf8");
+    const mentionStart = src.indexOf("const escRe =");
+    const mentionEnd = src.indexOf("// A hop waits for the seat's running turn", mentionStart);
+    let mentionFns = null;
+    try {
+      mentionFns = new Function(
+        `const seatIds = (room) => Object.keys(room.cfg.agents);\n${src.slice(mentionStart, mentionEnd)}\n` +
+        "return { maskMentionSyntax, findHopTarget };",
+      )();
+    } catch { /* assertion below reports extraction failure */ }
+    const mentionRoom = { cfg: { agents: { claude: { lurk: false }, codex: { lurk: false } } } };
+    const targetOf = (text) => mentionFns && mentionFns.findHopTarget(mentionRoom, { author: "claude", text });
+    ok("inline, fenced, and blockquoted mentions are inert while emphasis tags still route",
+      !!mentionFns &&
+      targetOf("Example: `@codex`") === null &&
+      targetOf("```js\n@codex please review\n```") === null &&
+      targetOf("> @codex said this earlier") === null &&
+      targetOf("**@codex** please review") === "codex" &&
+      mentionFns.maskMentionSyntax("one\n`@codex`\nthree").split("\n").length === 3,
+      mentionFns ? JSON.stringify([
+        targetOf("Example: `@codex`"), targetOf("```js\n@codex please review\n```"),
+        targetOf("> @codex said this earlier"), targetOf("**@codex** please review"),
+      ]) : "mention functions did not extract");
+  }
+
+  await api("POST", "/api/rooms", { name: "hop-progress" });
+  await useFakes("hop-progress");
+  await cfg("hop-progress", { hopBudget: 2, agents: { claude: { lurk: false }, codex: { lurk: false } } });
+  await say("hop-progress", "@claude PINGPONG");
+  const hopProgress = await waitRoom("hop-progress", (x) =>
+    Array.isArray(x.room.hopRuns) && x.room.hopRuns.some((run) => run.used >= 1),
+  "the live hop counter to advance", 10000);
+  ok("the room summary exposes live hop progress with the snapshotted budget",
+    hopProgress.room.hopRuns.length === 1 && hopProgress.room.hopRuns[0].budget === 2 &&
+    hopProgress.room.hopRuns[0].used >= 1,
+    JSON.stringify(hopProgress.room.hopRuns));
+  d = await idle("hop-progress");
+  ok("live hop progress clears when its exchange closes",
+    Array.isArray(d.room.hopRuns) && d.room.hopRuns.length === 0,
+    JSON.stringify(d.room.hopRuns));
+
+  console.log("\nguaranteed lurk catch-up");
+
+  await api("POST", "/api/rooms", { name: "lurk-catchup" });
+  await useFakes("lurk-catchup");
+  await cfg("lurk-catchup", {
+    hopBudget: 0,
+    agents: { claude: { lurk: false }, codex: { lurk: true } },
+  });
+  await say("lurk-catchup", "@codex SLEEP:2600 SAY:CATCHUPBUSY");
+  await waitRoom("lurk-catchup", (x) => x.room.busy.includes("codex"), "codex to occupy its seat");
+  await say("lurk-catchup", "@claude SAY:MISSEDONE");
+  const firstCatchUp = await waitRoom("lurk-catchup", (x) =>
+    !!(x.room.agents.codex && x.room.agents.codex.catchUp), "first catch-up obligation", 10000);
+  const firstObligation = firstCatchUp.room.agents.codex.catchUp;
+  const persistedCatchUp = JSON.parse(
+    fs.readFileSync(path.join(ROOT, "lurk-catchup", "state.json"), "utf8"),
+  ).agents.codex.pendingCatchUp;
+  ok("a busy selected lurker creates a persisted catch-up obligation",
+    !!firstObligation && !!persistedCatchUp &&
+    persistedCatchUp.throughN === firstObligation.throughN &&
+    persistedCatchUp.revision === firstObligation.revision,
+    JSON.stringify({ summary: firstObligation, disk: persistedCatchUp }));
+
+  await say("lurk-catchup", "@claude SAY:MISSEDTWO");
+  const coalescedCatchUp = await waitRoom("lurk-catchup", (x) => {
+    const pending = x.room.agents.codex && x.room.agents.codex.catchUp;
+    return pending && pending.revision > firstObligation.revision;
+  }, "the catch-up range to coalesce", 10000);
+  const coalescedObligation = coalescedCatchUp.room.agents.codex.catchUp;
+  ok("later misses coalesce into the same per-seat obligation",
+    coalescedObligation.sinceN === firstObligation.sinceN &&
+    coalescedObligation.throughN > firstObligation.throughN &&
+    coalescedObligation.revision > firstObligation.revision,
+    JSON.stringify({ first: firstObligation, coalesced: coalescedObligation }));
+
+  d = await idle("lurk-catchup", 40000);
+  const catchUpReceipts = d.receipts.filter((r) => r.agent === "codex" && r.mode === "lurk-catchup");
+  ok("coalesced catch-up runs once after user work, advances the cursor, and clears",
+    catchUpReceipts.length === 1 && catchUpReceipts[0].spoke === false &&
+    catchUpReceipts[0].upTo >= coalescedObligation.throughN &&
+    d.room.agents.codex.cursor >= coalescedObligation.throughN &&
+    d.room.agents.codex.catchUp === null,
+    JSON.stringify({ receipts: catchUpReceipts, agent: d.room.agents.codex }));
+
+  // A direct turn can partially cover a selected exchange: it snapshots the
+  // user root, then remains occupied while the addressed reply lands. Its
+  // cursor is therefore already past the eligible root but still before the
+  // obligation's tail. That must not falsely supersede the catch-up.
+  await api("POST", "/api/rooms", { name: "lurk-catchup-partial-cursor" });
+  await useFakes("lurk-catchup-partial-cursor");
+  await cfg("lurk-catchup-partial-cursor", {
+    hopBudget: 0,
+    agents: { claude: { lurk: false }, codex: { lurk: true } },
+  });
+  await say("lurk-catchup-partial-cursor", "@claude SLEEP:900 SAY:PARTIALROOT");
+  const partialRootState = await waitRoom("lurk-catchup-partial-cursor", (x) =>
+    x.room.busy.includes("claude") &&
+    x.entries.some((e) => e.kind === "user" && e.text.includes("PARTIALROOT")),
+  "the selected root to start");
+  const partialRoot = partialRootState.entries.find((e) =>
+    e.kind === "user" && e.text.includes("PARTIALROOT"));
+  await say("lurk-catchup-partial-cursor", "@codex SLEEP:1900 SAY:PARTIALDIRECT");
+  await waitRoom("lurk-catchup-partial-cursor", (x) => x.room.busy.includes("codex"),
+    "the direct codex turn to snapshot the root");
+  const partialPendingState = await waitRoom("lurk-catchup-partial-cursor", (x) =>
+    !!x.room.agents.codex.catchUp &&
+    x.entries.some((e) => e.kind === "agent" && e.author === "claude" && e.text === "PARTIALROOT"),
+  "the addressed reply to extend beyond codex's snapshot", 10000);
+  const partialReply = partialPendingState.entries.find((e) =>
+    e.kind === "agent" && e.author === "claude" && e.text === "PARTIALROOT");
+  const partialCatchUpRunning = await waitRoom("lurk-catchup-partial-cursor", (x) =>
+    x.room.busyInfo.some((run) => run.agent === "codex" && run.phase === "catching-up"),
+  "the partial range catch-up to run", 15000);
+  const partialCursor = partialCatchUpRunning.room.agents.codex.cursor;
+  d = await idle("lurk-catchup-partial-cursor", 30000);
+  const partialReceipt = d.receipts.find((r) =>
+    r.agent === "codex" && r.mode === "lurk-catchup" && r.upTo >= partialReply.n);
+  ok("a cursor past the eligible root but before its reply still runs the owed catch-up",
+    !!partialRoot && !!partialReply && partialCursor >= partialRoot.n &&
+    partialCursor < partialReply.n && !!partialReceipt && partialReceipt.spoke === false &&
+    d.room.agents.codex.cursor >= partialReply.n && d.room.agents.codex.catchUp === null,
+    JSON.stringify({ root: partialRoot, reply: partialReply, partialCursor,
+      receipt: partialReceipt, agent: d.room.agents.codex }));
+
+  // A catch-up sees the full current delta but may react only to roots that
+  // actually selected it for lurk. Use a tiny Codex fixture to capture the
+  // prompt and speak a deterministic chime: the later Solo root must be
+  // labelled context-only, must not steal reply provenance, and its tag must
+  // not turn the structurally bounded return into a third leg.
+  const writeCatchUpSpeaker = (stem, marker, reply) => {
+    const cli = path.join(ROOT, `${stem}.mjs`);
+    fs.writeFileSync(cli, [
+      "#!/usr/bin/env node",
+      "import fs from 'node:fs';",
+      "import crypto from 'node:crypto';",
+      `const marker = ${JSON.stringify(marker)};`,
+      `const reply = ${JSON.stringify(reply)};`,
+      "let raw = '';",
+      "process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data', (chunk) => { raw += chunk; });",
+      "process.stdin.on('end', () => {",
+      "  fs.writeFileSync(marker, raw, 'utf8');",
+      "  const out = (value) => process.stdout.write(JSON.stringify(value) + '\\n');",
+      "  out({ type: 'thread.started', thread_id: 'fake-catchup-' + crypto.randomUUID() });",
+      "  out({ type: 'turn.started' });",
+      "  out({ type: 'item.completed', item: { id: 'i1', type: 'agent_message', text: reply } });",
+      "  out({ type: 'turn.completed', usage: { input_tokens: 3, output_tokens: 2 } });",
+      "});",
+      "",
+    ].join("\n"));
+    return cli;
+  };
+
+  await api("POST", "/api/rooms", { name: "lurk-catchup-scope" });
+  await useFakes("lurk-catchup-scope");
+  await cfg("lurk-catchup-scope", {
+    hopBudget: 0,
+    agents: { claude: { lurk: false }, codex: { lurk: true } },
+  });
+  const catchUpScopeMarker = path.join(ROOT, "catchup-scope-prompt.txt");
+  const catchUpScopeCli = writeCatchUpSpeaker(
+    "catchup-scope-speaker", catchUpScopeMarker, "@claude PINGPONG",
+  );
+  await say("lurk-catchup-scope", "@codex SLEEP:2600 SAY:SCOPEBUSY");
+  await waitRoom("lurk-catchup-scope", (x) => x.room.busy.includes("codex"),
+    "scope blocker to occupy codex");
+  await say("lurk-catchup-scope", "@claude SLEEP:900 SAY:ELIGIBLE_A_REPLY");
+  await waitRoom("lurk-catchup-scope", (x) => x.room.busy.includes("claude"),
+    "eligible A to occupy claude");
+  const queuedContextB = await say("lurk-catchup-scope", "@claude PINGPONG", "auto", { solo: true });
+  await waitRoom("lurk-catchup-scope", (x) => !!x.room.agents.codex.catchUp &&
+    x.entries.some((e) => e.kind === "agent" && e.author === "claude" &&
+      e.text === "ELIGIBLE_A_REPLY"), "eligible A reply to arm catch-up", 10000);
+  await cfg("lurk-catchup-scope", { agents: { codex: { command: catchUpScopeCli } } });
+  d = await idle("lurk-catchup-scope", 40000);
+  const eligibleA = d.entries.find((e) => e.kind === "user" && e.text.includes("ELIGIBLE_A_REPLY"));
+  const contextB = d.entries.find((e) => e.kind === "user" && e.text === "PINGPONG" &&
+    e.meta && e.meta.relay && e.meta.relay.solo === true);
+  const scopeChime = d.entries.find((e) => e.kind === "agent" && e.author === "codex" &&
+    e.meta && e.meta.lurk && e.text === "@claude PINGPONG");
+  const scopeReturn = d.entries.find((e) => e.kind === "agent" && e.author === "claude" &&
+    e.meta && e.meta.catchUpReturn);
+  const capturedScopePrompt = fs.existsSync(catchUpScopeMarker)
+    ? fs.readFileSync(catchUpScopeMarker, "utf8") : "";
+  const scopeCatchUpReceipts = d.receipts.filter((r) =>
+    r.agent === "codex" && r.mode === "lurk-catchup");
+  ok("catch-up distinguishes eligible roots from later Solo context and keeps eligible provenance",
+    queuedContextB.status === 200 && Array.isArray(queuedContextB.data.deferred) &&
+    queuedContextB.data.deferred.includes("claude") && !!eligibleA && !!contextB && !!scopeChime &&
+    scopeChime.meta.replyRoot === eligibleA.n && scopeChime.meta.replyTo !== contextB.n &&
+    capturedScopePrompt.includes(`catch-up eligible root #${eligibleA.n}: SLEEP:900 SAY:ELIGIBLE_A_REPLY`) &&
+    capturedScopePrompt.includes(`claude · catch-up eligible root #${eligibleA.n}: ELIGIBLE_A_REPLY`) &&
+    capturedScopePrompt.includes(`context-only root #${contextB.n}: PINGPONG`) &&
+    capturedScopePrompt.includes(`claude · context-only root #${contextB.n}: @codex PINGPONG`) &&
+    d.room.agents.codex.cursor >= contextB.n &&
+    scopeCatchUpReceipts.length === 1 && scopeCatchUpReceipts[0].upTo >= contextB.n,
+    JSON.stringify({ eligibleA, contextB, chime: scopeChime, cursor: d.room.agents.codex.cursor,
+      receipts: scopeCatchUpReceipts, prompt: capturedScopePrompt.slice(-1200) }));
+  ok("a spoken catch-up earns exactly one return at hopBudget zero and that return cannot start a third leg",
+    !!scopeChime && !!scopeReturn && scopeReturn.meta.replyTo === scopeChime.n &&
+    scopeReturn.text === "@codex PINGPONG" &&
+    d.entries.filter((e) => e.kind === "agent" && e.meta && e.meta.catchUpReturn).length === 1 &&
+    !d.entries.some((e) => e.kind === "agent" && e.author === "codex" && e.n > scopeReturn.n),
+    JSON.stringify(d.entries.filter((e) => e.n >= (eligibleA && eligibleA.n))));
+
+  // The return leg is an observation, even in a Work room. Capture its argv to
+  // pin the read-only boundary rather than trusting only the provenance flag.
+  await api("POST", "/api/rooms", { name: "lurk-catchup-return-scope" });
+  await useFakes("lurk-catchup-return-scope");
+  await cfg("lurk-catchup-return-scope", {
+    mode: "work", hopBudget: 0,
+    agents: {
+      claude: { lurk: false, permissionMode: "bypassPermissions" },
+      codex: { lurk: true },
+    },
+  });
+  const returnScopeMarker = path.join(ROOT, "catchup-return-scope-prompt.txt");
+  const returnScopeCli = writeCatchUpSpeaker(
+    "catchup-return-scope-speaker", returnScopeMarker, "@claude ARGJSON",
+  );
+  await say("lurk-catchup-return-scope", "@codex SLEEP:2200 SAY:RETURNSCOPEBUSY");
+  await waitRoom("lurk-catchup-return-scope", (x) => x.room.busy.includes("codex"),
+    "return-scope blocker to occupy codex");
+  await say("lurk-catchup-return-scope", "@claude RETURN_SCOPE_ROOT");
+  await waitRoom("lurk-catchup-return-scope", (x) => !!x.room.agents.codex.catchUp,
+    "return-scope catch-up to arm", 10000);
+  await cfg("lurk-catchup-return-scope", { agents: { codex: { command: returnScopeCli } } });
+  d = await idle("lurk-catchup-return-scope", 40000);
+  const readOnlyReturn = d.entries.find((e) => e.kind === "agent" && e.author === "claude" &&
+    e.meta && e.meta.catchUpReturn);
+  const readOnlyReturnArgv = argvFrom(readOnlyReturn);
+  ok("the catch-up right-of-reply is forced read-only in a Work room",
+    !!readOnlyReturn && readOnlyReturnArgv &&
+    hasArg(readOnlyReturnArgv, "--permission-mode", "plan") &&
+    !hasArg(readOnlyReturnArgv, "--permission-mode", "bypassPermissions"),
+    JSON.stringify({ entry: readOnlyReturn, argv: readOnlyReturnArgv }));
+
+  // Attachment selection follows actionability, not simple recency. A later
+  // Solo message remains useful context, but its eight attachments cannot
+  // crowd the eligible lurk root's attachment out of the provider input.
+  await api("POST", "/api/rooms", { name: "lurk-catchup-attachment-root" });
+  await useFakes("lurk-catchup-attachment-root");
+  await cfg("lurk-catchup-attachment-root", {
+    hopBudget: 0,
+    agents: { claude: { lurk: false }, codex: { lurk: true } },
+  });
+  const attachmentCatchUpMarker = path.join(ROOT, "catchup-attachment-prompt.txt");
+  const attachmentCatchUpCli = writeCatchUpSpeaker(
+    "catchup-attachment-speaker", attachmentCatchUpMarker, "[pass]",
+  );
+  const eligibleAttachmentBody = Buffer.from("ELIGIBLE_ATTACHMENT_BODY\n", "utf8").toString("base64");
+  const contextPressureFiles = Array.from({ length: 8 }, (_, index) => ({
+    name: `context-${index + 1}.txt`, mime: "text/plain",
+    data: Buffer.from(`CONTEXT_ATTACHMENT_${index + 1}\n`, "utf8").toString("base64"),
+  }));
+  await say("lurk-catchup-attachment-root", "@codex SLEEP:2400 SAY:ATTACHBUSY");
+  await waitRoom("lurk-catchup-attachment-root", (x) => x.room.busy.includes("codex"),
+    "attachment blocker to occupy codex");
+  const eligibleAttachmentAccepted = await api("POST", "/api/message", {
+    room: "lurk-catchup-attachment-root", text: "@claude ATTACH_ROOT", target: "auto",
+    files: [{ name: "eligible.txt", mime: "text/plain", data: eligibleAttachmentBody }],
+  });
+  await waitRoom("lurk-catchup-attachment-root", (x) => !!x.room.agents.codex.catchUp,
+    "attachment root to arm catch-up", 10000);
+  await cfg("lurk-catchup-attachment-root", {
+    agents: { codex: { command: attachmentCatchUpCli } },
+  });
+  const contextAttachmentAccepted = await api("POST", "/api/message", {
+    room: "lurk-catchup-attachment-root", text: "@claude CONTEXT_ATTACHMENT_PRESSURE", target: "auto",
+    solo: true, files: contextPressureFiles,
+  });
+  d = await idle("lurk-catchup-attachment-root", 40000);
+  const attachmentCatchUpPrompt = fs.existsSync(attachmentCatchUpMarker)
+    ? fs.readFileSync(attachmentCatchUpMarker, "utf8") : "";
+  const attachmentCatchUpReceipt = d.receipts.find((r) =>
+    r.agent === "codex" && r.mode === "lurk-catchup");
+  ok("eligible-root attachments outrank later Solo context under catch-up input pressure",
+    eligibleAttachmentAccepted.status === 200 && contextAttachmentAccepted.status === 200 &&
+    !!attachmentCatchUpReceipt && attachmentCatchUpReceipt.spoke === false &&
+    attachmentCatchUpPrompt.includes('[Attached file: "eligible.txt"') &&
+    attachmentCatchUpPrompt.includes("ELIGIBLE_ATTACHMENT_BODY") &&
+    !attachmentCatchUpPrompt.includes('"eligible.txt" was not staged') &&
+    attachmentCatchUpPrompt.includes('"context-8.txt" was not staged'),
+    JSON.stringify({ eligible: eligibleAttachmentAccepted.data,
+      context: contextAttachmentAccepted.data, receipt: attachmentCatchUpReceipt,
+      prompt: attachmentCatchUpPrompt.slice(-2000) }));
+
+  const armCatchUp = async (name, token) => {
+    await api("POST", "/api/rooms", { name });
+    await useFakes(name);
+    await cfg(name, {
+      hopBudget: 0,
+      agents: { claude: { lurk: false }, codex: { lurk: true } },
+    });
+    await say(name, `@codex SLEEP:2600 SAY:${token}BUSY`);
+    await waitRoom(name, (x) => x.room.busy.includes("codex"), `${name} blocker to start`);
+    await say(name, `@claude SAY:${token}MISSED`);
+    return waitRoom(name, (x) => !!(x.room.agents.codex && x.room.agents.codex.catchUp),
+      `${name} catch-up to queue`, 10000);
+  };
+
+  await armCatchUp("lurk-catchup-sleep", "SLEEPCASE");
+  await api("POST", "/api/seat/sleep", {
+    room: "lurk-catchup-sleep", agent: "codex", asleep: true, reason: "quota",
+  });
+  let cancelledCatchUp = await room("lurk-catchup-sleep");
+  ok("sleep cancels a queued lurk catch-up with durable provenance",
+    cancelledCatchUp.room.agents.codex.catchUp === null &&
+    cancelledCatchUp.room.lurkOutcomes.some((o) => o.agent === "codex" && o.reason === "asleep"),
+    JSON.stringify(cancelledCatchUp.room.lurkOutcomes));
+
+  await armCatchUp("lurk-catchup-disabled", "DISABLECASE");
+  await cfg("lurk-catchup-disabled", { agents: { codex: { lurk: false } } });
+  cancelledCatchUp = await room("lurk-catchup-disabled");
+  ok("turning lurk off cancels its queued catch-up",
+    cancelledCatchUp.room.agents.codex.catchUp === null &&
+    cancelledCatchUp.room.lurkOutcomes.some((o) => o.agent === "codex" && o.reason === "disabled"),
+    JSON.stringify(cancelledCatchUp.room.lurkOutcomes));
+
+  await armCatchUp("lurk-catchup-stop", "STOPCASE");
+  await api("POST", "/api/stop", { room: "lurk-catchup-stop", scope: "all" });
+  cancelledCatchUp = await waitRoom("lurk-catchup-stop", (x) =>
+    x.room.agents.codex.catchUp === null && x.room.busy.length === 0,
+  "Stop all to cancel the catch-up and running blocker", 10000);
+  ok("Stop all cancels a queued catch-up instead of reviving it after the seat frees",
+    cancelledCatchUp.room.lurkOutcomes.some((o) => o.agent === "codex" && o.reason === "cancelled") &&
+    !cancelledCatchUp.receipts.some((r) => r.mode === "lurk-catchup"),
+    JSON.stringify({ outcomes: cancelledCatchUp.room.lurkOutcomes, receipts: cancelledCatchUp.receipts }));
+
+  // Catch-up is one attempt, not an autonomous retry loop. A provider failure
+  // leaves the cursor untouched and writes one terminal outcome; later normal
+  // traffic may heal the delta, but the failed obligation does not revive.
+  const slowCatchUpFailureCli = path.join(ROOT, "slow-catchup-failure.mjs");
+  fs.writeFileSync(slowCatchUpFailureCli, [
+    "#!/usr/bin/env node",
+    "process.stdin.resume();",
+    "process.stdin.on('end', () => setTimeout(() => {",
+    "  process.stderr.write('fake catch-up provider failure\\n');",
+    "  process.exit(2);",
+    "}, 900));",
+    "",
+  ].join("\n"));
+  await api("POST", "/api/rooms", { name: "lurk-catchup-fail" });
+  await useFakes("lurk-catchup-fail");
+  await cfg("lurk-catchup-fail", {
+    hopBudget: 0,
+    agents: { claude: { lurk: false }, codex: { lurk: true } },
+  });
+  await say("lurk-catchup-fail", "@codex SLEEP:1800 SAY:FAILBUSY");
+  await waitRoom("lurk-catchup-fail", (x) => x.room.busy.includes("codex"), "failure blocker to start");
+  await say("lurk-catchup-fail", "@claude SAY:FAILRANGE");
+  await waitRoom("lurk-catchup-fail", (x) => !!x.room.agents.codex.catchUp,
+    "failed exchange to owe a lurk catch-up", 10000);
+  await cfg("lurk-catchup-fail", { agents: { codex: { command: slowCatchUpFailureCli } } });
+  d = await idle("lurk-catchup-fail", 40000);
+  const failedCatchUpOutcomes = d.room.lurkOutcomes.filter((o) =>
+    o.agent === "codex" && o.reason === "failed");
+  const failedCatchUpCursor = d.room.agents.codex.cursor;
+  await sleep(700);
+  const failedCatchUpLater = await room("lurk-catchup-fail");
+  ok("a failed catch-up records one terminal outcome and never retries itself",
+    failedCatchUpOutcomes.length === 1 && d.room.agents.codex.catchUp === null &&
+    !d.receipts.some((r) => r.agent === "codex" && r.mode === "lurk-catchup") &&
+    failedCatchUpLater.room.lurkOutcomes.filter((o) => o.agent === "codex" && o.reason === "failed").length === 1 &&
+    failedCatchUpLater.room.agents.codex.cursor === failedCatchUpCursor,
+    JSON.stringify({ first: d.room, later: failedCatchUpLater.room }));
+
+  await api("POST", "/api/rooms", { name: "lurk-catchup-fail-then-sleep" });
+  await useFakes("lurk-catchup-fail-then-sleep");
+  await cfg("lurk-catchup-fail-then-sleep", {
+    hopBudget: 0,
+    agents: { claude: { lurk: false }, codex: { lurk: true } },
+  });
+  await say("lurk-catchup-fail-then-sleep", "@codex SLEEP:1600 SAY:FAILSLEEPBUSY");
+  await waitRoom("lurk-catchup-fail-then-sleep", (x) => x.room.busy.includes("codex"),
+    "failure/sleep blocker to start");
+  await say("lurk-catchup-fail-then-sleep", "@claude SAY:FAILSLEEPRANGE");
+  await waitRoom("lurk-catchup-fail-then-sleep", (x) => !!x.room.agents.codex.catchUp,
+    "failure/sleep catch-up to arm", 10000);
+  await cfg("lurk-catchup-fail-then-sleep", {
+    agents: { codex: { command: slowCatchUpFailureCli } },
+  });
+  await waitRoom("lurk-catchup-fail-then-sleep", (x) =>
+    x.room.busyInfo.some((run) => run.agent === "codex" && run.phase === "catching-up"),
+  "failure/sleep catch-up attempt to run", 15000);
+  await api("POST", "/api/seat/sleep", {
+    room: "lurk-catchup-fail-then-sleep", agent: "codex", asleep: true, reason: "quota",
+  });
+  d = await idle("lurk-catchup-fail-then-sleep", 30000);
+  const failureThenSleepOutcomes = d.room.lurkOutcomes.filter((o) => o.agent === "codex");
+  ok("a running catch-up records its adapter failure rather than a later ambient sleep state",
+    d.room.agents.codex.asleep && failureThenSleepOutcomes.length === 1 &&
+    failureThenSleepOutcomes[0].reason === "failed" && d.room.agents.codex.catchUp === null,
+    JSON.stringify({ agent: d.room.agents.codex, outcomes: failureThenSleepOutcomes }));
+
+  // If another exchange is missed while the catch-up adapter is already
+  // running, failure may terminate only the range it attempted. The extended
+  // tail remains an obligation and earns one later catch-up.
+  await api("POST", "/api/rooms", { name: "lurk-catchup-tail" });
+  await useFakes("lurk-catchup-tail");
+  await cfg("lurk-catchup-tail", {
+    hopBudget: 0,
+    agents: { claude: { lurk: false }, codex: { lurk: true } },
+  });
+  await say("lurk-catchup-tail", "@codex SLEEP:2200 SAY:TAILBUSY");
+  await waitRoom("lurk-catchup-tail", (x) => x.room.busy.includes("codex"), "tail blocker to start");
+  await say("lurk-catchup-tail", "@claude SAY:OLDTAIL");
+  await waitRoom("lurk-catchup-tail", (x) => !!x.room.agents.codex.catchUp,
+    "the first tail obligation", 10000);
+  await cfg("lurk-catchup-tail", { agents: { codex: { command: slowCatchUpFailureCli } } });
+  const runningCatchUp = await waitRoom("lurk-catchup-tail", (x) =>
+    x.room.busyInfo.some((run) => run.agent === "codex" && run.phase === "catching-up"),
+  "the first catch-up attempt to run", 15000);
+  const attemptedTail = { ...runningCatchUp.room.agents.codex.catchUp };
+  await say("lurk-catchup-tail", "@claude SAY:NEWTAIL");
+  const extendedTail = await waitRoom("lurk-catchup-tail", (x) => {
+    const pending = x.room.agents.codex.catchUp;
+    return pending && pending.revision > attemptedTail.revision && pending.throughN > attemptedTail.throughN;
+  }, "a newer miss to extend the running attempt", 10000);
+  const extendedTailN = extendedTail.entries.find((e) =>
+    e.kind === "user" && e.text === "SAY:NEWTAIL").n;
+  // The in-flight attempt keeps its process; only the retained tail should use
+  // the repaired command after that first attempt records its failure.
+  const retainedTailMarker = path.join(ROOT, "catchup-retained-tail-prompt.txt");
+  const retainedTailCli = writeCatchUpSpeaker(
+    "catchup-retained-tail-speaker", retainedTailMarker, "[pass]",
+  );
+  await cfg("lurk-catchup-tail", { agents: { codex: { command: retainedTailCli } } });
+  d = await idle("lurk-catchup-tail", 40000);
+  const tailFailure = d.room.lurkOutcomes.find((o) => o.agent === "codex" && o.reason === "failed");
+  const tailReceipt = d.receipts.find((r) => r.agent === "codex" && r.mode === "lurk-catchup");
+  const retainedTailPrompt = fs.existsSync(retainedTailMarker)
+    ? fs.readFileSync(retainedTailMarker, "utf8") : "";
+  // A fresh native session may carry older transcript in its recovery briefing;
+  // inspect the live catch-up prompt after that envelope. The failed range may
+  // remain as context, but it must not be actionable again.
+  const codexPromptSeparator = "\n\n---\n\n";
+  const retainedTailTurnPrompt = retainedTailPrompt.includes(codexPromptSeparator)
+    ? retainedTailPrompt.split(codexPromptSeparator).at(-1) : retainedTailPrompt;
+  ok("an in-flight extension survives the attempted range failing",
+    !!tailFailure && tailFailure.throughN <= attemptedTail.throughN &&
+    !!tailReceipt && tailReceipt.upTo >= extendedTailN &&
+    d.room.agents.codex.cursor >= extendedTailN && d.room.agents.codex.catchUp === null &&
+    /catch-up eligible root #\d+: SAY:NEWTAIL/.test(retainedTailTurnPrompt) &&
+    /context-only root #\d+: SAY:OLDTAIL/.test(retainedTailTurnPrompt) &&
+    !/catch-up eligible root #\d+: SAY:OLDTAIL/.test(retainedTailTurnPrompt),
+    JSON.stringify({ attemptedTail, failure: tailFailure, receipt: tailReceipt,
+      agent: d.room.agents.codex, prompt: retainedTailTurnPrompt.slice(-1200) }));
+
+  // Persisted obligations are dormant on process start: merely listing rooms
+  // must not spend a local/provider call in every room on disk. Opening that
+  // specific room is the deliberate activation edge that resumes it.
+  const restartFixture = fs.mkdtempSync(path.join(os.tmpdir(), "parley-catchup-restart-"));
+  const restartRoomName = "persisted-catchup";
+  const restartRoomDir = path.join(restartFixture, restartRoomName);
+  fs.mkdirSync(path.join(restartRoomDir, "workspace"), { recursive: true });
+  fs.writeFileSync(path.join(restartRoomDir, "room.json"), JSON.stringify({
+    defaultAgent: "claude", mode: "talk", hopBudget: 0, pairRounds: 0,
+    projectDir: null, roomNote: null, timeoutMs: 900000,
+    agents: {
+      claude: { command: FAKE, lurk: false },
+      codex: { command: FAKE, lurk: true },
+    },
+  }, null, 2));
+  fs.writeFileSync(path.join(restartRoomDir, "events.jsonl"), [
+    {
+      n: 1, kind: "user", author: "user", target: "claude", text: "SAY:PERSISTEDMISS",
+      ts: new Date().toISOString(),
+      meta: { audience: { addressed: ["claude"], lurking: ["codex"] },
+        relay: { hopBudget: 0, source: "room", solo: false } },
+    },
+    {
+      n: 2, kind: "agent", author: "claude", text: "PERSISTEDMISS",
+      ts: new Date().toISOString(), meta: { replyTo: 1 },
+    },
+  ].map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+  fs.writeFileSync(path.join(restartRoomDir, "state.json"), JSON.stringify({
+    agents: {
+      claude: { sessionRef: null, cursor: 1 },
+      codex: {
+        sessionRef: null, cursor: 0,
+        pendingCatchUp: { sinceN: 1, throughN: 2, triggerN: 1, revision: 1,
+          at: new Date().toISOString() },
+      },
+    },
+    lastAddressed: "claude",
+  }, null, 2));
+  let restartServer = null;
+  let resumedServer = null;
+  try {
+    restartServer = await bootAuxServer(SERVER, restartFixture, { FAKE_DELAY_MS: "50" });
+    await sleep(350);
+    const dormantBeforeRestart = JSON.parse(
+      fs.readFileSync(path.join(restartRoomDir, "state.json"), "utf8"),
+    ).agents.codex.pendingCatchUp;
+    await restartServer.stop();
+    restartServer = null;
+
+    resumedServer = await bootAuxServer(SERVER, restartFixture, { FAKE_DELAY_MS: "50" });
+    await sleep(350);
+    await resumedServer.request("GET", "/api/rooms");
+    await sleep(350);
+    const dormantAfterRestart = JSON.parse(
+      fs.readFileSync(path.join(restartRoomDir, "state.json"), "utf8"),
+    ).agents.codex.pendingCatchUp;
+    const preActivationEvents = fs.readFileSync(path.join(restartRoomDir, "events.jsonl"), "utf8");
+    ok("a persisted catch-up survives restart and stays dormant while rooms are only listed",
+      dormantBeforeRestart && dormantAfterRestart &&
+      dormantAfterRestart.throughN === 2 && !preActivationEvents.includes('"mode":"lurk-catchup"'),
+      JSON.stringify({ before: dormantBeforeRestart, after: dormantAfterRestart }));
+
+    const resumedCatchUp = await waitAuxRoom(resumedServer, restartRoomName, (x) =>
+      x && x.room && x.room.agents.codex.catchUp === null &&
+      x.receipts.some((r) => r.agent === "codex" && r.mode === "lurk-catchup"), 10000);
+    ok("opening the room deliberately resumes and clears its persisted catch-up",
+      !!resumedCatchUp && resumedCatchUp.room.agents.codex.cursor >= 2 &&
+      resumedCatchUp.receipts.filter((r) => r.agent === "codex" && r.mode === "lurk-catchup").length === 1,
+      JSON.stringify(resumedCatchUp && {
+        agent: resumedCatchUp.room.agents.codex, receipts: resumedCatchUp.receipts,
+      }));
+  } finally {
+    if (restartServer) await restartServer.stop();
+    if (resumedServer) await resumedServer.stop();
+    try { fs.rmSync(restartFixture, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
 
   // @both used to queue whole whenever either seat was busy, so one slow agent
   // silenced the other. Delivery is now per seat: the free one answers now.
@@ -3679,6 +4570,423 @@ async function main() {
     await sleep(1300);
     ok("Stop kills the CLI's descendant process too", !fs.existsSync(childSurvived), childSurvived);
   }
+
+  // A rate-limited seat could still be invoked from five different places, and
+  // an explicit @tag was the worst of them: findHopTarget returns it with no
+  // lurk check, so turning lurk off never protected the seat. Sleep is one
+  // authoritative gate at the launch functions, plus filters at the edges.
+  console.log("\nseat sleep & wake");
+  await api("POST", "/api/rooms", { name: "sleepseat" });
+  await useFakes("sleepseat");
+  const slept = await api("POST", "/api/seat/sleep",
+    { room: "sleepseat", agent: "codex", reason: "usage limit" });
+  ok("sleeping a seat reports the state and keeps the reason",
+    slept.status === 200 && slept.data.asleep === true &&
+    slept.data.room.agents.codex.asleep === true &&
+    slept.data.room.agents.codex.sleep.reason === "usage limit" &&
+    slept.data.room.agents.claude.asleep === false,
+    JSON.stringify(slept.data.room && slept.data.room.agents));
+  d = await room("sleepseat");
+  const sleepEntry = d.entries.find((e) => e.meta && e.meta.sleep && e.meta.sleep.event === "asleep");
+  ok("sleep is persisted as an entry, not only broadcast",
+    !!sleepEntry && sleepEntry.kind === "system" && /codex is asleep — usage limit/.test(sleepEntry.text),
+    sleepEntry && sleepEntry.text);
+  ok("sleep is a condition in room state, so it survives a restart",
+    !!JSON.parse(fs.readFileSync(path.join(ROOT, "sleepseat", "state.json"), "utf8")).agents.codex.asleep &&
+    !("asleep" in JSON.parse(fs.readFileSync(path.join(ROOT, "sleepseat", "room.json"), "utf8")).agents.codex));
+
+  // Held, not refused: the message lands in the thread where it was sent and
+  // waits, so the user never has to re-send it and the seat answers it in one
+  // turn on wake.
+  const heldMark = (await room("sleepseat")).entries.length;
+  const heldSend = await say("sleepseat", "@codex SAY:NOPE");
+  ok("addressing a sleeping seat is accepted, not refused",
+    heldSend.status === 200, JSON.stringify(heldSend.data));
+  d = await idle("sleepseat");
+  let heldSlice = d.entries.slice(heldMark);
+  const heldUser = heldSlice.find((e) => e.kind === "user");
+  ok("the held message is a real entry at the moment it was sent",
+    !!heldUser && heldUser.target === "codex" && heldUser.text.includes("SAY:NOPE"),
+    JSON.stringify(heldUser && { target: heldUser.target, text: heldUser.text }));
+  ok("the entry records that it is being held for the sleeping seat",
+    !!heldUser && (heldUser.meta.audience.asleep || []).join() === "codex" &&
+    (heldUser.meta.audience.addressed || []).length === 0,
+    JSON.stringify(heldUser && heldUser.meta.audience));
+  ok("holding is durable and reads as waiting, not as dropped",
+    heldSlice.some((e) => e.meta && e.meta.sleep && e.meta.sleep.event === "held" &&
+      e.meta.sleep.sourceN === heldUser.n && /held until wake/.test(e.text)),
+    JSON.stringify(heldSlice.filter((e) => e.meta && e.meta.sleep).map((e) => e.meta.sleep)));
+  ok("a held message launches nobody at all",
+    !heldSlice.some((e) => e.kind === "agent"),
+    JSON.stringify(heldSlice.map((e) => `${e.kind}:${e.author}`)));
+  ok("the room reports the held count as a subset of pending",
+    d.room.agents.codex.held === 1 && d.room.agents.codex.pending >= 1 &&
+    d.room.agents.claude.held === 0,
+    JSON.stringify({ codex: d.room.agents.codex.held, pending: d.room.agents.codex.pending }));
+
+  // The bug this guards: `listeners` selects every seat not in `agents`, so an
+  // empty `agents` made the *other* seat a lurker — the message the user aimed
+  // at a sleeping seat would have invoked the one they did not write to.
+  await cfg("sleepseat", { agents: { claude: { lurk: true } } });
+  const beforeLurkHeld = await room("sleepseat");
+  const lurkHeldMark = beforeLurkHeld.entries.length;
+  const claudeCursorBefore = beforeLurkHeld.room.agents.claude.cursor;
+  await say("sleepseat", "@codex SAY:LURKBAIT");
+  d = await idle("sleepseat");
+  const lurkHeldSlice = d.entries.slice(lurkHeldMark);
+  ok("a message held for a sleeping seat never invokes the awake lurker",
+    !lurkHeldSlice.some((e) => e.kind === "agent"),
+    JSON.stringify(lurkHeldSlice.map((e) => `${e.kind}:${e.author}`)));
+  // The cost of this bug is the launch itself, not the reply: a lurker that
+  // runs and passes leaves no entry but still spends a turn. Its cursor moves
+  // whenever its CLI actually ran, so that is what proves nothing started.
+  ok("…and no CLI is spent on it either — the awake seat's cursor never moves",
+    d.room.agents.claude.cursor === claudeCursorBefore,
+    JSON.stringify({ before: claudeCursorBefore, after: d.room.agents.claude.cursor }));
+  ok("…and records no listener for it",
+    (lurkHeldSlice.find((e) => e.kind === "user").meta.audience.lurking || []).length === 0,
+    JSON.stringify(lurkHeldSlice.find((e) => e.kind === "user").meta.audience));
+  ok("exactly one sleep notice is written for a held message",
+    lurkHeldSlice.filter((e) => e.meta && e.meta.sleep).length === 1,
+    JSON.stringify(lurkHeldSlice.filter((e) => e.meta && e.meta.sleep).map((e) => e.meta.sleep)));
+  await cfg("sleepseat", { agents: { claude: { lurk: false } } });
+
+  let sleepMark = (await room("sleepseat")).entries.length;
+  await say("sleepseat", "@both SAY:HALF");
+  d = await idle("sleepseat");
+  let sleepSlice = d.entries.slice(sleepMark);
+  const bothUser = sleepSlice.find((e) => e.kind === "user");
+  ok("@both still reaches the awake seat",
+    sleepSlice.some((e) => e.author === "claude" && e.kind === "agent" && e.text.includes("HALF")));
+  ok("…and never launches the sleeping one",
+    !sleepSlice.some((e) => e.author === "codex" && e.kind === "agent"));
+  ok("the entry records which seat was asleep for it",
+    !!bothUser && (bothUser.meta.audience.asleep || []).join() === "codex" &&
+    bothUser.meta.audience.addressed.join() === "claude",
+    JSON.stringify(bothUser && bothUser.meta.audience));
+  const bothSkip = sleepSlice.find((e) => e.meta && e.meta.sleep && e.meta.sleep.event === "held");
+  ok("the sleeping half of a @both is held as a durable entry, not just broadcast",
+    !!bothSkip && bothSkip.kind === "system" && bothSkip.meta.sleep.kind === "turn" &&
+    bothSkip.meta.sleep.sourceN === bothUser.n,
+    JSON.stringify(bothSkip && bothSkip.meta));
+
+  sleepMark = (await room("sleepseat")).entries.length;
+  await say("sleepseat", "@claude TAG:codex");
+  d = await idle("sleepseat");
+  sleepSlice = d.entries.slice(sleepMark);
+  ok("an explicit @tag cannot launch a sleeping seat, lurk or no lurk",
+    !sleepSlice.some((e) => e.author === "codex" && e.kind === "agent"));
+  ok("the refused call is recorded, so the silence is not read as agreement",
+    sleepSlice.some((e) => e.meta && e.meta.sleep && e.meta.sleep.kind === "hop" &&
+      /not agreement/.test(e.text)),
+    JSON.stringify(sleepSlice.map((e) => e.text)));
+
+  await cfg("sleepseat", { agents: { codex: { lurk: true } } });
+  sleepMark = (await room("sleepseat")).entries.length;
+  await say("sleepseat", "@claude SAY:CHIME");
+  d = await idle("sleepseat");
+  sleepSlice = d.entries.slice(sleepMark);
+  ok("a sleeping lurker does not chime in",
+    !sleepSlice.some((e) => e.author === "codex" && e.kind === "agent"));
+  ok("…and its skipped lurk is recorded too",
+    sleepSlice.some((e) => e.meta && e.meta.sleep && e.meta.sleep.kind === "lurk"));
+  await cfg("sleepseat", { agents: { codex: { lurk: false } } });
+
+  await say("sleepseat", "@claude SAWWHAT");
+  d = await idle("sleepseat");
+  const awakeSaw = JSON.parse(lastAgent(d, "claude").text.slice("SAWJSON ".length)).prompt;
+  ok("the awake seat is told the other one is asleep rather than merely silent",
+    /Parley system: .*codex is asleep/.test(awakeSaw), awakeSaw.slice(0, 700));
+
+  const beforeWake = await room("sleepseat");
+  const cursorAsleep = beforeWake.room.agents.codex.cursor;
+  ok("a sleeping seat reports the backlog its next turn will carry",
+    beforeWake.room.agents.codex.pending > 0 && beforeWake.room.agents.claude.pending === null,
+    JSON.stringify({ codex: beforeWake.room.agents.codex.pending, claude: beforeWake.room.agents.claude.pending }));
+  // Held is derived from the transcript and the seat's cursor, both already on
+  // disk — there is no separate inbox that could drift or need migrating.
+  const heldOnDisk = fs.readFileSync(path.join(ROOT, "sleepseat", "events.jsonl"), "utf8")
+    .split("\n").filter(Boolean).map((l) => JSON.parse(l))
+    .filter((e) => e.kind === "user" && e.meta && e.meta.audience &&
+      (e.meta.audience.asleep || []).includes("codex"));
+  ok("held survives a restart without any new persisted state",
+    heldOnDisk.length === beforeWake.room.agents.codex.held &&
+    heldOnDisk.every((e) => e.n > JSON.parse(
+      fs.readFileSync(path.join(ROOT, "sleepseat", "state.json"), "utf8")).agents.codex.cursor),
+    JSON.stringify({ onDisk: heldOnDisk.length, reported: beforeWake.room.agents.codex.held }));
+
+  const wakeOnlyMark = beforeWake.entries.length;
+  const woke = await api("POST", "/api/seat/sleep", { room: "sleepseat", agent: "codex", asleep: false });
+  ok("waking clears the state and reports what is pending",
+    woke.status === 200 && woke.data.asleep === false &&
+    woke.data.room.agents.codex.asleep === false && woke.data.pending > 0,
+    JSON.stringify(woke.data.room && woke.data.room.agents.codex));
+  d = await idle("sleepseat");
+  ok("waking does not replay and does not jump the cursor",
+    d.room.agents.codex.cursor === cursorAsleep &&
+    !d.room.queued && d.room.busy.length === 0,
+    JSON.stringify({ before: cursorAsleep, after: d.room.agents.codex.cursor }));
+  ok("wake is persisted symmetrically with sleep",
+    d.entries.some((e) => e.meta && e.meta.sleep && e.meta.sleep.event === "awake"));
+  // Wake only: the held messages become ordinary context rather than requests.
+  ok("Wake only launches nothing",
+    !d.entries.slice(wakeOnlyMark).some((e) => e.kind === "agent"),
+    JSON.stringify(d.entries.slice(wakeOnlyMark).map((e) => `${e.kind}:${e.author}`)));
+  ok("…and the held count stays visible on the awake seat until a turn moves the cursor",
+    d.room.agents.codex.held === beforeWake.room.agents.codex.held &&
+    d.room.agents.codex.held > 0 && d.room.agents.codex.asleep === false,
+    JSON.stringify({ held: d.room.agents.codex.held, was: beforeWake.room.agents.codex.held }));
+  ok("…and the wake entry does not claim the held messages were delivered",
+    /not delivered as requests|not delivered as a request/.test(
+      d.entries.slice(wakeOnlyMark).find((e) => e.meta && e.meta.sleep && e.meta.sleep.event === "awake").text),
+    d.entries.slice(wakeOnlyMark).find((e) => e.meta && e.meta.sleep && e.meta.sleep.event === "awake").text);
+
+  await say("sleepseat", "@codex SAWWHAT");
+  d = await idle("sleepseat");
+  const wokenSaw = JSON.parse(lastAgent(d, "codex").text.slice("SAWJSON ".length)).prompt;
+  ok("the woken seat's next turn carries what it missed, including having been called",
+    wokenSaw.includes("HALF") && /codex is asleep/.test(wokenSaw) &&
+    /claude's call to it was not delivered/.test(wokenSaw),
+    wokenSaw.slice(0, 900));
+  ok("…and the held messages ride along as context, phrased as waiting rather than dropped",
+    wokenSaw.includes("NOPE") && /held until wake/.test(wokenSaw), wokenSaw.slice(0, 1200));
+  ok("the held count clears itself once a turn advances the cursor",
+    d.room.agents.codex.held === 0, JSON.stringify(d.room.agents.codex));
+
+  // Wake & deliver: one run for everything held, rooted at the newest of them,
+  // with the older ones and the traffic between them still in their real
+  // positions so the seat can tell a stale request from a live one.
+  await api("POST", "/api/rooms", { name: "sleepdeliver" });
+  await useFakes("sleepdeliver");
+  await api("POST", "/api/seat/sleep", { room: "sleepdeliver", agent: "codex", reason: "usage limit" });
+  await say("sleepdeliver", "@codex FIRSTHELD");
+  await say("sleepdeliver", "@claude SAY:BETWEEN");
+  await idle("sleepdeliver");
+  await say("sleepdeliver", "@codex SAWWHAT SECONDHELD");
+  d = await idle("sleepdeliver");
+  ok("several messages can be held for one seat",
+    d.room.agents.codex.held === 2, JSON.stringify(d.room.agents.codex));
+  const deliverMark = (await room("sleepdeliver")).entries.length;
+  const delivered = await api("POST", "/api/seat/sleep",
+    { room: "sleepdeliver", agent: "codex", asleep: false, deliver: true });
+  ok("wake & deliver reports that it launched",
+    delivered.status === 200 && delivered.data.delivered === true && delivered.data.held === 2,
+    JSON.stringify(delivered.data));
+  d = await idle("sleepdeliver");
+  const deliverSlice = d.entries.slice(deliverMark);
+  ok("…as exactly one run, not one per held message",
+    deliverSlice.filter((e) => e.kind === "agent" && e.author === "codex").length === 1,
+    JSON.stringify(deliverSlice.map((e) => `${e.kind}:${e.author}`)));
+  const deliverSaw = JSON.parse(lastAgent(d, "codex").text.slice("SAWJSON ".length)).prompt;
+  ok("the run is rooted at the newest held message",
+    /\[Room activity since your last turn\][\s\S]*SECONDHELD\s*$/.test(deliverSaw.trim()) ||
+    deliverSaw.trim().endsWith("SECONDHELD"), deliverSaw.slice(-400));
+  ok("…with the earlier held message and the traffic after it in real order",
+    deliverSaw.indexOf("FIRSTHELD") < deliverSaw.indexOf("BETWEEN") &&
+    deliverSaw.indexOf("BETWEEN") < deliverSaw.lastIndexOf("SECONDHELD"),
+    JSON.stringify({ first: deliverSaw.indexOf("FIRSTHELD"), between: deliverSaw.indexOf("BETWEEN"),
+      second: deliverSaw.lastIndexOf("SECONDHELD") }));
+  ok("…and the seat is told they were held, so it can drop what went stale",
+    /2 messages were held for you while you slept/.test(deliverSaw) &&
+    /may have superseded/.test(deliverSaw), deliverSaw.slice(0, 600));
+  ok("delivering clears the held count and moves the cursor",
+    d.room.agents.codex.held === 0 && d.room.agents.codex.asleep === false,
+    JSON.stringify(d.room.agents.codex));
+
+  // Preflight before mutation: a sleeping seat can still be busy, and waking
+  // first would strand the held work with its sleep state already gone.
+  await api("POST", "/api/rooms", { name: "sleepdeliverbusy" });
+  await useFakes("sleepdeliverbusy");
+  await say("sleepdeliverbusy", "@codex SLEEP:2500 SAY:STILLGOING");
+  await sleep(300);
+  await api("POST", "/api/seat/sleep", { room: "sleepdeliverbusy", agent: "codex" });
+  await say("sleepdeliverbusy", "@codex WHILEBUSY");
+  const busyDeliver = await api("POST", "/api/seat/sleep",
+    { room: "sleepdeliverbusy", agent: "codex", asleep: false, deliver: true });
+  ok("wake & deliver refuses while the seat is still finishing a turn",
+    busyDeliver.status === 409 && /still finishing a turn/.test(busyDeliver.data.error || ""),
+    JSON.stringify(busyDeliver.data));
+  d = await room("sleepdeliverbusy");
+  ok("…and the refusal leaves the seat asleep with its held work intact",
+    d.room.agents.codex.asleep === true && d.room.agents.codex.held === 1,
+    JSON.stringify(d.room.agents.codex));
+  await idle("sleepdeliverbusy", 40000);
+
+  // A held @both whose awake half already answered. If the reconstructed
+  // lastUser kept `target: "both"` with an empty `done` map, this Retry would
+  // re-run claude's completed work as well.
+  // claude is the sleeper here on purpose: its half of the @both boundary is
+  // enforced in argv (--permission-mode plan), so losing it is visible. Codex's
+  // is instructional — a lost boundary there is only a missing prompt note.
+  await api("POST", "/api/rooms", { name: "sleepdeliverboth" });
+  await useFakes("sleepdeliverboth");
+  // Talk at acceptance, so the entry carries no durable `meta.discussion` and
+  // the boundary has to be *acquired* after the flip to Work — the one case
+  // where narrowing lastUser.target could lose it.
+  await cfg("sleepdeliverboth", {
+    mode: "talk", maxHops: 0,
+    agents: { claude: { lurk: false, permissionMode: "bypassPermissions" }, codex: { lurk: false } },
+  });
+  await api("POST", "/api/seat/sleep", { room: "sleepdeliverboth", agent: "claude" });
+  await say("sleepdeliverboth", "@both FAILONCESEAT:claude ARGJSON");
+  d = await idle("sleepdeliverboth", 40000);
+  ok("a @both is answered by the awake seat and held for the sleeping one",
+    d.entries.some((e) => e.kind === "agent" && e.author === "codex") &&
+    d.room.agents.claude.held === 1,
+    JSON.stringify({ held: d.room.agents.claude.held }));
+  ok("the held @both carried no boundary when it was accepted in a talk room",
+    !(d.entries.find((e) => e.kind === "user").meta || {}).discussion,
+    JSON.stringify(d.entries.find((e) => e.kind === "user").meta));
+  await cfg("sleepdeliverboth", { mode: "work" }); // …and now it must acquire one
+  const bothDeliverMark = (await room("sleepdeliverboth")).entries.length;
+  await api("POST", "/api/seat/sleep",
+    { room: "sleepdeliverboth", agent: "claude", asleep: false, deliver: true });
+  d = await idle("sleepdeliverboth", 40000);
+  ok("the held half's delivery failed, as the fake was told to",
+    !d.entries.slice(bothDeliverMark).some((e) => e.kind === "agent" && e.author === "claude"),
+    JSON.stringify(d.entries.slice(bothDeliverMark).map((e) => `${e.kind}:${e.author}`)));
+  ok("a failed delivery leaves the held count intact — nothing was consumed",
+    d.room.agents.claude.held === 1, JSON.stringify(d.room.agents.claude));
+  ok("…and offers Retry",
+    d.room.canRetry === true, JSON.stringify({ canRetry: d.room.canRetry }));
+  const bothRetryMark = d.entries.length;
+  await api("POST", "/api/retry", { room: "sleepdeliverboth" });
+  d = await idle("sleepdeliverboth", 40000);
+  const bothRetrySlice = d.entries.slice(bothRetryMark);
+  ok("Retry after a failed wake delivery invokes only the formerly sleeping seat",
+    bothRetrySlice.some((e) => e.kind === "agent" && e.author === "claude") &&
+    !bothRetrySlice.some((e) => e.kind === "agent" && e.author === "codex"),
+    JSON.stringify(bothRetrySlice.map((e) => `${e.kind}:${e.author}`)));
+  // Narrowing lastUser.target to one seat also takes away makeScope's ability
+  // to acquire the @both no-edit boundary, so it has to be latched at wake.
+  const bothRetryArgv = argvFrom(lastAgent(d, "claude"));
+  ok("…still under the @both no-edit boundary, which the narrowed target cannot re-derive",
+    hasArg(bothRetryArgv, "--permission-mode", "plan") &&
+    !hasArg(bothRetryArgv, "--permission-mode", "bypassPermissions"),
+    JSON.stringify(bothRetryArgv));
+
+  await api("POST", "/api/rooms", { name: "sleepqueue" });
+  await useFakes("sleepqueue");
+  await say("sleepqueue", "@codex SLEEP:2500 SAY:RUNNING");
+  const held = await say("sleepqueue", "@codex SAY:HELD");
+  ok("the second message is held for the busy lane", (held.data.deferred || []).join() === "codex",
+    JSON.stringify(held.data));
+  const sleptBusy = await api("POST", "/api/seat/sleep", { room: "sleepqueue", agent: "codex" });
+  ok("sleeping a seat cancels what its lane still owed, immediately",
+    sleptBusy.data.cancelled === 1, JSON.stringify(sleptBusy.data));
+  d = await waitRoom("sleepqueue", (x) => x.entries.some((e) => e.meta && e.meta.asleepSeat),
+    "the consolidated cancellation note");
+  ok("…in one consolidated note that says why",
+    d.entries.filter((e) => e.meta && e.meta.cancelledQueue).length === 1 &&
+    /codex was put to sleep with work still queued/.test(
+      d.entries.find((e) => e.meta && e.meta.cancelledQueue).text),
+    JSON.stringify(d.entries.filter((e) => e.meta && e.meta.cancelledQueue).map((e) => e.text)));
+  d = await idle("sleepqueue");
+  ok("sleep applies to future launches only — the running turn still finishes",
+    texts(d).includes("RUNNING") && !texts(d).includes("HELD"), JSON.stringify(texts(d)));
+
+  await api("POST", "/api/rooms", { name: "sleeppair" });
+  await useFakes("sleeppair");
+  await say("sleeppair", "/pair start @claude SAY:PAIRWORK");
+  await idle("sleeppair", 40000);
+  await api("POST", "/api/seat/sleep", { room: "sleeppair", agent: "codex" });
+  const pairRefused = await say("sleeppair", "SAY:MORE");
+  ok("a pair turn pauses rather than running with the sleeping role missing",
+    pairRefused.status === 409 && /pair mode needs both seats/.test(pairRefused.data.error || ""),
+    JSON.stringify(pairRefused.data));
+  const pairContinue = await api("POST", "/api/pair/continue", { room: "sleeppair" });
+  ok("Continue refuses for the same reason", pairContinue.status === 409 &&
+    /asleep/.test(pairContinue.data.error || ""), JSON.stringify(pairContinue.data));
+  ok("pair mode itself stays on — sleeping a seat is not /pair end",
+    (await room("sleeppair")).room.pair !== null);
+
+  // A *first* /pair start has no pairing in force yet, so the gate depends on
+  // `parsePlan` synthesizing one from the tagged worker. That is easy to read as
+  // "the existing pairing" and drop; if it ever were, a sleeping reviewer would
+  // arm the mode and run the worker on a task nobody could review — the half
+  // cycle pair mode exists to prevent. Uncovered until now, so pin it.
+  await api("POST", "/api/rooms", { name: "pairstartasleep" });
+  await useFakes("pairstartasleep");
+  await api("POST", "/api/seat/sleep",
+    { room: "pairstartasleep", agent: "codex", reason: "usage limit" });
+  const beforePairStart = (await room("pairstartasleep")).entries.length;
+  const startRefused = await say("pairstartasleep", "/pair start @claude SAY:NEVERPAIRED");
+  ok("a first /pair start refuses when the seat it would make reviewer is asleep",
+    startRefused.status === 409 &&
+    /codex \(usage limit\) is asleep/.test(startRefused.data.error || "") &&
+    /pair mode needs both seats/.test(startRefused.data.error || ""),
+    JSON.stringify(startRefused.data));
+  ok("…and does not offer /pair end for a mode it never armed",
+    !/\/pair end/.test(startRefused.data.error || "") &&
+    /tag the awake seat/.test(startRefused.data.error || ""),
+    JSON.stringify(startRefused.data));
+  d = await idle("pairstartasleep");
+  ok("pair mode is not armed by a refused start",
+    d.room.pair === null, JSON.stringify(d.room.pair));
+  ok("…no task entry is appended and the worker never launches",
+    d.entries.length === beforePairStart &&
+    !d.entries.some((e) => e.kind === "agent"),
+    JSON.stringify(d.entries.slice(beforePairStart).map((e) => `${e.kind}:${e.author}`)));
+  // The worker half of the same gate was always covered; keep it that way.
+  await api("POST", "/api/seat/sleep", { room: "pairstartasleep", agent: "codex", asleep: false });
+  await api("POST", "/api/seat/sleep", { room: "pairstartasleep", agent: "claude" });
+  const startWorkerAsleep = await say("pairstartasleep", "/pair start @claude SAY:STILLNEVER");
+  ok("…and the same refusal covers the tagged worker being the sleeping one",
+    startWorkerAsleep.status === 409 && /claude is asleep/.test(startWorkerAsleep.data.error || ""),
+    JSON.stringify(startWorkerAsleep.data));
+  ok("still not armed", (await room("pairstartasleep")).room.pair === null);
+
+  // Sleeping a seat mid-cycle: the step already running finishes, and the
+  // *next* one meets the gate. The reviewer's job never passes to the worker.
+  await api("POST", "/api/rooms", { name: "sleepmidpair" });
+  await useFakes("sleepmidpair");
+  await say("sleepmidpair", "/pair start @claude SLEEP:2500 SAY:MIDWORK");
+  await sleep(400);
+  await api("POST", "/api/seat/sleep", { room: "sleepmidpair", agent: "codex" });
+  d = await idle("sleepmidpair", 40000);
+  ok("a cycle already running finishes the step it is on",
+    texts(d).includes("MIDWORK"), JSON.stringify(texts(d)));
+  const midPause = d.entries.find((e) => e.meta && e.meta.pairPaused);
+  ok("…then pauses rather than approving work nobody reviewed",
+    !!midPause && /codex is asleep, so the review never ran/.test(midPause.text) &&
+    !!midPause.meta.pairIncomplete &&
+    !d.entries.some((e) => e.meta && e.meta.pairApproved),
+    midPause && midPause.text);
+  ok("the un-run review is recorded as a skip naming the step",
+    d.entries.some((e) => e.meta && e.meta.sleep && e.meta.sleep.kind === "review"),
+    JSON.stringify(d.entries.filter((e) => e.meta && e.meta.sleep).map((e) => e.meta.sleep)));
+
+  await api("POST", "/api/rooms", { name: "sleepauto" });
+  await useFakes("sleepauto");
+  await say("sleepauto", "@codex SAY:FIRST");
+  await idle("sleepauto");
+  await api("POST", "/api/seat/sleep", { room: "sleepauto", agent: "codex" });
+  const autoMark = (await room("sleepauto")).entries.length;
+  const autoHeld = await say("sleepauto", "SAY:UNTAGGED");
+  ok("an untagged message is held for the seat it was aimed at",
+    autoHeld.status === 200, JSON.stringify(autoHeld.data));
+  d = await idle("sleepauto");
+  ok("…never silently rerouted to the awake seat",
+    !d.entries.slice(autoMark).some((e) => e.kind === "agent"),
+    JSON.stringify(d.entries.slice(autoMark).map((e) => `${e.kind}:${e.author}`)));
+
+  await api("POST", "/api/rooms", { name: "sleepretry" });
+  await useFakes("sleepretry");
+  await say("sleepretry", "@claude SLEEP:2500 SAY:NEVER");
+  await sleep(250);
+  await api("POST", "/api/stop", { room: "sleepretry", agent: "claude" });
+  d = await idle("sleepretry");
+  ok("a stopped turn is retryable to begin with", d.room.canRetry === true);
+  await api("POST", "/api/seat/sleep", { room: "sleepretry", agent: "claude" });
+  ok("a sleeping seat is not offered as a retry target",
+    (await room("sleepretry")).room.canRetry === false);
+  const retryRefused = await api("POST", "/api/retry", { room: "sleepretry" });
+  ok("…and Retry refuses by name rather than saying there is nothing to retry",
+    retryRefused.status === 409 && /claude is asleep/.test(retryRefused.data.error || ""),
+    JSON.stringify(retryRefused.data));
+  await api("POST", "/api/new", { room: "sleepretry" });
+  ok("archiving the conversation does not quietly wake a rate-limited seat",
+    (await room("sleepretry")).room.agents.claude.asleep === true);
 
   console.log("\nwork mode & activity lines");
   await api("POST", "/api/rooms", { name: "workroom" });
