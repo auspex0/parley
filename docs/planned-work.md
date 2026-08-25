@@ -464,7 +464,7 @@ is not a package semver decision.
 
 ---
 
-## Package 12 — Generalized causal attention relay (built in the working tree, uncommitted; protocol 9)
+## Package 12 — Generalized causal attention relay (built, merged in PR #5 `c79af51` 2026-08-25; protocol 9)
 
 **A request is delivered when eligible. Every launched request earns one free answer return.
 New speech from that floor becomes the next budgeted request. A structural terminal is the
@@ -614,8 +614,8 @@ the reliable test if that ever stops being true.
    files. Kept here for the record — nothing in this step is outstanding.
 2. **`1.1.0` — minor, the feature batch above.** Packages 1, 6, 10 and the base Package 11
    implementation shipped in PR #4 (`5021b3a`); Package 11's sticky per-room shortcut
-   follow-up remains uncommitted on the current branch. The remaining Packages 2–5 work remains open,
-   and Package 12's generalized causal relay is built but uncommitted. Package 11 replaces
+   follow-up and Package 12's generalized causal relay shipped in PR #5 (`c79af51`,
+   merged 2026-08-25). The remaining Packages 2–5 work remains open. Package 11 replaces
    room config `maxHops` with `hopBudget`, but it is a
    backward-compatible migration rather than a break: legacy rooms are rewritten on
    load (`maxHops: 0` keeps its old “until settled” meaning as `hopBudget: -1`) and older
@@ -624,8 +624,8 @@ the reliable test if that ever stops being true.
 3. **Not a major.** `2.0.0` should be reserved for something that actually breaks a user:
    a room-state format that old versions cannot read, a renamed CLI flag, a changed
    default permission scope. Nothing here does that. The internal runtime protocol moved
-   5 → 6 for Sleep, 7 shipped in PR #4 for catch-up and relay progress, and is 9 in the
-   current working tree for generalized causal-attention, cap and answer-return state;
+   5 → 6 for Sleep, 7 shipped in PR #4 for catch-up and relay progress, and 9 shipped in
+   PR #5 for generalized causal-attention, cap and answer-return state;
    that is a stale-tab reload fence, not a semver event — the two numbers are unrelated
    and should stay that way.
 
