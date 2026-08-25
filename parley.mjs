@@ -34,8 +34,12 @@ const UI_HTML = fs.readFileSync(UI_FILE, "utf8");
 //    send" while the server is accepting and holding it.
 // 7: persisted lurk catch-up/outcomes and live hop progress; `hopBudget` also
 //    replaces the old zero-is-unlimited `maxHops` contract, and messages may
-//    carry a one-shot relay policy (including Solo).
-const RUNTIME_PROTOCOL = "7";
+//    carry a message-specific relay policy (including Solo).
+// 8: causal-closure receipts and terminal closure entries let the UI
+//    distinguish a deliberately bounded exchange from an undelivered reply.
+// 9: live causal request/answer scheduling generalizes that guarantee across
+//    explicit hops, concurrent @both replies and recovered Wake/Retry work.
+const RUNTIME_PROTOCOL = "9";
 const IS_WIN = process.platform === "win32";
 
 const IMAGE_TYPES = new Map([
@@ -237,8 +241,8 @@ function requireRoomHopBudget(value, label = "hopBudget") {
   return n;
 }
 
-// The one-message API is intentionally narrower than the room default: the
-// composer is a quick choice, not an unbounded per-message cost control.
+// The message API is intentionally narrower than the room default: the
+// composer is a quick shortcut, not an unbounded per-message cost control.
 function requireMessageHopBudget(value, label = "message hopBudget") {
   const n = requireRoomHopBudget(value, label);
   if (n > 8) {
@@ -259,6 +263,9 @@ function defaultState(seats = DEFAULT_SEATS) {
     // complete. Successful/caught-up receipts outrank these historical ranges
     // in the UI, so they never need destructive invalidation.
     lurkOutcomes: [],
+    // Durable charged-request usage per user root. Wake/Retry resume the same
+    // question and therefore the same cap instead of minting a fresh budget.
+    relayUsage: {},
     pair: null,     // { worker, reviewer, rounds, roundsSource } while pair mode is on
     codexLastWarned: false,
     // Current normalized room-note state. The revision advances on both edits
@@ -1398,6 +1405,11 @@ function loadRoom(name, seatChoice, create = false) {
     // Active per-message relay counters. These are runtime progress only: the
     // immutable policy itself is persisted on the root user entry.
     hopRuns: new Map(),
+    // Causal settlement is serialized per accepted user root. Initial provider
+    // calls may still finish concurrently, but Retry/Wake of one split @both
+    // half cannot race the original half into two coordinators that each miss
+    // the other's durable reply (or both spend the same remaining hop).
+    rootRelays: new Map(),
     // Stop all is a line drawn in time, not a flag. Every chain remembers the
     // count it started under and abandons itself once the count moves past it;
     // a boolean would be cleared by the next message the user sent, letting a
@@ -2354,14 +2366,18 @@ async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE, opts = 
   const gen = room.generation;
   const heardFrom = room.state.agents[agent].cursor;
   const unseen = deltaEntries(room, agent, -1);
-  if (!unseen.length) return;
-  const lastSeen = room.entries.length ? room.entries[room.entries.length - 1].n : 0;
   const catchUpRootSet = new Set((opts.catchUpRoots || [])
     .map((n) => Number(n) || 0).filter((n) => n > 0));
   const catchUpRootEntries = opts.catchUp
     ? [...catchUpRootSet].map((n) => room.entries.find((entry) => entry.n === n && entry.kind === "user"))
       .filter(Boolean)
     : [];
+  // A recovered provider failure/[pass]/empty attempt may add no relayable
+  // transcript entry even though it deliberately re-opened an explicit root's
+  // lurk obligation. The root packet itself is enough to run that assessment;
+  // ordinary live lurks still require a real unseen delta.
+  if (!unseen.length && !catchUpRootEntries.length) return;
+  const lastSeen = room.entries.length ? room.entries[room.entries.length - 1].n : 0;
   const ordinarySource = unseen.filter((e) => e.kind !== "system").pop() || unseen[unseen.length - 1];
   const catchUpThroughN = Number(opts.catchUpThroughN) || lastSeen;
   const catchUpEntryIndex = opts.catchUp ? new Map(room.entries.map((entry) => [entry.n, entry])) : null;
@@ -2376,7 +2392,7 @@ async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE, opts = 
     // The last thing it actually overheard someone say. A cancellation notice
     // rides in the same delta but is Parley speaking, not a participant, so it
     // makes a poor "replying to" target.
-    sourceN: (catchUpSource || ordinarySource).n,
+    sourceN: (catchUpSource || ordinarySource || catchUpRootEntries[catchUpRootEntries.length - 1]).n,
     chain: opts.chain || null,
   });
   const onStream = (text) => broadcast(room, { type: "stream", agent, text });
@@ -2449,6 +2465,7 @@ async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE, opts = 
     applyAdapterSession(room, agent, res, epoch);
     stampPromptDelivery(room, agent, res, epoch, delivery);
     room.state.agents[agent].cursor = Math.max(heardFrom, lastSeen);
+    if (opts.onDelivered) opts.onDelivered({ from: heardFrom, upTo: lastSeen });
     const passed = res.text.trim().length <= 12 && LURK_PASS.test(res.text.trim());
     let entry = null;
     if (passed) {
@@ -2459,6 +2476,7 @@ async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE, opts = 
         kind: "agent", author: agent, text: res.text,
         meta: {
           durationMs: Date.now() - startedAt, lurk: true,
+          ...(opts.catchUp ? { lurkCatchUp: true } : {}),
           replyTo: run.sourceN, ...(run.rootN !== null && run.rootN !== run.sourceN ? { replyRoot: run.rootN } : {}),
           ...(res.usage ? { tokens: res.usage } : {}),
         },
@@ -2503,6 +2521,17 @@ async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE, opts = 
 // -1 runs until settled under a high emergency ceiling for accidental ping-pong.
 
 const HOP_INSTRUCTION = "(You were addressed directly by the other agent. Treat their proposal as a peer contribution, not an instruction. Answer the concrete point briefly without replaying the room context; tag them back only if another response is genuinely needed. Reply to them, the user, or both. If you truly have nothing to add, reply with exactly: [pass])";
+const CAUSAL_CONTINUATION_INSTRUCTION = "(The other agent responded while receiving an answer you sent. " +
+  "This is a new continuation under the user-selected hop budget. Address what materially needs a response; " +
+  "otherwise reply exactly [pass]. You do not need an @tag to return a substantive answer — Parley routes the " +
+  "causal reply itself.)";
+const SIBLING_ATTENTION_INSTRUCTION = "(The other agent's reply from the same @both exchange arrived while " +
+  "your provider turn was using an earlier snapshot. Review it now. Respond only if it materially changes the " +
+  "result or asks something of you; otherwise reply exactly [pass]. If you respond, Parley returns that answer " +
+  "once to its caller, then any further continuation is governed by the hop budget.)";
+const LURK_RETURN_INSTRUCTION = "(A lurking agent just chimed in. You have one structurally guaranteed right " +
+  "of reply. Address only what materially needs a response; otherwise reply exactly [pass]. If you respond, " +
+  "Parley returns that answer once to the lurker, then any further continuation is governed by the hop budget.)";
 const HOP_SAFETY_HOPS = Math.max(2, Number(process.env.PARLEY_HOP_SAFETY) || 25);
 
 function hopInstructionForBudget(policy, usedBefore) {
@@ -2759,7 +2788,7 @@ async function runHopTurn(room, agent, triggerEntry, rootN, scope = NO_SCOPE, op
       saveState(room);
       appendReceipt(room, {
         agent, from: heardFrom, upTo: Math.max(triggerEntry.n, heardThrough),
-        turn: rootN, mode: "hop", spoke: false,
+        turn: rootN, mode: opts.receiptMode || "hop", spoke: false,
       });
       return STEP_INCOMPLETE;
     }
@@ -2767,7 +2796,10 @@ async function runHopTurn(room, agent, triggerEntry, rootN, scope = NO_SCOPE, op
     let entry = null;
     if (passed) {
       saveState(room);
-      broadcast(room, { type: "lurk", agent, spoke: false, hop: true });
+      broadcast(room, {
+        type: "lurk", agent, spoke: false,
+        hop: opts.phase !== "attention", attention: opts.phase === "attention",
+      });
     } else {
       entry = appendEntry(room, {
         kind: "agent", author: agent, text: res.text,
@@ -2781,7 +2813,7 @@ async function runHopTurn(room, agent, triggerEntry, rootN, scope = NO_SCOPE, op
     }
     appendReceipt(room, {
       agent, from: heardFrom, upTo: Math.max(triggerEntry.n, heardThrough),
-      turn: rootN, mode: "hop", spoke: !passed,
+      turn: rootN, mode: opts.receiptMode || "hop", spoke: !passed,
     });
     return entry;
   } catch (e) {
@@ -2796,10 +2828,13 @@ async function runHopTurn(room, agent, triggerEntry, rootN, scope = NO_SCOPE, op
       // and a silent/pass reply. Ordinary hops deliberately retain null.
       return opts.signalFailure ? STEP_STOPPED : null;
     }
+    const causalPhase = opts.phase === "attention" || opts.phase === "closure" || opts.causalDelivery;
     appendEntry(room, {
       kind: "system", author: "system",
-      text: `⚠ ${agent} failed replying to a mention: ${e.message}`,
-      meta: { agent, error: true },
+      text: causalPhase
+        ? `⚠ ${agent} failed during causal delivery: ${e.message}`
+        : `⚠ ${agent} failed replying to a mention: ${e.message}`,
+      meta: { agent, error: true, ...(causalPhase ? { causalDelivery: true } : {}) },
     });
     return opts.signalFailure ? HOP_FAILED : null;
   } finally {
@@ -3322,6 +3357,447 @@ function planMessage(room, raw, targetSel) {
   return { pairCmd, starting, target, text, explicit, pair, asPairTurn, seats };
 }
 
+function relayUsed(room, rootN) {
+  const raw = room.state.relayUsage && room.state.relayUsage[String(rootN)];
+  const used = Number(raw);
+  return Number.isSafeInteger(used) && used > 0 ? used : 0;
+}
+
+function relayUsageProtectedRoots(room) {
+  const protectedRoots = new Set();
+  const lastN = Number(room.state.lastUser && room.state.lastUser.n) || 0;
+  if (lastN > 0) protectedRoots.add(lastN);
+  for (const run of room.hopRuns ? room.hopRuns.values() : []) {
+    const rootN = Number(run && run.rootN) || 0;
+    if (rootN > 0) protectedRoots.add(rootN);
+  }
+  // A split @both can spend budget on the awake half while its sibling half
+  // remains held for days. Preserve that root until Wake & deliver resolves it,
+  // even if hundreds of newer roots charge hops in the meantime.
+  for (const agent of seatIds(room)) {
+    for (const entry of heldForSeat(room, agent)) protectedRoots.add(entry.n);
+  }
+  return protectedRoots;
+}
+
+function recordRelayLaunch(room, rootN, priorUsed = 0) {
+  if (!room.state.relayUsage || typeof room.state.relayUsage !== "object") {
+    room.state.relayUsage = {};
+  }
+  const key = String(rootN);
+  // The coordinator retains its local count across awaits. Taking the maximum
+  // also prevents a concurrently pruned or legacy-missing ledger entry from
+  // resetting an already-running root back to one.
+  const used = Math.max(relayUsed(room, rootN), Number(priorUsed) || 0) + 1;
+  room.state.relayUsage[key] = used;
+  // This is execution history, not an archive. Bound it like lurk outcomes;
+  // old transcript entries remain authoritative without growing state forever.
+  const keys = Object.keys(room.state.relayUsage)
+    .map((n) => Number(n)).filter((n) => Number.isSafeInteger(n) && n > 0)
+    .sort((a, b) => a - b);
+  const protectedRoots = relayUsageProtectedRoots(room);
+  const removable = keys.filter((n) => !protectedRoots.has(n));
+  for (const old of removable.slice(0, Math.max(0, removable.length - 200))) {
+    delete room.state.relayUsage[String(old)];
+  }
+  for (const run of room.hopRuns ? room.hopRuns.values() : []) {
+    if (run && run.rootN === rootN) run.used = used;
+  }
+  saveState(room);
+  return used;
+}
+
+async function withRootRelay(room, rootN, work) {
+  const key = `${room.generation}:${Number(rootN) || 0}`;
+  const previous = room.rootRelays.get(key) || Promise.resolve();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const tail = previous.catch(() => {}).then(() => gate);
+  room.rootRelays.set(key, tail);
+  await previous.catch(() => {});
+  try {
+    return await work();
+  } finally {
+    release();
+    if (room.rootRelays.get(key) === tail) room.rootRelays.delete(key);
+  }
+}
+
+function directRootReplies(room, userTurn) {
+  return room.entries.filter((entry) => entry.kind === "agent" &&
+    Number(entry.meta && entry.meta.replyTo) === userTurn.n &&
+    !withdrawnFrom(room, entry.author, userTurn))
+    .sort((a, b) => a.n - b.n);
+}
+
+// One live user root owns one causal coordinator, including work resumed by
+// Wake & deliver or Retry. Requests may be charged (agent conversation) or
+// structural (@both sibling delivery / lurk right of reply). Every launched
+// request earns one free answer return; speech from that return re-enters as a
+// charged continuation. This single state machine keeps ordinary, deferred and
+// recovered delivery from drifting into different conversation contracts.
+function createCausalCoordinator(room, {
+  userTurn, scope, chain, gen, relayPolicy, hopRun, invoked = new Set(),
+}) {
+  const configuredBudget = normalizeHopBudget(relayPolicy && relayPolicy.hopBudget, -1);
+  const hopLimit = configuredBudget < 0 ? HOP_SAFETY_HOPS : configuredBudget;
+  const allowPlain = userTurn.target === "both";
+  let hops = Math.max(Number(hopRun && hopRun.used) || 0, relayUsed(room, userTurn.n));
+  const handled = new Set();
+  const cappedTargets = new Map();
+  const requests = [];
+  const answers = [];
+  const requestTarget = (request) => request.target ||
+    findHopTarget(room, request.entry, { allowPlain });
+  const requestOutcome = (request, target, reason) => persistLurkOutcome(room, target, {
+    sinceN: request.entry.n, throughN: request.entry.n, triggerN: request.entry.n,
+  }, `request-${reason}`);
+
+  const enqueueInitial = (entries, eligibleAuthors = new Set()) => {
+    for (const entry of [...entries].filter(isEntryResult).sort((a, b) => a.n - b.n)) {
+      if (userTurn.target === "both") {
+        const target = otherSeat(room, entry.author);
+        if (eligibleAuthors.has(target)) {
+          requests.push({ entry, target, charged: false, kind: "sibling" });
+        } else if (withdrawnFrom(room, target, userTurn)) {
+          // A surviving agent's explicit request after split cancellation is
+          // distinct new causal work. Failure, Stop and sleep are not
+          // withdrawals, so those dispositions never become an auto-retry.
+          const requested = findHopTarget(room, entry, { allowPlain });
+          if (requested && requested !== entry.author) {
+            requests.push({ entry, target: requested, charged: true, kind: "explicit" });
+          }
+        }
+      } else {
+        // A single addressed reply wakes its peer only when it actually asks.
+        requests.push({ entry, target: null, charged: true, kind: "explicit" });
+      }
+    }
+  };
+
+  const enqueueLurks = (entries) => {
+    for (const entry of [...entries].filter(isEntryResult).sort((a, b) => a.n - b.n)) {
+      const target = findHopTarget(room, entry, { allowPlain }) || otherSeat(room, entry.author);
+      requests.push({ entry, target, charged: false, kind: "lurk" });
+    }
+  };
+
+  const drainRequests = async () => {
+    while (requests.length && !chainHalted(room, chain)) {
+      if (gen !== room.generation) return;
+      const request = requests.shift();
+      const trigger = request.entry;
+      const target = requestTarget(request);
+      if (!target || target === trigger.author) continue;
+      // Once causal routing selects a seat, outer lurk fanout must not invoke it
+      // again as a different delivery class if this request caps, sleeps, fails
+      // or times out. Its durable request disposition is the one truth.
+      invoked.add(target);
+
+      if (room.state.agents[target].cursor >= trigger.n) {
+        handled.add(trigger.n);
+        cappedTargets.delete(trigger.n);
+        continue;
+      }
+      if (isAsleep(room, target)) {
+        noteSleepSkip(room, target, "hop", { trigger, sourceN: trigger.n });
+        requestOutcome(request, target, "asleep");
+        handled.add(trigger.n);
+        continue;
+      }
+      if (request.charged) hops = Math.max(hops, relayUsed(room, userTurn.n));
+      if (request.charged && hops >= hopLimit) {
+        cappedTargets.set(trigger.n, target);
+        continue;
+      }
+      if (seatOccupied(room, target)) {
+        const ready = await waitForHopSeat(room, target, gen, chain);
+        if (gen !== room.generation) return;
+        if (!ready) {
+          broadcast(room, { type: "lurk", agent: target, spoke: false, skipped: true });
+          requestOutcome(request, target, chainHalted(room, chain) ? "stopped" : "wait-aborted");
+          handled.add(trigger.n);
+          continue;
+        }
+      }
+      // User-lane work can carry this request while it waits for the seat.
+      if (gen !== room.generation) return;
+      if (chainHalted(room, chain)) {
+        requestOutcome(request, target, "stopped");
+        handled.add(trigger.n);
+        continue;
+      }
+      if (room.state.agents[target].cursor >= trigger.n) {
+        handled.add(trigger.n);
+        cappedTargets.delete(trigger.n);
+        continue;
+      }
+      if (isAsleep(room, target)) {
+        noteSleepSkip(room, target, "hop", { trigger, sourceN: trigger.n });
+        requestOutcome(request, target, "asleep");
+        handled.add(trigger.n);
+        continue;
+      }
+
+      const instruction = request.charged
+        ? (request.kind === "continuation"
+          ? causalContinuationInstruction(configuredBudget, hops)
+          : hopInstructionForBudget(configuredBudget, hops))
+        : request.kind === "sibling" ? SIBLING_ATTENTION_INSTRUCTION
+          : LURK_RETURN_INSTRUCTION;
+      const reply = await runHopTurn(room, target, trigger, userTurn.n, scope, {
+        chain,
+        phase: request.charged ? "hop" : "attention",
+        receiptMode: request.charged ? "hop" : "attention",
+        causalDelivery: request.kind === "continuation",
+        instruction,
+        signalFailure: true,
+        meta: request.charged ? null : {
+          hop: false,
+          causalRequest: { sourceN: trigger.n, kind: request.kind },
+        },
+        onLaunch: request.charged ? () => {
+          hops = recordRelayLaunch(room, userTurn.n, hops);
+          if (hopRun) hopRun.used = hops;
+          broadcast(room, { type: "room", room: roomSummary(room) });
+        } : null,
+      });
+      if (gen !== room.generation) return;
+      handled.add(trigger.n);
+      cappedTargets.delete(trigger.n);
+      if (reply === HOP_FAILED) { requestOutcome(request, target, "failed"); continue; }
+      if (reply === STEP_STOPPED) { requestOutcome(request, target, "stopped"); continue; }
+      if (reply === SEAT_ASLEEP) { requestOutcome(request, target, "asleep"); continue; }
+      if (!isEntryResult(reply) && room.state.agents[target].cursor < trigger.n) {
+        requestOutcome(request, target, "failed");
+        continue;
+      }
+      if (isEntryResult(reply)) answers.push({
+        reply, recipient: trigger.author, kind: request.kind,
+      });
+    }
+  };
+
+  const drainAnswers = async () => {
+    while (answers.length && !chainHalted(room, chain)) {
+      if (gen !== room.generation) return;
+      const answer = answers.shift();
+      if (handled.has(answer.reply.n)) continue;
+      const result = await deliverCausalAnswer(room, {
+        recipient: answer.recipient, reply: answer.reply, rootN: userTurn.n,
+        chain, gen, kind: answer.kind, terminal: false,
+      });
+      handled.add(answer.reply.n);
+      if (result.seen) cappedTargets.delete(answer.reply.n);
+      if (gen !== room.generation) return;
+      if (isEntryResult(result.entry)) requests.push({
+        entry: result.entry, target: answer.reply.author,
+        charged: true, kind: "continuation",
+      });
+    }
+  };
+
+  const disposeStopped = () => {
+    if (gen !== room.generation) return;
+    while (requests.length) {
+      const request = requests.shift();
+      const target = requestTarget(request);
+      if (!target || target === request.entry.author) continue;
+      invoked.add(target);
+      if (room.state.agents[target].cursor < request.entry.n) {
+        requestOutcome(request, target, "stopped");
+      }
+      handled.add(request.entry.n);
+      cappedTargets.delete(request.entry.n);
+    }
+    while (answers.length) {
+      const answer = answers.shift();
+      if (handled.has(answer.reply.n)) continue;
+      persistLurkOutcome(room, answer.recipient, causalAnswerRange(answer.reply),
+        room.state.agents[answer.recipient].cursor >= answer.reply.n
+          ? "closed-by-delivery" : "closure-stopped");
+      handled.add(answer.reply.n);
+    }
+    // A request may already have been removed from the queue when the budget
+    // capped it. If Stop ends the owning chain before the cap line is written,
+    // retain a durable terminal disposition instead of leaving its dot orphaned.
+    for (const [n, target] of cappedTargets) {
+      if (room.state.agents[target].cursor < n) {
+        persistLurkOutcome(room, target, { sinceN: n, throughN: n, triggerN: n },
+          "request-stopped");
+      }
+    }
+    cappedTargets.clear();
+  };
+
+  const settle = async () => {
+    while (requests.length || answers.length) {
+      if (gen !== room.generation) return;
+      if (chainHalted(room, chain)) {
+        disposeStopped();
+        return;
+      }
+      await drainRequests();
+      if (gen !== room.generation) return;
+      if (chainHalted(room, chain)) {
+        disposeStopped();
+        return;
+      }
+      await drainAnswers();
+    }
+    if (gen === room.generation && chainHalted(room, chain)) disposeStopped();
+  };
+
+  const finishCaps = () => {
+    for (const [n, target] of cappedTargets) {
+      if (room.state.agents[target].cursor >= n) cappedTargets.delete(n);
+    }
+    if (!cappedTargets.size) return false;
+    if (hopRun) hopRun.phase = configuredBudget < 0 ? "safety" : "capped";
+    appendEntry(room, {
+      kind: "system", author: "system",
+      text: configuredBudget === 0
+        ? "Agent-to-agent reply not delivered — hops are off for this message. The reply remains in the transcript for later context."
+        : configuredBudget > 0
+          ? `⛓ Agent-hop budget reached (${configuredBudget}) — choose a higher per-message cap for a longer exchange.`
+          : `🛑 Agent-hop safety stop after ${HOP_SAFETY_HOPS} exchanges — the agents may be stuck in a loop.`,
+      meta: {
+        relayCap: {
+          rootN: userTurn.n, budget: configuredBudget, used: hops,
+          dropped: [...cappedTargets].map(([n, target]) => ({ n, target })),
+        },
+      },
+    });
+    broadcast(room, { type: "room", room: roomSummary(room) });
+    return true;
+  };
+
+  return { invoked, enqueueInitial, enqueueLurks, settle, finishCaps };
+}
+
+function relayPolicyForEntry(room, entry) {
+  const stored = entry && entry.meta && entry.meta.relay;
+  return {
+    hopBudget: normalizeHopBudget(stored && stored.hopBudget, normalizeHopBudget(room.cfg.hopBudget, -1)),
+    source: stored && stored.source ? stored.source : "room",
+    solo: !!(stored && stored.solo),
+  };
+}
+
+// Wake/Retry replays the original user root, then rejoins the same causal
+// scheduler as a normal accepted message. Keeping the exchange counter open
+// through attention work prevents a false-idle window and gives Stop/config
+// guards the same chain object for the entire recovered conversation.
+function startRecoveredDelivery(room, userTurn, targets, scope, turnOptions = null) {
+  const gen = room.generation;
+  const chain = newChain(room);
+  const queueGroupId = `d${room.dispatchSeq++}`;
+  const relayPolicy = relayPolicyForEntry(room, userTurn);
+  const noteStoppedRecoveryLurkers = (invoked = new Set(targets)) => {
+    if (relayPolicy.solo || userTurn.target === "both") return;
+    for (const agent of seatIds(room)) {
+      if (!invoked.has(agent) && room.cfg.agents[agent].lurk) {
+        noteLurkOutcome(room, agent, userTurn.n, "stopped");
+      }
+    }
+  };
+  const hopRun = {
+    id: queueGroupId, rootN: userTurn.n, used: relayUsed(room, userTurn.n),
+    budget: relayPolicy.hopBudget, phase: "running",
+  };
+  room.exchanges++;
+  room.hopRuns.set(queueGroupId, hopRun);
+  (async () => {
+    try {
+      const results = await Promise.allSettled(targets.map((agent) => {
+        chain.delivered++;
+        const extra = typeof turnOptions === "function" ? (turnOptions(agent) || {}) : (turnOptions || {});
+        return runAgentTurn(room, agent, userTurn, scope, {
+          ...extra, queueGroupId, chain,
+        });
+      }));
+      if (gen !== room.generation) return;
+      await withRootRelay(room, userTurn.n, async () => {
+        if (gen !== room.generation) return;
+        if (chainHalted(room, chain)) {
+          noteStoppedRecoveryLurkers();
+          return;
+        }
+        const replies = results
+          .filter((result) => result.status === "fulfilled" && isEntryResult(result.value))
+          .map((result) => result.value);
+        // When Retry/Wake overlaps the still-running sibling of this same @both
+        // root, whichever coordinator reaches this serialized boundary second
+        // reconciles both durable direct replies. Cursor checks inside the
+        // coordinator suppress any direction the first one already delivered.
+        const initialReplies = userTurn.target === "both"
+          ? directRootReplies(room, userTurn) : replies;
+        const eligibleAuthors = new Set(initialReplies.map((entry) => entry.author));
+        const coordinator = createCausalCoordinator(room, {
+          userTurn, scope, chain, gen, relayPolicy, hopRun,
+          invoked: new Set(targets),
+        });
+        coordinator.enqueueInitial(initialReplies, eligibleAuthors);
+        await coordinator.settle();
+
+        // A held/retried single-seat turn becomes a real exchange when its
+        // recovery attempt runs, even if the addressed provider fails or stays
+        // silent. Ordinary live fanout lets an enabled lurker observe that same
+        // outcome, so Wake/Retry must honor the contract at this safe boundary
+        // too instead of creating one permanently un-overheard exchange class.
+        if (gen !== room.generation) return;
+        if (chainHalted(room, chain)) {
+          noteStoppedRecoveryLurkers(coordinator.invoked);
+          return;
+        }
+        const listeners = relayPolicy.solo || userTurn.target === "both"
+          ? []
+          : seatIds(room).filter((agent) => !coordinator.invoked.has(agent) &&
+            room.cfg.agents[agent].lurk);
+        const lurkers = [];
+        for (const agent of listeners) {
+          if (isAsleep(room, agent)) {
+            noteSleepSkip(room, agent, "lurk", { sourceN: userTurn.n });
+            continue;
+          }
+          const throughN = room.entries.length
+            ? room.entries[room.entries.length - 1].n : userTurn.n;
+          if (room.state.agents[agent].cursor >= throughN) continue;
+          if (seatOccupied(room, agent)) {
+            queueLurkCatchUp(room, agent, userTurn.n, throughN, { roots: [userTurn.n] });
+            continue;
+          }
+          lurkers.push(agent);
+        }
+        const chimeResults = lurkers.length
+          ? await Promise.allSettled(lurkers.map((agent) =>
+            runListenerTurn(room, agent, userTurn.n, scope, {
+              chain,
+              onTerminal: (reason, range) => persistLurkOutcome(room, agent, range, reason),
+            })))
+          : [];
+        if (gen !== room.generation || chainHalted(room, chain)) return;
+        coordinator.enqueueLurks(chimeResults
+          .filter((result) => result.status === "fulfilled" && isEntryResult(result.value))
+          .map((result) => result.value));
+        await coordinator.settle();
+        if (gen !== room.generation) return;
+        coordinator.finishCaps();
+      });
+    } finally {
+      room.exchanges = Math.max(0, room.exchanges - 1);
+      room.hopRuns.delete(queueGroupId);
+      if (gen !== room.generation) return;
+      drainLanes(room);
+      // Drain first so the summary cannot briefly claim the room is idle while
+      // accepted user work is already queued to start at this boundary.
+      broadcast(room, { type: "room", room: roomSummary(room) });
+      scheduleCatchUps(room);
+    }
+  })();
+  broadcast(room, { type: "room", room: roomSummary(room) });
+}
+
 // Synchronous validation + kickoff; agent turns continue in the background
 // and surface over SSE. Throws (with .status) on invalid input so the HTTP
 // route can report it.
@@ -3342,7 +3818,7 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles, rawRel
   const tasklessPairStart = startingPair && !text && !prepared.length;
   // Solo is incompatible with a pair *cycle*, not with the controls that merely
   // arm or end pair mode. Those controls append no user turn and have no relay
-  // policy to apply, so a one-shot composer choice must not block them.
+  // policy to apply, so the sticky composer shortcut must not block them.
   if (solo && (target === "both" || (plan.asPairTurn && !tasklessPairStart))) {
     throw Object.assign(new Error("Solo needs one ordinary addressee; it cannot be used with @both or a pair turn"), { status: 400 });
   }
@@ -3563,7 +4039,7 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles, rawRel
   // exchange — the project folder — asks about this, not about `busy`.
   room.exchanges++;
   const hopRun = {
-    id: queueGroupId, rootN: userTurn.n, used: 0,
+    id: queueGroupId, rootN: userTurn.n, used: relayUsed(room, userTurn.n),
     budget: relayPolicy.hopBudget, phase: "running",
   };
   room.hopRuns.set(queueGroupId, hopRun);
@@ -3580,6 +4056,8 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles, rawRel
       return runAgentTurn(room, a, userTurn, scope, { queueGroupId, chain });
     }));
     if (gen !== room.generation) return;
+    await withRootRelay(room, userTurn.n, async () => {
+    if (gen !== room.generation) return;
     // Every delivery this message owed was cancelled before it ran, so there is
     // no exchange to continue: no hops, and no lurk check either — a lurker
     // chiming in about a message the user cancelled is the whole bug. A split
@@ -3592,66 +4070,34 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles, rawRel
       for (const a of listeners) noteLurkOutcome(room, a, userTurn.n, "stopped");
       return;
     }
-    const invoked = new Set(agents);
-
-    // Bounded exchange loop. hopBudget budgets agent-triggered follow-ups —
-    // an open-ended chain that needs a counter. A lurker's spoken chime always
-    // earns the other agent one reply back (right of reply); that step is
-    // structurally bounded (lurkers evaluate exactly once per user message —
-    // no re-lurking, or two polite agents would ping-pong forever), so it
-    // doesn't consume the budget. Lurk's cost is lurk's own toggle.
-    const configuredBudget = relayPolicy.hopBudget;
-    const hopLimit = configuredBudget < 0 ? HOP_SAFETY_HOPS : configuredBudget;
-    const allowPlain = userTurn.target === "both";
-    let hops = 0, capped = false;
-    const queue = [];
-    for (const r of results) if (r.status === "fulfilled" && r.value) queue.push(r.value);
-    queue.sort((a, b) => a.n - b.n); // follow the order the replies appeared in chat
-
-    const drainMentions = async () => {
-      while (queue.length && !chainHalted(room, chain)) {
-        const trigger = queue.shift();
-        const target = findHopTarget(room, trigger, { allowPlain });
-        if (!target) continue;
-        // Ahead of the budget check: a call that was never delivered must not
-        // spend a hop. This is the hole the gate was built for — an explicit
-        // @tag routes here with no lurk check of its own.
-        if (isAsleep(room, target)) {
-          noteSleepSkip(room, target, "hop", { trigger, sourceN: trigger.n });
-          continue;
-        }
-        // A seat delivered to late read this reply in its own delta and has
-        // already answered it, so hopping would be the same agent replying
-        // twice to one message. Its cursor is the test: anything it has not
-        // seen yet — a later reply, a chime — still hops normally.
-        if (deferred.has(target) && room.state.agents[target].cursor >= trigger.n) continue;
-        if (hops >= hopLimit) { capped = true; return; }
-        if (seatOccupied(room, target) && !(await waitForHopSeat(room, target, gen, chain))) {
-          broadcast(room, { type: "lurk", agent: target, spoke: false, skipped: true });
-          continue;
-        }
-        const reply = await runHopTurn(room, target, trigger, userTurn.n, scope, {
-          chain,
-          instruction: hopInstructionForBudget(configuredBudget, hops),
-          onLaunch: () => {
-            hops++;
-            hopRun.used = hops;
-            broadcast(room, { type: "room", room: roomSummary(room) });
-          },
-        });
-        if (gen !== room.generation) return;
-        invoked.add(target);
-        if (reply) queue.push(reply);
-      }
-    };
-    await drainMentions();
+    const localInitialReplies = results
+      .filter((r) => r.status === "fulfilled" && isEntryResult(r.value))
+      .map((r) => r.value)
+      .sort((a, b) => a.n - b.n);
+    // A same-root Retry/Wake may have produced the missing @both half while
+    // this coordinator was still awaiting its original provider. Reconcile
+    // exact direct-root entries at the serialized boundary; never infer a
+    // successful half from a high cursor or unrelated later traffic.
+    const initialReplies = userTurn.target === "both"
+      ? directRootReplies(room, userTurn) : localInitialReplies;
+    const successfulInitialAuthors = new Set(initialReplies.map((entry) => entry.author));
+    const coordinator = createCausalCoordinator(room, {
+      userTurn, scope, chain, gen, relayPolicy, hopRun,
+      invoked: new Set(agents),
+    });
+    coordinator.enqueueInitial(initialReplies, successfulInitialAuthors);
+    await coordinator.settle();
     if (gen !== room.generation) return;
     if (chainHalted(room, chain)) {
-      for (const a of listeners) noteLurkOutcome(room, a, userTurn.n, "stopped");
+      // A listener already invoked by causal routing has handled this root;
+      // don't also persist a contradictory "lurk stopped" outcome for it.
+      for (const a of listeners) {
+        if (!coordinator.invoked.has(a)) noteLurkOutcome(room, a, userTurn.n, "stopped");
+      }
       return;
     }
 
-    const lurkers = listeners.filter((a) => !invoked.has(a)).filter((a) => {
+    const lurkers = listeners.filter((a) => !coordinator.invoked.has(a)).filter((a) => {
       // Asked before busy: a sleeping seat is not busy, and the busy path's
       // "the delta catches it up later" is exactly what does not hold here.
       if (isAsleep(room, a)) {
@@ -3677,43 +4123,18 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles, rawRel
       : [];
     if (gen !== room.generation || chainHalted(room, chain)) return;
 
-    const chimes = chimeResults.filter((r) => r.status === "fulfilled" && r.value).map((r) => r.value);
+    const chimes = chimeResults
+      .filter((r) => r.status === "fulfilled" && isEntryResult(r.value))
+      .map((r) => r.value);
     if (chimes.length) {
-      for (const chime of chimes) {
-        if (chainHalted(room, chain)) break;
-        const target = findHopTarget(room, chime, { allowPlain }) || otherSeat(room, chime.author);
-        if (isAsleep(room, target)) {
-          noteSleepSkip(room, target, "hop", { trigger: chime, sourceN: chime.n });
-          continue;
-        }
-        if (seatOccupied(room, target) && !(await waitForHopSeat(room, target, gen, chain))) {
-          broadcast(room, { type: "lurk", agent: target, spoke: false, skipped: true });
-          continue;
-        }
-        const reply = await runHopTurn(room, target, chime, userTurn.n, scope, { chain }); // free: right of reply
-        if (gen !== room.generation) return;
-        invoked.add(target);
-        if (reply) queue.push(reply); // but any tag in it is budgeted as usual
-      }
-      await drainMentions();
+      coordinator.enqueueLurks(chimes);
+      await coordinator.settle();
       if (gen !== room.generation) return;
     }
 
-    if (capped) {
-      hopRun.phase = configuredBudget < 0 ? "safety" : "capped";
-      appendEntry(room, {
-        kind: "system", author: "system",
-        text: configuredBudget === 0
-          ? "Agent-to-agent reply not delivered — hops are off for this message. The reply remains in the transcript for later context."
-          : configuredBudget > 0
-            ? `⛓ Agent-hop budget reached (${configuredBudget}) — choose a higher per-message cap for a longer exchange.`
-            : `🛑 Agent-hop safety stop after ${HOP_SAFETY_HOPS} exchanges — the agents may be stuck in a loop.`,
-        meta: { relayCap: { rootN: userTurn.n, budget: configuredBudget, used: hops } },
-      });
-      broadcast(room, { type: "room", room: roomSummary(room) });
-    }
-
+    coordinator.finishCaps();
     drainLanes(room); // messages the user queued while the table was busy
+    });
    } finally {
      room.exchanges = Math.max(0, room.exchanges - 1);
      room.hopRuns.delete(queueGroupId);
@@ -3740,14 +4161,33 @@ function catchUpState(room, agent) {
   const throughN = Number(raw.throughN) || 0;
   const triggerN = Number(raw.triggerN) || throughN;
   const revision = Math.max(1, Number(raw.revision) || 1);
-  return throughN > 0 ? { sinceN, throughN, triggerN, revision, at: raw.at || null } : null;
+  const roots = Array.isArray(raw.roots)
+    ? [...new Set(raw.roots.map((n) => Number(n) || 0).filter((n) => n > 0))]
+    : [];
+  const rootRevisions = {};
+  if (raw.rootRevisions && typeof raw.rootRevisions === "object") {
+    for (const rootN of roots) {
+      const value = Math.max(1, Number(raw.rootRevisions[String(rootN)]) || revision);
+      rootRevisions[String(rootN)] = value;
+    }
+  } else {
+    // Legacy pending entries predate per-root versioning. Their current global
+    // revision is the best exact snapshot and keeps migration idempotent.
+    for (const rootN of roots) rootRevisions[String(rootN)] = revision;
+  }
+  return throughN > 0 ? {
+    sinceN, throughN, triggerN, revision, at: raw.at || null,
+    ...(roots.length ? { roots } : {}),
+    ...(roots.length ? { rootRevisions } : {}),
+  } : null;
 }
 
-// The accepted user entry already records which seats were selected to lurk.
-// Re-derive the actionable roots from that durable fact so Solo and unrelated
-// traffic can ride in the full delta as context without becoming invitations to
-// speak. No second persisted list is needed, and cursor advancement naturally
-// removes roots that another successful invocation has already delivered.
+// Ordinarily the accepted user entry records which seats were selected to
+// lurk. A held single-seat message has no listener until Wake/Retry turns it
+// into a real exchange, so that recovery path may add explicit root ids to the
+// pending obligation instead. In either case Solo and unrelated traffic ride
+// in the full delta only as context, while cursor advancement naturally removes
+// roots another successful invocation already delivered.
 function transcriptRootN(room, entry, entryIndex = null) {
   if (!entry) return 0;
   const byN = entryIndex || new Map(room.entries.map((item) => [item.n, item]));
@@ -3776,19 +4216,154 @@ function catchUpRoots(room, agent, pending) {
   const cursor = (room.state.agents[agent] && room.state.agents[agent].cursor) || 0;
   const unseenFrom = Math.max(from, cursor + 1);
   const entryIndex = new Map(room.entries.map((entry) => [entry.n, entry]));
+  // A completed catch-up appends its own chime, bounded right of reply and
+  // terminal answer after the range it assessed. Those descendants inherit
+  // the original root for provenance, but they are not a new missed exchange.
+  // Ignore them when deciding whether an in-flight extension made that root
+  // actionable again. A genuine Wake/Retry answer to the same root has none of
+  // these markers, so it correctly reopens the root for one fresh assessment.
+  const isCatchUpArtifact = (entry) => {
+    const meta = entry && entry.meta;
+    return !!(meta && (meta.lurkCatchUp || meta.catchUpReturn ||
+      (meta.causalAttention && meta.causalAttention.terminal &&
+        String(meta.causalAttention.kind || "").startsWith("lurk-catchup"))));
+  };
   const rootsWithCoveredEntries = new Set(room.entries
-    .filter((entry) => entry.n >= unseenFrom && entry.n <= through)
+    .filter((entry) => entry.n >= unseenFrom && entry.n <= through && !isCatchUpArtifact(entry))
     .map((entry) => transcriptRootN(room, entry, entryIndex)).filter(Boolean));
+  const explicitlySelected = new Set((pending.roots || []).map((n) => Number(n) || 0));
   return room.entries.filter((entry) => entry.kind === "user" && entry.n <= through &&
-    (entry.n >= unseenFrom || rootsWithCoveredEntries.has(entry.n)) &&
-    Array.isArray(entry.meta && entry.meta.audience && entry.meta.audience.lurking) &&
-    entry.meta.audience.lurking.includes(agent));
+    (entry.n >= unseenFrom || rootsWithCoveredEntries.has(entry.n) ||
+      explicitlySelected.has(entry.n)) &&
+    (explicitlySelected.has(entry.n) ||
+      (Array.isArray(entry.meta && entry.meta.audience && entry.meta.audience.lurking) &&
+        entry.meta.audience.lurking.includes(agent))));
 }
 
 const CATCH_UP_RETURN_INSTRUCTION = "(The other agent just spoke during a delayed lurk catch-up. " +
   "You have one structurally bounded right of reply. Address only what materially needs a response; " +
+  "otherwise reply exactly [pass]. If you reply, Parley will deliver that answer once to the original " +
+  "lurker so the causal exchange is not left open.)";
+
+const CAUSAL_ANSWER_INSTRUCTION = "(This is a causal answer delivery: the other agent answered a message " +
+  "you sent. Review that answer now. Respond only if it materially changes the result or leaves something " +
+  "unresolved; otherwise reply exactly [pass]. If you respond, Parley treats it as a new request governed by " +
+  "the current exchange's hop budget.)";
+
+const CAUSAL_ANSWER_REQUESTED_INSTRUCTION = "(This is a causal answer delivery: the other agent answered " +
+  "a message you sent and explicitly asked for your response. Answer if the point still needs one; otherwise " +
+  "reply exactly [pass]. If you respond, Parley treats it as a new request governed by the current exchange's " +
+  "hop budget.)";
+
+const TERMINAL_CAUSAL_ANSWER_INSTRUCTION = "(This is a causal answer delivery from a delayed lurk catch-up. " +
+  "Respond only if that answer materially changes the result or leaves something unresolved; otherwise reply " +
+  "exactly [pass]. This is the final automatically delivered leg: tagging the other agent will not schedule " +
+  "another response.)";
+
+const TERMINAL_CAUSAL_ANSWER_REQUESTED_INSTRUCTION = "(This is a causal answer delivery from a delayed " +
+  "lurk catch-up, and the other agent explicitly asked for your response. Answer if the point still needs one; " +
   "otherwise reply exactly [pass]. This is the final automatically delivered leg: tagging the other agent " +
   "will not schedule another response.)";
+
+function isEntryResult(value) {
+  return !!value && typeof value === "object" && Number.isFinite(Number(value.n));
+}
+
+function causalContinuationInstruction(policy, usedBefore) {
+  return hopInstructionForBudget(policy, usedBefore).replace(HOP_INSTRUCTION, CAUSAL_CONTINUATION_INSTRUCTION);
+}
+
+function causalAnswerRange(reply) {
+  return { sinceN: reply.n, throughN: reply.n, triggerN: reply.n };
+}
+
+// One free answer-return for every successfully launched live request. The
+// caller's reply is returned to the request queue by the owning coordinator,
+// where it must spend hopBudget. Delayed catch-up has no single root budget,
+// so that path opts into a structurally terminal form instead.
+async function deliverCausalAnswer(room, {
+  recipient, reply, rootN, chain, gen, kind = "causal", terminal = false,
+}) {
+  if (!isEntryResult(reply)) return { handled: false, seen: false, entry: null };
+  const range = causalAnswerRange(reply);
+  const outcome = (reason) => persistLurkOutcome(room, recipient, range, reason);
+  const stopped = () => chainHalted(room, chain);
+
+  if (gen !== room.generation) return { handled: true, seen: false, entry: null };
+  if (stopped()) {
+    outcome("closure-stopped");
+    return { handled: true, seen: false, entry: null };
+  }
+  if (room.state.agents[recipient].cursor >= reply.n) {
+    outcome("closed-by-delivery");
+    return { handled: true, seen: true, entry: null };
+  }
+  if (isAsleep(room, recipient)) {
+    noteSleepSkip(room, recipient, "hop", { trigger: reply, sourceN: reply.n });
+    outcome("closure-asleep");
+    return { handled: true, seen: false, entry: null };
+  }
+  if (seatOccupied(room, recipient) && !(await waitForHopSeat(room, recipient, gen, chain))) {
+    if (gen === room.generation) outcome(stopped() ? "closure-stopped" : "closure-wait-aborted");
+    return { handled: true, seen: false, entry: null };
+  }
+
+  // A queued user delivery can carry this reply while closure yields. Cursor
+  // truth, not the reason the seat became free, decides whether work remains.
+  if (gen !== room.generation) return { handled: true, seen: false, entry: null };
+  if (stopped()) {
+    outcome("closure-stopped");
+    return { handled: true, seen: false, entry: null };
+  }
+  if (room.state.agents[recipient].cursor >= reply.n) {
+    outcome("closed-by-delivery");
+    return { handled: true, seen: true, entry: null };
+  }
+  if (isAsleep(room, recipient)) {
+    noteSleepSkip(room, recipient, "hop", { trigger: reply, sourceN: reply.n });
+    outcome("closure-asleep");
+    return { handled: true, seen: false, entry: null };
+  }
+
+  const requested = findHopTarget(room, reply, { allowPlain: true }) === recipient;
+  const instruction = terminal
+    ? (requested ? TERMINAL_CAUSAL_ANSWER_REQUESTED_INSTRUCTION : TERMINAL_CAUSAL_ANSWER_INSTRUCTION)
+    : (requested ? CAUSAL_ANSWER_REQUESTED_INSTRUCTION : CAUSAL_ANSWER_INSTRUCTION);
+  const causalAttention = { terminal, sourceN: reply.n, requested, kind };
+  const result = await runHopTurn(room, recipient, reply, rootN, NO_SCOPE, {
+    chain,
+    phase: terminal ? "closure" : "attention",
+    readOnly: true,
+    signalFailure: true,
+    receiptMode: terminal ? "closure" : "attention",
+    instruction,
+    meta: {
+      // runHopTurn supplies the common reply/cursor machinery, but this call
+      // is the uncharged answer floor rather than a hop-budget launch.
+      hop: false,
+      causalAttention,
+      // Compatibility for Package-12 transcripts/UI while the generic name
+      // rolls out. Only lurk-derived answers carry the legacy shape.
+      ...(String(kind).startsWith("lurk") ? { lurkClosure: causalAttention } : {}),
+    },
+  });
+  if (gen !== room.generation) return { handled: true, seen: false, entry: null };
+  if (result === HOP_FAILED) {
+    outcome("closure-failed");
+    return { handled: true, seen: false, entry: null };
+  }
+  if (result === STEP_STOPPED || stopped()) {
+    outcome("closure-stopped");
+    return { handled: true, seen: false, entry: null };
+  }
+  if (result === SEAT_ASLEEP) {
+    outcome("closure-asleep");
+    return { handled: true, seen: false, entry: null };
+  }
+  const seen = room.state.agents[recipient].cursor >= reply.n;
+  if (!seen) outcome("closure-failed");
+  return { handled: true, seen, entry: isEntryResult(result) ? result : null };
+}
 
 function recordLurkOutcome(room, agent, range, reason) {
   if (!range) return;
@@ -3828,26 +4403,61 @@ function persistLurkOutcome(room, agent, range, reason) {
   return true;
 }
 
-function queueLurkCatchUp(room, agent, sourceN, throughN) {
+function queueLurkCatchUp(room, agent, sourceN, throughN, opts = {}) {
   const seat = room.state.agents[agent];
   if (!seat || isAsleep(room, agent) || !room.cfg.agents[agent].lurk) return false;
   const end = Math.max(Number(throughN) || 0, Number(sourceN) || 0);
-  if (room.state.agents[agent].cursor >= end) return false;
+  const explicitRootNs = (Array.isArray(opts.roots) ? opts.roots : [])
+    .map((n) => Number(n) || 0).filter((n) => n > 0);
+  if (room.state.agents[agent].cursor >= end && !explicitRootNs.length) return false;
   const prior = catchUpState(room, agent);
+  const roots = new Set(prior ? prior.roots : []);
+  const revision = prior ? prior.revision + 1 : 1;
+  const rootRevisions = { ...(prior && prior.rootRevisions ? prior.rootRevisions : {}) };
+  for (const rootN of explicitRootNs) {
+    roots.add(rootN);
+    // Re-adding the same root is a new recovery attempt, not a duplicate of
+    // the catch-up currently in flight. Its newer revision must survive that
+    // older attempt's completion even when no rooted reply bubble was made.
+    rootRevisions[String(rootN)] = revision;
+  }
   seat.pendingCatchUp = {
     // The catch-up invocation receives the full delta, so the honest lower
     // bound is the first entry beyond the seat's cursor, not merely this root.
     sinceN: prior ? prior.sinceN : room.state.agents[agent].cursor + 1,
     throughN: Math.max(prior ? prior.throughN : 0, end),
-    triggerN: Math.max(1, Number(sourceN) || (prior ? prior.triggerN : end)),
-    revision: prior ? prior.revision + 1 : 1,
+    triggerN: Math.max(1, Number(sourceN) || end, prior ? prior.triggerN : 0),
+    revision,
     at: prior ? prior.at : tsLocal(),
+    ...(roots.size ? { roots: [...roots].sort((a, b) => a - b) } : {}),
+    ...(roots.size ? { rootRevisions } : {}),
   };
   saveState(room);
   broadcast(room, { type: "lurk", agent, spoke: false, queued: true });
   broadcast(room, { type: "room", room: roomSummary(room) });
   scheduleCatchUps(room);
   return true;
+}
+
+function pruneAttemptedCatchUpRoots(live, attempt, attemptedRootNs) {
+  const attempted = new Set((attemptedRootNs || []).map((n) => Number(n) || 0));
+  const liveRevisions = live.rootRevisions || {};
+  const attemptRevisions = attempt.rootRevisions || {};
+  const kept = (live.roots || []).filter((rootN) => {
+    if (!attempted.has(rootN)) return true;
+    return (Number(liveRevisions[String(rootN)]) || 0) >
+      (Number(attemptRevisions[String(rootN)]) || 0);
+  });
+  if (kept.length) {
+    live.roots = kept;
+    live.rootRevisions = Object.fromEntries(kept.map((rootN) => [
+      String(rootN), Number(liveRevisions[String(rootN)]) || live.revision,
+    ]));
+  } else {
+    delete live.roots;
+    delete live.rootRevisions;
+  }
+  return live;
 }
 
 function cancelLurkCatchUp(room, agent, reason, opts = {}) {
@@ -3881,7 +4491,7 @@ function maybeRunCatchUp(room, agent) {
   if (room.exchanges > 0 || room.pairActive || room.pending.length || seatOccupied(room, agent)) return;
   if (isAsleep(room, agent)) return cancelLurkCatchUp(room, agent, "asleep");
   if (!room.cfg.agents[agent].lurk) return cancelLurkCatchUp(room, agent, "disabled");
-  if (room.state.agents[agent].cursor >= pending.throughN) {
+  if (room.state.agents[agent].cursor >= pending.throughN && !(pending.roots || []).length) {
     return cancelLurkCatchUp(room, agent, "superseded", { record: false });
   }
   const actionable = catchUpRoots(room, agent, pending);
@@ -3891,15 +4501,21 @@ function maybeRunCatchUp(room, agent) {
 
   const gen = room.generation;
   const before = room.state.agents[agent].cursor;
-  const attempt = { ...pending };
+  const attempt = {
+    ...pending,
+    ...(pending.roots ? { roots: [...pending.roots] } : {}),
+    ...(pending.rootRevisions ? { rootRevisions: { ...pending.rootRevisions } } : {}),
+  };
   const catchUpRootNs = actionable.map((entry) => entry.n);
   const triggerN = catchUpRootNs[catchUpRootNs.length - 1];
   const chain = newChain(room);
   let terminalReason = null;
+  let attemptDelivered = false;
   room.exchanges++;
   Promise.resolve(runListenerTurn(room, agent, triggerN, NO_SCOPE, {
     chain, catchUp: true, catchUpRoots: catchUpRootNs, catchUpThroughN: attempt.throughN,
     onTerminal: (reason) => { terminalReason = reason; },
+    onDelivered: () => { attemptDelivered = true; },
   }))
     .then(async (chime) => {
       // A spoken live lurk earns one right of reply outside hopBudget. A delayed
@@ -3907,15 +4523,67 @@ function maybeRunCatchUp(room, agent) {
       // it structurally: this one return is never inspected for another hop.
       if (!chime || gen !== room.generation || chainHalted(room, chain)) return;
       const target = findHopTarget(room, chime, { allowPlain: true }) || otherSeat(room, chime.author);
+      const returnOutcome = (reason) => persistLurkOutcome(room, target, causalAnswerRange(chime), `request-${reason}`);
       if (isAsleep(room, target)) {
         noteSleepSkip(room, target, "hop", { trigger: chime, sourceN: chime.n });
+        returnOutcome("asleep");
         return;
       }
-      if (seatOccupied(room, target) && !(await waitForHopSeat(room, target, gen, chain))) return;
-      if (gen !== room.generation || chainHalted(room, chain)) return;
-      await runHopTurn(room, target, chime, triggerN, NO_SCOPE, {
-        chain, readOnly: true, instruction: CATCH_UP_RETURN_INSTRUCTION,
-        meta: { catchUpReturn: true },
+      if (seatOccupied(room, target) && !(await waitForHopSeat(room, target, gen, chain))) {
+        if (gen === room.generation) returnOutcome(chainHalted(room, chain) ? "stopped" : "wait-aborted");
+        return;
+      }
+      if (gen !== room.generation) return;
+      if (chainHalted(room, chain)) {
+        returnOutcome("stopped");
+        return;
+      }
+      if (room.state.agents[target].cursor >= chime.n) {
+        persistLurkOutcome(room, target, causalAnswerRange(chime), "closed-by-delivery");
+        return;
+      }
+      if (isAsleep(room, target)) {
+        noteSleepSkip(room, target, "hop", { trigger: chime, sourceN: chime.n });
+        returnOutcome("asleep");
+        return;
+      }
+      const reply = await runHopTurn(room, target, chime, triggerN, NO_SCOPE, {
+        chain, readOnly: true, signalFailure: true,
+        phase: "attention", receiptMode: "attention",
+        instruction: CATCH_UP_RETURN_INSTRUCTION,
+        meta: {
+          hop: false,
+          causalRequest: { sourceN: chime.n, kind: "lurk-catchup-return" },
+          catchUpReturn: true,
+        },
+      });
+      if (gen !== room.generation) return;
+      if (reply === HOP_FAILED) {
+        returnOutcome("failed");
+        return;
+      }
+      if (reply === STEP_STOPPED || chainHalted(room, chain)) {
+        returnOutcome("stopped");
+        return;
+      }
+      if (reply === SEAT_ASLEEP) {
+        returnOutcome("asleep");
+        return;
+      }
+      // A pass/empty reply still advances cursor and closes leg 2 honestly;
+      // only spoken content creates the terminal answer-return leg.
+      if (!isEntryResult(reply)) {
+        if (room.state.agents[target].cursor < chime.n) returnOutcome("failed");
+        return;
+      }
+      await deliverCausalAnswer(room, {
+        recipient: agent,
+        reply,
+        rootN: triggerN,
+        chain,
+        gen,
+        kind: "lurk-catchup",
+        terminal: true,
       });
     })
     .catch(() => { terminalReason ||= "failed"; })
@@ -3925,10 +4593,14 @@ function maybeRunCatchUp(room, agent) {
       // unwind its runtime count, then leave that new state completely alone.
       if (gen !== room.generation) return;
       const live = catchUpState(room, agent);
-      if (room.state.agents[agent].cursor > before) {
-        if (live && room.state.agents[agent].cursor >= live.throughN) {
-          cancelLurkCatchUp(room, agent, "superseded", { record: false });
-        } else if (live) {
+      if (attemptDelivered || room.state.agents[agent].cursor > before) {
+        if (live) {
+          pruneAttemptedCatchUpRoots(live, attempt, catchUpRootNs);
+          if (room.state.agents[agent].cursor >= live.throughN && !(live.roots || []).length) {
+            cancelLurkCatchUp(room, agent, "superseded", { record: false });
+            scheduleCatchUps(room);
+            return;
+          }
           live.sinceN = room.state.agents[agent].cursor + 1;
           room.state.agents[agent].pendingCatchUp = live;
           saveState(room);
@@ -3943,10 +4615,11 @@ function maybeRunCatchUp(room, agent) {
         // exchange may have extended the obligation while the adapter was
         // running; retain that newer tail instead of silently deleting it.
         recordLurkOutcome(room, agent, attempt, reason);
-        const extended = live.throughN > attempt.throughN;
+        const extended = live.throughN > attempt.throughN || live.revision > attempt.revision;
         if (extended) {
           // The attempted range is terminal and gets no automatic retry. Keep
           // only entries appended after its upper bound as the newer obligation.
+          pruneAttemptedCatchUpRoots(live, attempt, catchUpRootNs);
           live.sinceN = Math.max(room.state.agents[agent].cursor + 1, attempt.throughN + 1);
           room.state.agents[agent].pendingCatchUp = live;
         } else {
@@ -4334,8 +5007,7 @@ function wakeAndDeliver(room, agent) {
   // other half of that @both, and it runs under the boundary that message had.
   const scope = makeScope(room, root.n, root.target, boundary);
   clearWithdrawals(room, root.n, [agent]); // it is being delivered after all
-  Promise.allSettled([runAgentTurn(room, agent, root, scope, { heldCount: held.length })])
-    .then(() => drainLanes(room));
+  startRecoveredDelivery(room, root, [agent], scope, { heldCount: held.length });
   return { ...result, delivered: true, deliveredN: root.n };
 }
 
@@ -4432,7 +5104,7 @@ function handleRetry(room) {
   // it latched, so a Work→Talk flip since the failure cannot widen this retry.
   const scope = makeScope(room, lu.n, lu.target, lu.discussion);
   clearWithdrawals(room, lu.n, targets); // it is being delivered after all
-  Promise.allSettled(targets.map((a) => runAgentTurn(room, a, userTurn, scope))).then(() => drainLanes(room));
+  startRecoveredDelivery(room, userTurn, targets, scope);
 }
 
 // Stop is four different intentions, not one button with a guess attached:

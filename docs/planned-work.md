@@ -116,7 +116,14 @@ room eats a 429.
   leaves it as ordinary context. The choice has three outcomes counting "not now", which
   is one more than a confirm dialog can express — its Cancel would have to double as one
   of the two wakes. Wake & deliver preflights (`pairActive`/`seatOccupied`) *before*
-  clearing sleep, so a refusal leaves the held work provably still held.
+  clearing sleep, so a refusal leaves the held work provably still held. **Extended in
+  protocol 9:** every Wake & deliver attempt rejoins the original root's causal
+  request/answer coordinator. An already-successful direct-root `@both` sibling receives
+  a successfully recovered half structurally; failure and Stop never qualify a missing half
+  for that sibling relay. Independently, a recovered single-seat attempt honors enabled lurk
+  after it settles even on failure, `[pass]` or no bubble, persisting an explicit-root
+  catch-up when the listener is busy. Explicit Stop ends the chain and records the terminal
+  listener disposition instead of launching downstream work.
   Per-message discard of a held message is **not** in this package — it belongs with
   Package 3's queue controls, which already own the discard vocabulary. Wake only is the
   escape hatch until then.
@@ -263,10 +270,10 @@ radius of one click flips on sub-second timing the user cannot see.
 
 ---
 
-## Package 6 — Mention parsing and final-hop warning (built in the working tree, uncommitted 2026-08-10)
+## Package 6 — Mention parsing and final-hop warning (built 2026-08-10)
 
-Implemented in the current working tree; **not committed or shipped**. The routing mask
-lives beside `findHopTarget`, and the per-turn warning is composed at the hop launch site.
+Implemented and shipped in PR #4. The routing mask lives beside `findHopTarget`, and the
+per-turn warning is composed at the hop launch site.
 The broader budget vocabulary and composer control that made the warning user-selectable
 are recorded separately in Package 11.
 
@@ -350,9 +357,9 @@ living only in chat.
 
 ---
 
-## Package 10 — Guaranteed lurk catch-up (built in the working tree, uncommitted 2026-08-10)
+## Package 10 — Guaranteed lurk catch-up (built 2026-08-10)
 
-Implemented in the current working tree; **not committed or shipped**.
+Implemented and shipped in PR #4.
 
 **The bug.** The audience snapshot already recorded that a seat was selected to lurk, but
 the fan-out checked `seatOccupied` only once, after the addressed exchange finished. A
@@ -372,11 +379,13 @@ lurking seat “overhears every exchange.”
   user exchange, Pair cycle and queued delivery has settled and the seat is free. User
   work therefore always wins.
 - **One full-delta attempt.** The listener sees the whole chronological delta rather than
-  a frozen, stale slice for each missed exchange. Only user roots whose accepted audience
-  selected this seat to lurk are marked actionable; Solo and otherwise-unselected traffic
-  remains context-only, so it can prove that a concern became stale without becoming a
-  reason to interject. A normal successful turn that already advances the seat's cursor
-  through the recorded range supersedes the obligation before it launches.
+  a frozen, stale slice for each missed exchange. User roots whose accepted audience
+  selected this seat to lurk are marked actionable; protocol-9 recovery may also attach an
+  explicit root when a held/retried single-seat exchange first becomes eligible for lurk at
+  delivery time. Solo and otherwise-unselected traffic remains context-only, so it can prove
+  that a concern became stale without becoming a reason to interject. A normal successful
+  turn that already advances the seat's cursor through the recorded range supersedes the
+  obligation before it launches.
 - **One attempt, no retry loop.** Speaking and `[pass]` both advance the cursor and write
   the ordinary lurk receipt. Before launch, sleep or disabling lurk cancels the pending
   obligation and records why; an already-running catch-up follows Sleep's ordinary
@@ -389,9 +398,10 @@ lurking seat “overhears every exchange.”
   “hasn't seen this yet”; after a terminal outcome they say why it did not run. A later
   receipt or cursor advance outranks that historical outcome, so status repairs itself
   without destructive cleanup.
-- **One bounded return.** If the delayed listener speaks, the other seat gets one read-only
-  right of reply after its user lane clears. That return is outside `hopBudget` and final:
-  it is not scanned for another automatic tag, so catch-up cannot create a ping-pong loop.
+- **One structurally terminal closure.** If the delayed listener speaks, the other seat gets
+  one read-only right of reply after its user lane clears, and that answer returns once to
+  the original lurker. Both deliveries are outside `hopBudget`; the answer return is final
+  and is never scanned for another automatic tag, so catch-up cannot create a ping-pong loop.
 
 This supersedes Package 1's earlier rationale that an occupied lurker could simply be
 skipped because “the delta catches it up later.” Delta delivery preserves the text, but
@@ -399,49 +409,192 @@ without a later invocation it does not preserve the promise to overhear.
 
 ---
 
-## Package 11 — Per-message hop control and Solo (built in the working tree, uncommitted 2026-08-10)
+## Package 11 — Per-message hop control and Solo (built 2026-08-10)
 
-Implemented in the current working tree; **not committed or shipped**. This is the live
-composer control requested for questions where the user wants to shorten or suppress an
-agent debate without changing the room for later messages.
+The base implementation shipped in PR #4. The composer control was then revised from a
+one-message override to a sticky per-room browser-session shortcut: it can shorten or suppress
+agent debate across several messages without editing the room's persisted default.
 
 - **Unambiguous room config.** New `hopBudget` uses one vocabulary: `-1` means `∞` / until
-  settled under the emergency safety ceiling, `0` means no agent-to-agent handoffs, and
-  any positive whole number is an exact launch limit. Settings accepts any safe integer,
-  while the compact composer offers quick one-message choices through `8`. The old `maxHops` key used `0` for “until settled”; a
+  settled under the emergency safety ceiling, `0` means no charged agent-to-agent requests,
+  and any positive whole number is an exact charged-launch limit. Settings accepts any safe integer,
+  while the compact composer offers sticky per-room shortcut choices through `8`. The old `maxHops` key used `0` for “until settled”; a
   new key makes migration idempotent, translating legacy zero to `hopBudget: -1` and
   preserving the old meaning for older clients that still submit `maxHops`. `pairRounds`
   is deliberately unchanged: Pair cycles consult it and never `hopBudget`.
-- **Snapshotted per message.** The control beside the composer offers **Room default**,
-  **Solo**, `∞`, and `0`–`8`. An override is stored on the accepted user entry, so changing
-  Settings or the next message's control cannot rewrite a queued exchange. It resets to
-  Room default only after the next accepted user message; a failed send preserves the choice,
-  and taskless Pair start/end controls do not consume it.
+- **Sticky shortcut, snapshotted per message.** The control beside the composer offers
+  **Room default**, **Solo**, `∞`, and `0`–`8`. Its choice remains selected across sends and
+  reloads for that room during the current browser session; switching rooms restores that room's
+  own shortcut. Each accepted user entry stores an immutable policy snapshot, so changing Settings
+  or the composer shortcut cannot rewrite a queued or running exchange; taskless Pair start/end
+  controls carry no relay policy.
 - **Server-authoritative counting.** Models do not count their own tags. The relay charges
-  only an invocation it actually launches: the user's initial addressed turn is free; an
+  only a charged request invocation it actually launches: the user's initial addressed turn is free; an
   asleep target or a late seat that already read the trigger spends nothing; a launched
-  call that later fails still spends one. At the cap, the target is not invoked, but the
-  tagging reply remains in the transcript and reaches it later as ordinary context.
-- **Guidance and live feedback.** Finite turns are told how many handoffs remain, the last
-  allowed turn is labelled final, and the `∞` path gets the same warning at the emergency
-  safety edge. A live counter beside the composer reports launched handoffs for the latest
-  active exchange, and the capped transcript note distinguishes an intentional limit from
-  the safety stop.
-- **Solo is not budget zero.** `0` still permits a configured lurker and its structurally
-  bounded right of reply. Solo suppresses both lurk and agent handoffs so exactly one
+  call that later fails still spends one. Package 12 adds structural requests and one free
+  answer return per launched request; neither increments this counter. At the cap, the target
+  is not invoked, but the triggering reply remains in the transcript and reaches it later as ordinary context.
+- **Durable per-root accounting.** Charged launches are persisted in `state.json` by the
+  original user entry, so Wake & deliver and Retry resume the already-spent count instead of
+  granting the same question a fresh budget. `relayUsage` is execution history rather than a
+  second transcript: it retains the newest 200 inactive charged roots plus any older root that
+  is still active, held or retryable, bounding growth without evicting an unresolved cap.
+- **Guidance and live feedback.** Finite charged turns are told how many handoffs remain,
+  and the `∞` path gets the same warning at the emergency
+  safety edge. A live **Hops used · limit** counter beside the composer reports launched
+  charged requests against the latest active exchange's starting snapshot—not the shortcut currently
+  selected for later messages—and the capped transcript note distinguishes an intentional
+  limit from the safety stop.
+- **Solo is not budget zero.** `0` still permits a configured lurker's structural right of
+  reply, successful `@both` sibling attention, and answer returns already owed. Solo suppresses
+  both lurk and agent handoffs so exactly one
   selected seat responds. It is rejected for `@both` and Pair turns. The other seat is
   excluded from reacting, not from history: it can still read the message in a later
   delta, and no lurk catch-up obligation is created for the deliberate exclusion.
 - **Separate accounting domains.** A lurker's spoken chime-in earns the other seat one
-  bounded right of reply outside `hopBudget`. A live lurk's further explicit tag is
-  budgeted normally; a delayed coalesced catch-up's single return is final because there
-  is no one original message budget to resume. Pair review/fix rounds remain governed by
-  `pairRounds`.
+  bounded right of reply outside `hopBudget`. Under Package 12, the answer returns to the
+  live lurker once for free and any speech from that floor becomes the next charged request.
+  A delayed coalesced catch-up remains terminal because there is no one original message
+  budget to resume. Pair review/fix rounds remain governed by `pairRounds`.
 
-The runtime protocol moves 6 → 7 with this working-tree implementation because room
+The runtime protocol moved 6 → 7 with the shipped implementation because room
 summaries now expose catch-up status, terminal lurk outcomes and live hop progress, while
 accepted user entries carry their immutable relay policy. That internal stale-tab fence
 is not a package semver decision.
+
+---
+
+## Package 12 — Generalized causal attention relay (built in the working tree, uncommitted; protocol 9)
+
+**A request is delivered when eligible. Every launched request earns one free answer return.
+New speech from that floor becomes the next budgeted request. A structural terminal is the
+only deliberate exception.**
+
+The package began with a lurk-specific defect: a listener could raise an issue, the other
+seat could answer, and the listener would never receive that answer. The same missing edge
+then appeared in an ordinary hop — A called B, B answered without tagging A back — and in
+concurrent `@both` replies whose bubbles landed in transcript order even though both provider
+turns used the earlier user-message snapshot. A lurk-only closure fixed one symptom; protocol
+9 expresses the common causal rule.
+
+**The contract remains hybrid.** Prompt text cannot deliver an answer to a seat that was
+never invoked, while the server cannot decide whether a delivered answer deserves speech:
+
+- **The server owns** immutable turn boundaries, causal ancestry, user-lane priority, cursor
+  truth, deduplication, request accounting, answer return, caps and structural termination.
+- **The agent owns** relevance and whether speaking adds value. `[pass]` is always legal,
+  including when another agent explicitly requested attention.
+- **Tags request; they do not self-route.** A tag raises salience, but the server decides
+  whether the request is charged, structural, already delivered, capped or terminal.
+
+**Never inject into a running provider turn.** Each turn keeps the delta snapshot accepted
+at launch. Activity that lands while it is running stays behind the cursor until a safe
+boundary. This is why an `@both` reply can appear above its sibling in the transcript without
+having been in that sibling's prompt; screen position is not delivery evidence.
+
+### Protocol-9 request/answer model
+
+The causal coordinator (`parley.mjs:3439-3676`) drains two explicit work lists for live and
+recovered roots:
+
+- A **request** is an agent entry owed to one peer. **Charged** requests are explicit agent
+  calls and implicit continuations spoken from a returned causal answer; they consume one
+  `hopBudget` unit only when the target launches. **Structural** requests are safe-boundary
+  delivery between successful initial `@both` siblings and a live lurker's one right of
+  reply; their existing shape bounds them, so they survive a zero/exhausted hop budget.
+- An **answer return** is owed once to the immediate caller of every successfully launched
+  request that produced a real reply entry. `deliverCausalAnswer` (`parley.mjs:4284-4366`)
+  performs that return read-only and without charging the budget. An explicit tag in the
+  answer raises salience but does not charge the same delivery twice.
+- If the answer-return turn says `[pass]`, the exchange settles. If it speaks, that entry
+  becomes the next **charged continuation** to the agent who supplied the answer; no new
+  `@tag` is required. That next request, if launched, earns its own free answer return.
+
+The finite accounting rule is therefore: **one counted hop can mean up to two provider
+invocations** — the charged request and its free answer return. Speech from that floor needs
+the next hop. `-1` still uses the emergency safety ceiling; `0` blocks every new charged
+request but not a structural request or an answer already owed by a request that launched.
+
+**Eligibility stays narrow.** A single-addressed initial reply that neither tags nor calls
+the other seat does not wake that unrelated peer; otherwise lurk and Solo would lose their
+meaning and every one-seat answer would cost another call. By contrast, after both initial
+`@both` provider turns succeed, each reply is delivered to its sibling exactly once at the
+safe boundary, even at `hopBudget: 0`. A cancelled, sleeping or failed half is not resurrected
+under the sibling rule, because that would bypass withdrawal or become an automatic retry.
+
+**Wake/Retry recovery rejoins, rather than bypasses, the coordinator.**
+`startRecoveredDelivery` (`parley.mjs:3691-3802`) launches the still-eligible half under the
+original user entry, relay-policy snapshot and persisted charged-use count, then feeds successful
+replies into the same request/answer queues. Recovery therefore resumes the root's remaining
+budget rather than restarting its counter:
+
+- For a recovered `@both` half, structural sibling delivery requires a durable successful
+  agent entry whose `replyTo` is this exact user root. A high cursor is deliberately
+  insufficient: unrelated later work must not make a failed or stopped direct half look
+  successful and resurrect it as an automatic call.
+- For a recovered single-seat root, enabled lurk is evaluated at the post-attempt safe
+  boundary whether the addressed provider spoke, returned `[pass]`, failed or produced no
+  bubble. A free listener runs then; an occupied listener receives the usual
+  persisted, coalesced catch-up with the recovered root explicitly attached as actionable.
+  This matches ordinary live lurk fan-out and closes the audience-snapshot gap created when
+  the original message was held before lurk selection. Explicit Stop ends the chain instead
+  and records `stopped` for eligible listeners; it never launches downstream work.
+- A failed recovered launch creates no reply entry, no sibling qualification and no
+  answer-return obligation, but it does not suppress that single-seat lurk fan-out.
+  Recovery is one deliberate user action, never a general automatic-retry license.
+- Initial providers for one `@both` root may overlap, but causal settlement is serialized by
+  that root. The later boundary re-reads exact direct-root replies and cursor-deduplicates both
+  directions, so Wake cannot make two valid siblings miss each other or let two coordinators
+  spend the same remaining hop.
+- An explicit recovered-root catch-up carries a per-root revision. Re-opening that same root
+  while an older catch-up is in flight survives the older attempt even when the numeric delta
+  range did not grow; only the revision actually attempted is retired.
+
+**Live lurk uses the same model.** A spoken chime creates one structural right-of-reply
+request; its answer returns to the lurker once for free. If the lurker speaks from that
+answer floor, the speech is the next charged continuation rather than an unbounded free leg.
+
+**Delayed coalesced lurk catch-up stays structurally terminal.** `pendingCatchUp` may merge
+several roots and therefore has no single original `hopBudget` to resume. Its spoken catch-up
+gets one structural, read-only right of reply and one read-only answer return to the original
+lurker (`parley.mjs:4486-4633`). That answer return is terminal: tags remain visible text but
+schedule nothing, and there is no fourth leg. This is a deliberate exception, not an
+accidental missing delivery.
+
+**Cursor truth and status are load-bearing.** Before a request or answer return launches,
+the coordinator rechecks whether another full-delta turn already carried the entry. A
+successful delivery, `[pass]`, sleep skip, Stop, provider failure or aborted seat wait is
+handled once rather than automatically retried. `cappedTargets` records the exact charged
+requests that could not launch; cursor reconciliation runs before the durable cap entry, so
+the transcript never says an entry was withheld after another delivery already carried it.
+Generic `causalAttention` metadata and closure receipts distinguish a free answer return
+from a charged hop. Terminal delayed-catch-up bubbles say the structural chain ended instead
+of falling through to “hasn't seen this yet.”
+
+The initial lurk-only closure draft moved runtime protocol 7 → 8. Generalizing its metadata,
+cap state and UI contract to live causal requests and recovered Wake/Retry roots moves the
+current working tree 8 → 9.
+These are stale-tab fences, not package-semver events.
+
+**Verification pinned in the smoke suite:**
+
+- a charged request's untagged answer returns once to its caller for free;
+- a tagged answer uses that same free return rather than being charged twice;
+- speech from the answer floor becomes a charged continuation without an `@tag`;
+- the final charged request still earns its answer return, while further speech stops at cap;
+- `hopBudget: 0` blocks a new charged request but not structural sibling/lurk delivery;
+- a single-seat untagged reply does not wake an unrelated non-lurking peer;
+- successful concurrent `@both` siblings each receive the other exactly once at a safe boundary;
+- Wake & deliver and Retry rejoin the causal scheduler under the original root policy;
+- a recovered root resumes its durable charged-use count rather than receiving a fresh hop budget;
+- a recovered `@both` half reaches an already-successful direct-root sibling, but never a
+  failed or stopped half or a seat qualified only by an unrelated high cursor;
+- a recovered single-seat attempt runs enabled lurk after failure, `[pass]` or no bubble,
+  or persists an explicit-root catch-up when that listener is busy; explicit Stop instead
+  ends downstream work and records the terminal disposition;
+- `[pass]`, failure, Stop, sleep, wait abort and cursor supersession do not create retries;
+- live and delayed causal answer turns remain read-only in Work rooms; and
+- delayed catch-up's terminal answer can never create another automatic leg.
 
 ---
 
@@ -459,9 +612,11 @@ the reliable test if that ever stops being true.
    relative path, npm resolves relative paths against the default branch, and that file
    was deleted in `735b0b8`. The republish fixed the images and the tarball is now five
    files. Kept here for the record — nothing in this step is outstanding.
-2. **`1.1.0` — minor, the feature batch above.** The working tree currently contains
-   Packages 1, 6, 10 and 11; none is committed or shipped. The remaining 1–5 work is
-   still additive. Package 11 replaces room config `maxHops` with `hopBudget`, but it is a
+2. **`1.1.0` — minor, the feature batch above.** Packages 1, 6, 10 and the base Package 11
+   implementation shipped in PR #4 (`5021b3a`); Package 11's sticky per-room shortcut
+   follow-up remains uncommitted on the current branch. The remaining Packages 2–5 work remains open,
+   and Package 12's generalized causal relay is built but uncommitted. Package 11 replaces
+   room config `maxHops` with `hopBudget`, but it is a
    backward-compatible migration rather than a break: legacy rooms are rewritten on
    load (`maxHops: 0` keeps its old “until settled” meaning as `hopBudget: -1`) and older
    clients posting `maxHops` retain the legacy semantics. No room on disk stops loading
@@ -469,7 +624,8 @@ the reliable test if that ever stops being true.
 3. **Not a major.** `2.0.0` should be reserved for something that actually breaks a user:
    a room-state format that old versions cannot read, a renamed CLI flag, a changed
    default permission scope. Nothing here does that. The internal runtime protocol moved
-   5 → 6 for Sleep and is 7 in the current working tree for catch-up and relay progress;
+   5 → 6 for Sleep, 7 shipped in PR #4 for catch-up and relay progress, and is 9 in the
+   current working tree for generalized causal-attention, cap and answer-return state;
    that is a stale-tab reload fence, not a semver event — the two numbers are unrelated
    and should stay that way.
 
@@ -481,9 +637,10 @@ working tree. Nothing should be held hostage to scope growth in a later package.
 |---|---|---|
 | 1 | ~~Sleep (1)~~ **built**, durable status model (2), stop-button semantics (5) | Sleep landed first and depended on nothing in package 2, as predicted — its skip is its own `appendEntry`, and the existing `broadcast(… skipped: true)` sites covered the UI half. **Runtime protocol 5 → 6 landed with it**, for exactly the predicted reason: the summary now carries each seat's sleep state, and its pending-backlog count while asleep. Package 5 depends on nothing at all and is ~3 lines plus a rewrite of `test/smoke.mjs:1175-1182`; it goes early because it is the highest-frequency interaction in the app and is otherwise the first thing to slip. |
 | 2 | `dispatchFromSource` (4), queue controls (3), Ask again / Redirect (4) | The single-head-of-lane-producer invariant must be enforced **when the primitive lands**, not retrofitted after Retry is already calling it. Packages 3 and 4 are the ones that render into package 2's amber and per-seat status. |
-| 3 | ~~Mention masking and final-hop warning (6)~~ **built**, parked UI items (7) | Package 6 is present but uncommitted. The unrelated parked UI set can still slip without cost. |
-| Relay/lurk extension | ~~Guaranteed lurk catch-up (10), per-message hop control and Solo (11)~~ **built** | Present in the working tree, uncommitted and unshipped. Runtime protocol 6 → 7 lands with this slice because summaries add catch-up/outcome/progress state. |
+| 3 | ~~Mention masking and final-hop warning (6)~~ **shipped in PR #4**, parked UI items (7) | The unrelated parked UI set can still slip without cost. |
+| Relay/lurk extension | ~~Guaranteed lurk catch-up (10), per-message hop control and Solo (11 base)~~ **shipped in PR #4**; Package 11 sticky shortcut follow-up and generalized causal attention (12) **built, uncommitted** | Runtime protocol 6 → 7 shipped with Packages 10–11 because summaries added catch-up/outcome/progress state. Package 12's initial closure receipt used 8; the generalized charged/structural request and answer-return scheduler moves the current working tree to 9. |
 
 If stage 2 or the remaining stage-3 UI work grows, the completed built slices can still
 ship as `1.1.0` and the rest move to `1.2.0`. Nothing in Packages 3–5 or 7 needs to change
-for Packages 1, 6, 10 and 11 to stand on their own.
+for the shipped Packages 1, 6, 10 and 11 to stand on their own. Package 12 is a later
+relay/lurk extension and does not gate that shipped slice.
