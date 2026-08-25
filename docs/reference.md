@@ -12,7 +12,7 @@ parley [--port N] [--root DIR] [--no-open]
 - `--root DIR` — where room folders live, default `~/.parley`.
 - `--no-open` — don't launch a browser.
 
-After updating, restart the running Parley process before reloading the page — builds pin the UI to the backend that served it, and an older server meeting a newer page blocks its controls and shows a persistent **Restart Parley** warning instead of silently mixing runtime versions.
+After updating, restart the running Parley process before reloading the page — builds pin the UI to the backend that served it, and an older server meeting a newer page blocks its controls and shows a persistent **Restart Parley** warning instead of silently mixing runtime versions. The current source uses internal runtime protocol **9**, covering generalized causal-attention and relay-cap state plus recovered Wake/Retry integration. That number is a stale-tab compatibility fence, not Parley's package version or a public API version.
 
 ## The room folder
 
@@ -20,8 +20,8 @@ Each room is a folder under `~/.parley/<room>/`:
 
 ```
 room.json        config (see below)
-state.json       sessions, per-agent cursors, per-seat sleep and persisted lurk catch-up state
-events.jsonl     machine-readable transcript (source of truth)
+state.json       sessions, per-agent cursors, per-seat sleep and persisted lurk catch-up/outcome state
+events.jsonl     machine-readable transcript and delivery/causal-answer receipts (source of truth)
 transcript.md    human-readable transcript (what "Download transcript" serves)
 workspace/       shared folder; both agent CLIs run with this as cwd
 ```
@@ -44,7 +44,7 @@ workspace/       shared folder; both agent CLIs run with this as cwd
 - **`model`** overrides the CLI's default model (`--model` / `-m`) and **`effort`** sets reasoning effort (claude `--effort`, codex `model_reasoning_effort`). Both are **free-text comboboxes**, and the suggestions are discovered rather than hardcoded: Codex maintains `~/.codex/models_cache.json`, so Parley lists exactly the models your CLI knows about and the reasoning levels each supports — new OpenAI models appear without a Parley update. Claude Code keeps no such list, so its suggestions are static aliases (`opus`, `sonnet`, …) plus the effort levels including `ultracode`. Anything you type is passed straight through; an unrecognized value simply comes back as the CLI's own error in the chat.
 - **`command`** lets you point a seat at a different binary or path.
 - **`lurk`** / **`lurkStyle`** / **`lurkPrompt`** — see [conversation.md](conversation.md#lurk-mode-).
-- **`hopBudget`** controls agent-to-agent handoffs per user message: `-1` means until settled (with the emergency safety stop), `0` means none, and any positive integer is an exact limit. Rooms written with the legacy `maxHops` key are migrated on load; its old `0 = until settled` becomes `hopBudget: -1`. Settings accepts any safe whole number; the one-message composer control deliberately offers only quick overrides through `8` without editing `room.json`.
+- **`hopBudget`** controls **charged request launches** per user message: `-1` means until settled (with the emergency safety stop), `0` means no charged launches, and any positive integer is an exact limit. Explicit agent calls and continuations spoken from a returned answer are charged; safe-boundary `@both` sibling delivery and a live lurker's right of reply are structural and do not consume the counter. Every launched request that produces an answer also earns one free, read-only return to its immediate caller, so one counted hop can mean up to two provider invocations. Charged usage is durable per user-message root: Wake & deliver and Retry resume the already-spent count, while `state.json` keeps the newest 200 inactive charged roots plus any older root that is still active, held or retryable. Rooms written with the legacy `maxHops` key are migrated on load; its old `0 = until settled` becomes `hopBudget: -1`. Settings accepts any safe whole number; the sticky per-room composer shortcut deliberately offers only quick overrides through `8` without editing `room.json`. See [Agent-to-agent hops & right of reply](conversation.md#agent-to-agent-hops--right-of-reply) for the full scheduler.
 - **`pairRounds`** is separate from `hopBudget`: `0` means review until approved, while a positive value caps Pair fix/review rounds.
 - **`permissionMode`** (Claude) and **`sandbox`** (Codex) — see [permissions.md](permissions.md).
 
@@ -99,7 +99,11 @@ Attachment-only messages work too, Retry reuses the same stored bytes, and a fai
 
 Live "thinking…" indicators and streamed reply text; markdown rendering with copy-able code blocks; multiple rooms in the sidebar, each with its own config, sessions and transcript; **New conversation** to archive the transcript and reset both agents' sessions; a **Retry** button on failed turns; hover any message for a copy button; very long replies collapse with "Show more"; the tab title shows ● when replies land while you're in another window; and one click to **download the room transcript as Markdown** or **open the shared workspace folder**.
 
-The hops control beside the composer applies to the **next accepted user message**: Room default, Solo, `∞`, or `0`–`8`. A taskless `/pair start` or `/pair end` changes Pair mode without consuming that choice. Solo permits exactly one selected responder for that message, so it cannot be combined with `@both` or a Pair turn; the suppressed seat can still receive the message later as ordinary transcript context. While an exchange is active, the adjacent status shows server-counted launched handoffs against that message's snapshotted budget.
+The hops control beside the composer is a sticky per-room browser-session shortcut: Room default, Solo, `∞`, or `0`–`8`. The selected policy survives page reloads and is snapshotted onto every accepted user message until the user changes it; taskless `/pair start` and `/pair end` controls carry no relay policy. Solo permits exactly one selected responder for a message, so it cannot be combined with `@both` or a Pair turn; the suppressed seat can still receive the message later as ordinary transcript context. While an exchange is active, the adjacent **Hops used · limit** status shows server-counted **charged request launches** against that exchange's immutable starting budget. Structural requests and the one free answer return owed by each launched request do not increment it. Changing the shortcut never rewrites a running or queued exchange.
+
+**Wake & deliver and Retry reuse the original user entry, its relay-policy snapshot and its durable charged-use count.** The recovery attempt rejoins the same protocol-9 causal scheduler as live work with the original root's remaining budget; it does not reset the cap. A successful recovered `@both` half structurally reaches only a sibling with a successful direct reply to that exact root; a cursor advanced by unrelated work cannot resurrect a failed or stopped half. A recovered single-seat attempt honors enabled lurk after it settles even if the addressed provider failed, passed or produced no bubble, and a busy listener receives a persisted catch-up obligation carrying that root explicitly. Explicit Stop ends the chain and records the terminal disposition instead of launching lurk. **Wake only** launches nothing and therefore creates none of these relay obligations.
+
+Causal settlement is serialized per original root, so overlapping live/recovered `@both` halves cannot miss one another or double-spend. Explicit recovered-root catch-up obligations are versioned, which prevents an older in-flight attempt from erasing a newer attempt for the same user message.
 
 ## Adding a provider
 

@@ -34,7 +34,7 @@ function ok(name, cond, detail) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 let TOKEN = ""; // read out of the served page, exactly as the browser does
-const RUNTIME_PROTOCOL = "7";
+const RUNTIME_PROTOCOL = "9";
 
 async function api(method, route, body) {
   const res = await fetch(base + route, method === "GET"
@@ -171,7 +171,7 @@ function localStamp(date = new Date()) {
 const texts = (d, kind) => d.entries.filter((e) => !kind || e.kind === kind).map((e) => e.text);
 const lastAgent = (d, author) => [...d.entries].reverse().find((e) => e.kind === "agent" && (!author || e.author === author));
 const argvFrom = (entry) => {
-  const text = entry && String(entry.text || "");
+  const text = String(entry && entry.text || "");
   if (!text.startsWith("ARGVJSON ")) return [];
   try { return JSON.parse(text.slice(9)); } catch { return []; }
 };
@@ -924,6 +924,48 @@ async function checkFolderPickerUi() {
   ok("clearing the withdrawal immediately restores the ordinary receipt dot",
     probe.heard("claude", 4)?.cls === "live", JSON.stringify(probe.heard("claude", 4)));
 
+  uiSummary.busy = [];
+  uiSummary.cancelledDeliveries = {};
+  uiSummary.agents.claude.cursor = 0;
+  uiSummary.agents.codex.cursor = 0;
+  probe.seedRoom(uiSummary, [
+    { n: 4, kind: "agent", author: "claude", ts: "2026-08-05T02:02:00", text: "the answer", meta: {} },
+    { n: 5, kind: "agent", author: "codex", ts: "2026-08-05T02:03:00", text: "closure", meta: {
+      replyTo: 4, lurkClosure: { terminal: true, sourceN: 4, requested: false },
+    } },
+  ], [{ agent: "codex", from: 0, upTo: 4, turn: 1, mode: "closure", spoke: true,
+    ts: "2026-08-05T02:03:00" }]);
+  ok("closure receipt copy identifies the causal delivery",
+    /causal answer delivered/.test(probe.heard("codex", 4)?.title || ""),
+    JSON.stringify(probe.heard("codex", 4)));
+  ok("a terminal closure bubble does not look like an outstanding automatic delivery",
+    /deliberately closed here/.test(probe.heard("claude", 5)?.title || ""),
+    JSON.stringify(probe.heard("claude", 5)));
+
+  probe.seedRoom(uiSummary, [
+    { n: 6, kind: "agent", author: "claude", ts: "2026-08-05T02:04:00", text: "causal answer", meta: {} },
+  ], [{ agent: "codex", from: 0, upTo: 6, turn: 1, mode: "attention", spoke: false,
+    ts: "2026-08-05T02:05:00" }]);
+  ok("a silent attention receipt says the causal message was delivered with nothing to add",
+    probe.heard("codex", 6)?.cls === "passed" &&
+    /causal message delivered.*nothing to add/.test(probe.heard("codex", 6)?.title || ""),
+    JSON.stringify(probe.heard("codex", 6)));
+
+  uiSummary.busy = ["codex"];
+  uiSummary.lurkOutcomes = [{
+    agent: "codex", fromN: 7, throughN: 7, triggerN: 7,
+    reason: "request-wait-aborted", at: "2026-08-05T02:06:00",
+  }];
+  probe.seedRoom(uiSummary, [
+    { n: 7, kind: "agent", author: "claude", ts: "2026-08-05T02:06:00", text: "undelivered request", meta: {} },
+  ]);
+  ok("a terminal causal-request wait abort outranks an unrelated busy indicator",
+    probe.heard("codex", 7)?.cls === "unheard" &&
+    /causal request could not obtain the seat; no automatic retry/.test(probe.heard("codex", 7)?.title || ""),
+    JSON.stringify(probe.heard("codex", 7)));
+  uiSummary.busy = [];
+  uiSummary.lurkOutcomes = [];
+
   // Inline routing wins on the server. Once that answer comes back, the chip
   // must follow it so the next untagged send does not accidentally stay @both.
   let sentBody = null;
@@ -1210,6 +1252,26 @@ function checkWakeMenuUi() {
 
 async function checkSoloPairControlUi() {
   const src = fs.readFileSync(path.join(here, "..", "ui", "index.html"), "utf8");
+  const storageFrom = src.indexOf("const hopChoiceStorageKey");
+  const storageTo = src.indexOf("const state = {", storageFrom);
+  const storageBlock = storageFrom >= 0 && storageTo > storageFrom ? src.slice(storageFrom, storageTo) : "";
+  const saved = new Map();
+  const sessionStorage = {
+    getItem: (key) => saved.has(key) ? saved.get(key) : null,
+    setItem: (key, value) => saved.set(key, String(value)),
+  };
+  let storedHopChoice = null, rememberHopChoice = null;
+  try {
+    ({ storedHopChoice, rememberHopChoice } = new Function("sessionStorage",
+      `${storageBlock}\nreturn { storedHopChoice, rememberHopChoice };`)(sessionStorage));
+  } catch { /* assertion below reports extraction failure */ }
+  if (rememberHopChoice) rememberHopChoice("room-a", "3");
+  ok("the sticky hop shortcut survives reloads without leaking into another room",
+    !!storedHopChoice && storedHopChoice("room-a") === "3" &&
+    storedHopChoice("room-b") === "default" &&
+    src.includes("state.hopChoice = storedHopChoice(roomName)"),
+    JSON.stringify(Object.fromEntries(saved)));
+
   const from = src.indexOf("function pairControlOnly(");
   const to = src.indexOf("function closeHopMenu(", from);
   const block = from >= 0 && to > from ? src.slice(from, to) : "";
@@ -1254,10 +1316,9 @@ async function checkSoloPairControlUi() {
   const sendBlock = sendFrom >= 0 && sendTo > sendFrom ? src.slice(sendFrom, sendTo) : "";
   const input = { value: "/pair start @claude" };
   const sentBodies = [];
-  let policyResets = 0;
   Object.assign(state, {
     room: "r", sending: false, draftImages: [], draftFiles: [],
-    resyncVersion: 0, chipRevision: 0, hopRevision: 0, sendVersion: 0,
+    resyncVersion: 0, chipRevision: 0, sendVersion: 0,
   });
   const sendScope = {
     state, input, pairControlOnly, soloTargetProblem,
@@ -1268,17 +1329,32 @@ async function checkSoloPairControlUi() {
     normalizedHopBudget: (value, fallback) => Number.isInteger(Number(value)) ? Number(value) : fallback,
     api: async (_path, body) => { sentBodies.push(body); return {}; },
     selectChip: () => {},
-    selectHopChoice: () => { policyResets++; state.hopChoice = "default"; },
   };
   let send = null;
   try {
     send = new Function(...Object.keys(sendScope), `${sendBlock}\nreturn send;`)(...Object.values(sendScope));
     await send();
   } catch { /* assertion below reports harness failure */ }
-  ok("a taskless Pair control neither transmits nor consumes the armed one-shot Solo policy",
+  ok("a taskless Pair control does not transmit the sticky Solo policy",
     !!send && sentBodies.length === 1 && !("solo" in sentBodies[0]) &&
-    !("hopBudget" in sentBodies[0]) && state.hopChoice === "solo" && policyResets === 0,
-    JSON.stringify({ sentBodies, hopChoice: state.hopChoice, policyResets }));
+    !("hopBudget" in sentBodies[0]) && state.hopChoice === "solo",
+    JSON.stringify({ sentBodies, hopChoice: state.hopChoice }));
+
+  input.value = "@claude first";
+  await send();
+  input.value = "@claude second";
+  await send();
+  ok("Solo remains selected and is snapshotted onto every accepted message until changed",
+    sentBodies.length === 3 && sentBodies[1].solo === true && sentBodies[2].solo === true &&
+    state.hopChoice === "solo",
+    JSON.stringify({ sentBodies, hopChoice: state.hopChoice }));
+
+  state.hopChoice = "3";
+  input.value = "@claude third";
+  await send();
+  ok("a numeric hop shortcut likewise remains selected after a successful send",
+    sentBodies.length === 4 && sentBodies[3].hopBudget === 3 && state.hopChoice === "3",
+    JSON.stringify({ sentBodies, hopChoice: state.hopChoice }));
 }
 
 function checkActivityRunUi() {
@@ -2099,8 +2175,521 @@ async function main() {
   await say("lurkroom", "@claude SAY:CHIME");
   d = await idle("lurkroom");
   const chime = d.entries.find((e) => e.author === "codex" && e.meta && e.meta.lurk);
+  const liveReturn = chime && d.entries.find((e) => e.author === "claude" && e.meta &&
+    e.meta.causalRequest && e.meta.causalRequest.kind === "lurk" && e.meta.replyTo === chime.n);
   ok("lurker chimes in when it has something", !!chime, chime && chime.text);
-  ok("chime earns a free right of reply", d.entries.some((e) => e.author === "claude" && e.meta && e.meta.hop));
+  ok("chime earns a free right of reply and the lurker hears that answer once",
+    !!liveReturn &&
+    d.receipts.some((r) => r.agent === "codex" && r.mode === "attention" &&
+      r.from < liveReturn.n && liveReturn.n <= r.upTo),
+    JSON.stringify({ chime, liveReturn, receipts: d.receipts }));
+
+  await api("POST", "/api/rooms", { name: "lurk-closure-cap" });
+  await useFakes("lurk-closure-cap");
+  await cfg("lurk-closure-cap", {
+    hopBudget: 0,
+    agents: { claude: { lurk: false }, codex: { lurk: true } },
+  });
+  await say("lurk-closure-cap", "@claude SAY:CLOSURETAG");
+  const cappedClosureRoom = await idle("lurk-closure-cap", 30000);
+  const cappedReturn = cappedClosureRoom.entries.find((e) => e.author === "claude" &&
+    e.meta && e.meta.causalRequest && e.meta.causalRequest.kind === "lurk" && /CLOSURE_ANSWER/.test(e.text));
+  ok("a tagged right-of-reply is returned structurally at hopBudget zero without a false cap notice",
+    !!cappedReturn && cappedClosureRoom.receipts.some((r) => r.agent === "codex" &&
+      r.mode === "attention" && r.from < cappedReturn.n && cappedReturn.n <= r.upTo) &&
+    !cappedClosureRoom.entries.some((e) => e.kind === "system" && e.meta && e.meta.relayCap),
+    JSON.stringify(cappedClosureRoom.entries));
+
+  await api("POST", "/api/rooms", { name: "lurk-closure-budgeted" });
+  await useFakes("lurk-closure-budgeted");
+  await cfg("lurk-closure-budgeted", {
+    hopBudget: 1,
+    agents: { claude: { lurk: false }, codex: { lurk: true } },
+  });
+  await say("lurk-closure-budgeted", "@claude SAY:CLOSURETAG");
+  const budgetedClosureRoom = await idle("lurk-closure-budgeted", 30000);
+  const budgetedReturn = budgetedClosureRoom.entries.find((e) => e.author === "claude" &&
+    e.meta && e.meta.causalRequest && e.meta.causalRequest.kind === "lurk" && /CLOSURE_ANSWER/.test(e.text));
+  ok("an explicit answer tag uses the free answer return and is not charged twice",
+    !!budgetedReturn && budgetedClosureRoom.receipts.some((r) => r.agent === "codex" &&
+      r.mode === "attention" && r.from < budgetedReturn.n && budgetedReturn.n <= r.upTo) &&
+    !budgetedClosureRoom.entries.some((e) => e.kind === "system" && e.meta && e.meta.relayCap),
+    JSON.stringify({ entries: budgetedClosureRoom.entries, receipts: budgetedClosureRoom.receipts }));
+
+  await api("POST", "/api/rooms", { name: "lurk-closure-pass" });
+  await useFakes("lurk-closure-pass");
+  await cfg("lurk-closure-pass", {
+    hopBudget: 0,
+    agents: { claude: { lurk: false }, codex: { lurk: true } },
+  });
+  await say("lurk-closure-pass", "@claude SAY:CLOSUREPASS");
+  const passedClosureRoom = await idle("lurk-closure-pass", 30000);
+  ok("a right-of-reply [pass] creates no causal closure leg",
+    !passedClosureRoom.entries.some((e) => e.meta && e.meta.lurkClosure) &&
+    !passedClosureRoom.receipts.some((r) => r.mode === "closure"),
+    JSON.stringify({ entries: passedClosureRoom.entries, receipts: passedClosureRoom.receipts }));
+
+  await api("POST", "/api/rooms", { name: "lurk-closure-readonly" });
+  await useFakes("lurk-closure-readonly");
+  await cfg("lurk-closure-readonly", {
+    mode: "work", hopBudget: 0,
+    agents: {
+      claude: { lurk: true, permissionMode: "bypassPermissions" },
+      codex: { lurk: false },
+    },
+  });
+  await say("lurk-closure-readonly", "@codex SAY:CLOSUREARGS");
+  const readOnlyClosureRoom = await idle("lurk-closure-readonly", 30000);
+  const readOnlyClosure = readOnlyClosureRoom.entries.find((e) => e.author === "claude" &&
+    e.meta && e.meta.lurkClosure);
+  const readOnlyClosureArgv = argvFrom(readOnlyClosure);
+  ok("the causal closure leg is forced read-only in a Work room",
+    !!readOnlyClosure && hasArg(readOnlyClosureArgv, "--permission-mode", "plan") &&
+    !hasArg(readOnlyClosureArgv, "--permission-mode", "bypassPermissions"),
+    JSON.stringify({ entry: readOnlyClosure, argv: readOnlyClosureArgv }));
+
+  console.log("\ngeneral causal attention");
+  await api("POST", "/api/rooms", { name: "causal-pass" });
+  await useFakes("causal-pass");
+  await cfg("causal-pass", {
+    hopBudget: 1,
+    agents: { claude: { lurk: false }, codex: { lurk: false } },
+  });
+  await say("causal-pass", "@claude CAUSALPASS");
+  const causalPassRoom = await idle("causal-pass", 30000);
+  const causalCall = causalPassRoom.entries.find((e) => e.author === "claude" && /@codex CAUSALPASS/.test(e.text));
+  const causalAnswer = causalCall && causalPassRoom.entries.find((e) => e.author === "codex" &&
+    e.meta && e.meta.replyTo === causalCall.n && /CAUSAL_ANSWER/.test(e.text));
+  ok("a charged peer request returns its untagged answer once to the caller for free",
+    !!causalAnswer && causalPassRoom.receipts.some((r) => r.agent === "claude" &&
+      r.mode === "attention" && r.spoke === false && r.from < causalAnswer.n && causalAnswer.n <= r.upTo) &&
+    !causalPassRoom.entries.some((e) => e.kind === "system" && e.meta && e.meta.relayCap),
+    JSON.stringify({ entries: causalPassRoom.entries, receipts: causalPassRoom.receipts }));
+
+  await api("POST", "/api/rooms", { name: "causal-tag" });
+  await useFakes("causal-tag");
+  await cfg("causal-tag", {
+    hopBudget: 1,
+    agents: { claude: { lurk: false }, codex: { lurk: false } },
+  });
+  await say("causal-tag", "@claude CAUSALTAG");
+  const causalTagRoom = await idle("causal-tag", 30000);
+  const taggedAnswer = causalTagRoom.entries.find((e) => e.author === "codex" && /CAUSAL_ANSWER CAUSALTAG/.test(e.text));
+  ok("an answer that tags its caller still uses one free return rather than a second charged hop",
+    !!taggedAnswer && causalTagRoom.receipts.some((r) => r.agent === "claude" &&
+      r.mode === "attention" && r.from < taggedAnswer.n && taggedAnswer.n <= r.upTo) &&
+    !causalTagRoom.entries.some((e) => e.kind === "system" && e.meta && e.meta.relayCap),
+    JSON.stringify({ entries: causalTagRoom.entries, receipts: causalTagRoom.receipts }));
+
+  await api("POST", "/api/rooms", { name: "causal-continue" });
+  await useFakes("causal-continue");
+  await cfg("causal-continue", {
+    hopBudget: 2,
+    agents: { claude: { lurk: false }, codex: { lurk: false } },
+  });
+  await say("causal-continue", "@claude CAUSALSPEAK");
+  const causalContinueRoom = await idle("causal-continue", 30000);
+  const floorSpeech = causalContinueRoom.entries.find((e) => e.author === "claude" &&
+    e.meta && e.meta.causalAttention && /CAUSAL_FLOOR_SPEAK/.test(e.text));
+  ok("speech from the free answer return becomes one charged continuation without needing an @tag",
+    !!floorSpeech && causalContinueRoom.receipts.some((r) => r.agent === "codex" &&
+      r.mode === "hop" && r.from < floorSpeech.n && floorSpeech.n <= r.upTo) &&
+    !causalContinueRoom.entries.some((e) => e.kind === "system" && e.meta && e.meta.relayCap),
+    JSON.stringify({ entries: causalContinueRoom.entries, receipts: causalContinueRoom.receipts }));
+
+  await api("POST", "/api/rooms", { name: "causal-cap" });
+  await useFakes("causal-cap");
+  await cfg("causal-cap", {
+    hopBudget: 1,
+    agents: { claude: { lurk: false }, codex: { lurk: false } },
+  });
+  await say("causal-cap", "@claude CAUSALSPEAK");
+  const causalCapRoom = await idle("causal-cap", 30000);
+  const cappedFloorSpeech = causalCapRoom.entries.find((e) => e.author === "claude" &&
+    e.meta && e.meta.causalAttention && /CAUSAL_FLOOR_SPEAK/.test(e.text));
+  const causalCapNotice = causalCapRoom.entries.find((e) => e.kind === "system" && e.meta && e.meta.relayCap);
+  ok("the final charged request's answer returns for free, but speech from that floor stops truthfully at cap",
+    !!cappedFloorSpeech && !!causalCapNotice &&
+    causalCapNotice.meta.relayCap.dropped.some((x) => x.n === cappedFloorSpeech.n && x.target === "codex") &&
+    !causalCapRoom.receipts.some((r) => r.agent === "codex" && r.from < cappedFloorSpeech.n && cappedFloorSpeech.n <= r.upTo),
+    JSON.stringify({ entries: causalCapRoom.entries, receipts: causalCapRoom.receipts }));
+
+  await api("POST", "/api/rooms", { name: "causal-zero" });
+  await useFakes("causal-zero");
+  await cfg("causal-zero", {
+    hopBudget: 0,
+    agents: { claude: { lurk: false }, codex: { lurk: false } },
+  });
+  await say("causal-zero", "@claude CAUSALPASS");
+  const causalZeroRoom = await idle("causal-zero", 30000);
+  const zeroCall = causalZeroRoom.entries.find((e) => e.author === "claude" && /@codex CAUSALPASS/.test(e.text));
+  const zeroCap = causalZeroRoom.entries.find((e) => e.kind === "system" && e.meta && e.meta.relayCap);
+  ok("hopBudget zero blocks a new peer request before it can create an answer-return obligation",
+    !!zeroCall && !!zeroCap && zeroCap.meta.relayCap.dropped.some((x) => x.n === zeroCall.n && x.target === "codex") &&
+    !causalZeroRoom.entries.some((e) => e.author === "codex" && e.kind === "agent"),
+    JSON.stringify(causalZeroRoom.entries));
+
+  await api("POST", "/api/rooms", { name: "causal-unrelated" });
+  await useFakes("causal-unrelated");
+  await cfg("causal-unrelated", {
+    hopBudget: -1,
+    agents: { claude: { lurk: false }, codex: { lurk: false } },
+  });
+  await say("causal-unrelated", "@claude NOATTENTION");
+  const causalUnrelatedRoom = await idle("causal-unrelated", 30000);
+  ok("an untagged single-seat answer does not wake an unrelated non-lurking peer",
+    causalUnrelatedRoom.entries.some((e) => e.author === "claude" && e.text === "NO_ATTENTION_REPLY") &&
+    !causalUnrelatedRoom.entries.some((e) => e.author === "codex" && e.kind === "agent") &&
+    !causalUnrelatedRoom.receipts.some((r) => r.agent === "codex"),
+    JSON.stringify({ entries: causalUnrelatedRoom.entries, receipts: causalUnrelatedRoom.receipts }));
+
+  await api("POST", "/api/rooms", { name: "causal-both" });
+  await useFakes("causal-both");
+  await cfg("causal-both", {
+    hopBudget: 0,
+    agents: { claude: { lurk: false }, codex: { lurk: false } },
+  });
+  await say("causal-both", "@both BOTHATTENTION");
+  const causalBothRoom = await idle("causal-both", 30000);
+  const bothClaude = causalBothRoom.entries.find((e) => e.author === "claude" && /BOTH_INITIAL_CLAUDE/.test(e.text));
+  const bothCodex = causalBothRoom.entries.find((e) => e.author === "codex" && /BOTH_INITIAL_CODEX/.test(e.text));
+  ok("concurrent @both siblings are each delivered once at a safe boundary even with hopBudget zero",
+    !!bothClaude && !!bothCodex &&
+    causalBothRoom.receipts.some((r) => r.agent === "claude" && r.from < bothCodex.n && bothCodex.n <= r.upTo) &&
+    causalBothRoom.receipts.some((r) => r.agent === "codex" && r.from < bothClaude.n && bothClaude.n <= r.upTo) &&
+    !causalBothRoom.entries.some((e) => e.kind === "system" && e.meta && e.meta.relayCap),
+    JSON.stringify({ entries: causalBothRoom.entries, receipts: causalBothRoom.receipts }));
+
+  // Retry is root-aware: while an unfinished sibling still owns the same @both
+  // turn it refuses instead of starting a competing recovery coordinator. Once
+  // that sibling settles, the deliberate Retry rejoins the exact-root protocol
+  // and both durable direct replies must still be delivered reciprocally.
+  await api("POST", "/api/rooms", { name: "causal-both-retry-overlap" });
+  await useFakes("causal-both-retry-overlap");
+  await cfg("causal-both-retry-overlap", {
+    hopBudget: 0,
+    agents: { claude: { lurk: false }, codex: { lurk: false } },
+  });
+  await say("causal-both-retry-overlap", "@both FAILONCESEAT:codex ORDERSTART");
+  const retryOverlapFailed = await waitRoom("causal-both-retry-overlap", (x) =>
+    x.room.busy.includes("claude") && x.entries.some((e) =>
+      e.kind === "system" && e.meta && e.meta.agent === "codex" && e.meta.error),
+  "Codex to fail while the original Claude half remains active", 10000);
+  const retryOverlapRoot = retryOverlapFailed.entries.find((e) =>
+    e.kind === "user" && /FAILONCESEAT:codex ORDERSTART/.test(e.text));
+  const retryOverlapRefused = await api("POST", "/api/retry", {
+    room: "causal-both-retry-overlap",
+  });
+  await idle("causal-both-retry-overlap", 30000);
+  const retryOverlapAccepted = await api("POST", "/api/retry", {
+    room: "causal-both-retry-overlap",
+  });
+  d = await idle("causal-both-retry-overlap", 30000);
+  const retryOverlapClaude = retryOverlapRoot && d.entries.find((e) =>
+    e.kind === "agent" && e.author === "claude" && e.meta &&
+    e.meta.replyTo === retryOverlapRoot.n && /FROMCLAUDE/.test(e.text));
+  const retryOverlapCodex = retryOverlapRoot && d.entries.find((e) =>
+    e.kind === "agent" && e.author === "codex" && e.meta &&
+    e.meta.replyTo === retryOverlapRoot.n && /FROMCODEX/.test(e.text));
+  ok("Retry waits for an unfinished @both sibling, then rejoins reciprocal delivery",
+    retryOverlapRefused.status === 409 && /still busy/.test(retryOverlapRefused.data.error || "") &&
+    retryOverlapAccepted.status === 200 &&
+    !!retryOverlapClaude && !!retryOverlapCodex &&
+    d.receipts.some((r) => r.agent === "claude" && r.mode === "attention" &&
+      r.from < retryOverlapCodex.n && retryOverlapCodex.n <= r.upTo) &&
+    d.receipts.some((r) => r.agent === "codex" &&
+      r.from < retryOverlapClaude.n && retryOverlapClaude.n <= r.upTo),
+    JSON.stringify({ root: retryOverlapRoot, claude: retryOverlapClaude,
+      codex: retryOverlapCodex, receipts: d.receipts }));
+
+  // Wake & deliver has the same overlap shape: only the sleeping seat is gated
+  // by wake preflight, so its recovered turn may run while the awake @both half
+  // is still producing its initial reply.
+  await api("POST", "/api/rooms", { name: "causal-both-wake-overlap" });
+  await useFakes("causal-both-wake-overlap");
+  await cfg("causal-both-wake-overlap", {
+    hopBudget: 0,
+    agents: { claude: { lurk: false }, codex: { lurk: false } },
+  });
+  await api("POST", "/api/seat/sleep", {
+    room: "causal-both-wake-overlap", agent: "codex", asleep: true, reason: "test",
+  });
+  await say("causal-both-wake-overlap", "@both ORDERSTART");
+  const wakeOverlapHeld = await waitRoom("causal-both-wake-overlap", (x) =>
+    x.room.busy.includes("claude") && x.room.agents.codex.held === 1,
+  "the original Claude half to run while Codex holds the root", 10000);
+  const wakeOverlapRoot = wakeOverlapHeld.entries.find((e) =>
+    e.kind === "user" && e.text === "@both ORDERSTART");
+  const wakeOverlapAccepted = await api("POST", "/api/seat/sleep", {
+    room: "causal-both-wake-overlap", agent: "codex", asleep: false, deliver: true,
+  });
+  d = await idle("causal-both-wake-overlap", 30000);
+  const wakeOverlapClaude = wakeOverlapRoot && d.entries.find((e) =>
+    e.kind === "agent" && e.author === "claude" && e.meta &&
+    e.meta.replyTo === wakeOverlapRoot.n && /FROMCLAUDE/.test(e.text));
+  const wakeOverlapCodex = wakeOverlapRoot && d.entries.find((e) =>
+    e.kind === "agent" && e.author === "codex" && e.meta &&
+    e.meta.replyTo === wakeOverlapRoot.n && /FROMCODEX/.test(e.text));
+  ok("Wake & deliver overlapping the live half of one @both root still delivers both siblings",
+    wakeOverlapAccepted.status === 200 && wakeOverlapAccepted.data.delivered === true &&
+    !!wakeOverlapClaude && !!wakeOverlapCodex &&
+    d.receipts.some((r) => r.agent === "claude" && r.mode === "attention" &&
+      r.from < wakeOverlapCodex.n && wakeOverlapCodex.n <= r.upTo) &&
+    d.receipts.some((r) => r.agent === "codex" && r.mode === "attention" &&
+      r.from < wakeOverlapClaude.n && wakeOverlapClaude.n <= r.upTo),
+    JSON.stringify({ wake: wakeOverlapAccepted.data, root: wakeOverlapRoot,
+      claude: wakeOverlapClaude, codex: wakeOverlapCodex, receipts: d.receipts }));
+
+  await api("POST", "/api/rooms", { name: "causal-failed-sibling" });
+  await useFakes("causal-failed-sibling");
+  await cfg("causal-failed-sibling", {
+    hopBudget: 2,
+    agents: { claude: { lurk: false }, codex: { lurk: false } },
+  });
+  await say("causal-failed-sibling", "@both FAILONCESEAT:claude CAUSALPASS");
+  const failedSiblingRoom = await idle("causal-failed-sibling", 30000);
+  const failedSiblingRoot = failedSiblingRoom.entries.find((e) => e.kind === "user");
+  const survivingTaggedReply = failedSiblingRoot && failedSiblingRoom.entries.find((e) =>
+    e.kind === "agent" && e.author === "codex" && e.meta && e.meta.replyTo === failedSiblingRoot.n &&
+    /@claude CAUSALPASS/.test(e.text));
+  const failedClaudeEntries = failedSiblingRoom.entries.filter((e) =>
+    e.kind === "system" && e.meta && e.meta.agent === "claude" && e.meta.error);
+  ok("a failed @both half is not automatically retried by the surviving sibling's tag",
+    !!survivingTaggedReply && failedClaudeEntries.length === 1 &&
+    !failedSiblingRoom.entries.some((e) => e.kind === "agent" && e.author === "claude") &&
+    failedSiblingRoom.room.canRetry === true,
+    JSON.stringify({ entries: failedSiblingRoom.entries, canRetry: failedSiblingRoom.room.canRetry }));
+
+  // Stop can land while the first of two structural @both sibling requests is
+  // waiting behind user work. The shifted request and the still-queued request
+  // are equally terminal: neither may be launched later, and both need durable
+  // request-stopped provenance rather than a misleading "hasn't seen this yet".
+  await api("POST", "/api/rooms", { name: "causal-stop-pending-requests" });
+  await useFakes("causal-stop-pending-requests");
+  await cfg("causal-stop-pending-requests", {
+    hopBudget: 0,
+    agents: { claude: { lurk: false }, codex: { lurk: false } },
+  });
+  await say("causal-stop-pending-requests", "@both ORDERSTART");
+  await waitRoom("causal-stop-pending-requests", (x) =>
+    x.room.busy.includes("claude") && x.room.busy.includes("codex"),
+  "both initial root turns to start", 10000);
+  await say("causal-stop-pending-requests", "@claude SLEEP:3000 SAY:QUEUEBLOCK");
+  const stopPending = await waitRoom("causal-stop-pending-requests", (x) => {
+    const root = x.entries.find((e) => e.kind === "user" && e.text === "@both ORDERSTART");
+    const blocker = x.entries.find((e) => e.kind === "user" && /QUEUEBLOCK/.test(e.text));
+    const direct = root ? x.entries.filter((e) => e.kind === "agent" && e.meta &&
+      e.meta.replyTo === root.n) : [];
+    return !!root && !!blocker && direct.length === 2 && x.room.busyInfo.some((run) =>
+      run.agent === "claude" && run.rootN === blocker.n);
+  }, "the first sibling request to wait with the second still queued", 15000);
+  const stopPendingRoot = stopPending.entries.find((e) =>
+    e.kind === "user" && e.text === "@both ORDERSTART");
+  const stopPendingReplies = stopPending.entries.filter((e) => e.kind === "agent" &&
+    e.meta && e.meta.replyTo === stopPendingRoot.n);
+  await api("POST", "/api/stop", { room: "causal-stop-pending-requests", scope: "all" });
+  const stoppedPendingRoom = await idle("causal-stop-pending-requests", 30000);
+  const stoppedRequestOutcomes = stoppedPendingRoom.room.lurkOutcomes.filter((o) =>
+    o.reason === "request-stopped" && stopPendingReplies.some((entry) =>
+      o.agent !== entry.author && o.fromN <= entry.n && entry.n <= o.throughN));
+  ok("Stop durably terminalizes every pending @both sibling request, not only the shifted one",
+    stopPendingReplies.length === 2 && stoppedRequestOutcomes.length === 2 &&
+    stopPendingReplies.every((entry) => stoppedRequestOutcomes.some((o) =>
+      o.agent !== entry.author && o.fromN <= entry.n && entry.n <= o.throughN)) &&
+    !stoppedPendingRoom.receipts.some((r) => r.mode === "attention" &&
+      stopPendingReplies.some((entry) => r.from < entry.n && entry.n <= r.upTo)),
+    JSON.stringify({ replies: stopPendingReplies, outcomes: stoppedPendingRoom.room.lurkOutcomes,
+      receipts: stoppedPendingRoom.receipts }));
+
+  // The answer side owns the same terminalization rule. In a two-seat @both
+  // exchange the second sibling-request turn necessarily carries the first
+  // sibling answer in its full delta, so that first answer closes by delivery;
+  // only the final answer return remains outstanding. Make Codex's initial
+  // turn finish second, then hold that final return open long enough to Stop.
+  const stopAnswersMarker = path.join(ROOT, "causal-stop-pending-answers.ready");
+  const stopAnswersCli = path.join(ROOT, "causal-stop-pending-answers.mjs");
+  fs.writeFileSync(stopAnswersCli, [
+    "#!/usr/bin/env node",
+    "import fs from 'node:fs';",
+    "import crypto from 'node:crypto';",
+    `const marker = ${JSON.stringify(stopAnswersMarker)};`,
+    "let raw = '';",
+    "process.stdin.setEncoding('utf8');",
+    "process.stdin.on('data', (chunk) => { raw += chunk; });",
+    "process.stdin.on('end', () => {",
+    "  const answer = raw.includes('(This is a causal answer delivery:');",
+    "  const sibling = raw.includes('same @both exchange');",
+    "  const reply = answer ? '[pass]' : sibling ? 'CAUSAL_ANSWER CAUSALSPEAK' : '@claude CAUSALSPEAK';",
+    "  if (answer) fs.writeFileSync(marker, 'ready\\n', 'utf8');",
+    "  setTimeout(() => {",
+    "    const out = (value) => process.stdout.write(JSON.stringify(value) + '\\n');",
+    "    out({ type: 'thread.started', thread_id: 'fake-stop-answers-' + crypto.randomUUID() });",
+    "    out({ type: 'turn.started' });",
+    "    out({ type: 'item.completed', item: { id: 'i1', type: 'agent_message', text: reply } });",
+    "    out({ type: 'turn.completed', usage: { input_tokens: 3, output_tokens: 2 } });",
+    "  }, answer ? 3000 : sibling ? 0 : 500);",
+    "});",
+    "",
+  ].join("\n"));
+  await api("POST", "/api/rooms", { name: "causal-stop-pending-answers" });
+  await useFakes("causal-stop-pending-answers");
+  await cfg("causal-stop-pending-answers", {
+    hopBudget: 0,
+    agents: {
+      claude: { lurk: false },
+      codex: { command: stopAnswersCli, lurk: false },
+    },
+  });
+  await say("causal-stop-pending-answers", "@both CAUSALSPEAK");
+  const stopAnswers = await waitRoom("causal-stop-pending-answers", (x) =>
+    fs.existsSync(stopAnswersMarker) && x.entries.filter((e) => e.kind === "agent" &&
+      e.meta && e.meta.causalRequest && e.meta.causalRequest.kind === "sibling").length === 2 &&
+      x.room.busyInfo.some((run) => run.agent === "codex" && run.phase === "attention"),
+  "the first answer return to run with the second still queued", 15000);
+  const stopAnswerEntries = stopAnswers.entries.filter((e) => e.kind === "agent" &&
+    e.meta && e.meta.causalRequest && e.meta.causalRequest.kind === "sibling");
+  const stopAnswerRecipients = new Map(stopAnswerEntries.map((entry) => {
+    const trigger = stopAnswers.entries.find((e) => e.n === entry.meta.replyTo);
+    return [entry.n, trigger && trigger.author];
+  }));
+  await api("POST", "/api/stop", { room: "causal-stop-pending-answers", scope: "all" });
+  const stoppedAnswersRoom = await idle("causal-stop-pending-answers", 30000);
+  const stoppedAnswerOutcomes = stoppedAnswersRoom.room.lurkOutcomes.filter((o) =>
+    o.reason === "closure-stopped" && stopAnswerEntries.some((entry) =>
+      stopAnswerRecipients.get(entry.n) === o.agent &&
+      o.fromN <= entry.n && entry.n <= o.throughN));
+  const carriedAnswerOutcomes = stoppedAnswersRoom.room.lurkOutcomes.filter((o) =>
+    o.reason === "closed-by-delivery" && stopAnswerEntries.some((entry) =>
+      stopAnswerRecipients.get(entry.n) === o.agent &&
+      o.fromN <= entry.n && entry.n <= o.throughN));
+  const stoppedAnswer = stopAnswerEntries.find((entry) => stoppedAnswerOutcomes.some((o) =>
+    stopAnswerRecipients.get(entry.n) === o.agent &&
+    o.fromN <= entry.n && entry.n <= o.throughN));
+  ok("Stop terminalizes the outstanding causal answer after its sibling was already carried by delivery",
+    stopAnswerEntries.length === 2 && stoppedAnswerOutcomes.length === 1 &&
+    carriedAnswerOutcomes.length === 1 &&
+    stopAnswerEntries.every((entry) => [...stoppedAnswerOutcomes, ...carriedAnswerOutcomes].some((o) =>
+      stopAnswerRecipients.get(entry.n) === o.agent &&
+      o.fromN <= entry.n && entry.n <= o.throughN)) &&
+    !!stoppedAnswer && !stoppedAnswersRoom.receipts.some((r) =>
+      r.mode === "attention" && r.from < stoppedAnswer.n && stoppedAnswer.n <= r.upTo),
+    JSON.stringify({ answers: stopAnswerEntries, recipients: [...stopAnswerRecipients],
+      outcomes: stoppedAnswersRoom.room.lurkOutcomes, receipts: stoppedAnswersRoom.receipts }));
+
+  await api("POST", "/api/rooms", { name: "causal-retry-cap" });
+  await useFakes("causal-retry-cap");
+  await cfg("causal-retry-cap", {
+    hopBudget: 1,
+    agents: { claude: { lurk: false }, codex: { lurk: false } },
+  });
+  await say("causal-retry-cap", "@codex SLEEP:2500 SAY:CAPRETRYBUSY");
+  await waitRoom("causal-retry-cap", (x) => x.room.busy.includes("codex"), "codex to hold one @both half");
+  await say("causal-retry-cap", "@both CAUSALSPEAK");
+  let retryCapRoom = await waitRoom("causal-retry-cap", (x) => x.room.queue.some((item) =>
+    item.agents.includes("codex") && /CAUSALSPEAK/.test(item.text)), "the retryable @both half");
+  const retryCapRoot = retryCapRoom.entries.find((e) => e.kind === "user" && /CAUSALSPEAK/.test(e.text));
+  const retryCapItem = retryCapRoot && retryCapRoom.room.queue.find((item) =>
+    item.sourceN === retryCapRoot.n && item.agents.includes("codex"));
+  await api("POST", "/api/queue/cancel", {
+    room: "causal-retry-cap", groupId: retryCapItem && retryCapItem.queueGroupId,
+  });
+  retryCapRoom = await idle("causal-retry-cap", 40000);
+  const chargedBeforeRetry = retryCapRoom.receipts.filter((r) =>
+    r.mode === "hop" && r.turn === retryCapRoot.n).length;
+  ok("the original split exchange spends its one charged-hop allowance and leaves the cancelled half retryable",
+    !!retryCapRoot && !!retryCapItem && chargedBeforeRetry === 1 && retryCapRoom.room.canRetry === true &&
+    retryCapRoom.entries.some((e) => e.kind === "system" && e.meta && e.meta.relayCap &&
+      e.meta.relayCap.rootN === retryCapRoot.n && e.meta.relayCap.used === 1),
+    JSON.stringify({ item: retryCapItem, receipts: retryCapRoom.receipts, entries: retryCapRoom.entries }));
+  const retryCapMarkN = retryCapRoom.entries.length
+    ? retryCapRoom.entries[retryCapRoom.entries.length - 1].n : 0;
+  const retryCapReceiptMark = retryCapRoom.receipts.length;
+  await api("POST", "/api/retry", { room: "causal-retry-cap" });
+  retryCapRoom = await idle("causal-retry-cap", 40000);
+  const chargedAfterRetry = retryCapRoom.receipts.filter((r) =>
+    r.mode === "hop" && r.turn === retryCapRoot.n).length;
+  const recoveredRetryReply = retryCapRoom.entries.find((e) => e.n > retryCapMarkN &&
+    e.kind === "agent" && e.author === "codex" && e.meta && e.meta.replyTo === retryCapRoot.n);
+  const recoveredRetryFloor = retryCapRoom.entries.find((e) => e.n > retryCapMarkN &&
+    e.kind === "agent" && e.author === "codex" && e.meta && e.meta.causalAttention &&
+    /CAUSAL_FLOOR_SPEAK/.test(e.text));
+  const recoveredRetryCap = retryCapRoom.entries.find((e) => e.n > retryCapMarkN &&
+    e.kind === "system" && e.meta && e.meta.relayCap && e.meta.relayCap.rootN === retryCapRoot.n);
+  ok("Retry resumes the root's durable hop usage instead of minting a second allowance",
+    !!recoveredRetryReply && !!recoveredRetryFloor && !!recoveredRetryCap &&
+    recoveredRetryCap.meta.relayCap.used === 1 &&
+    recoveredRetryCap.meta.relayCap.dropped.some((item) =>
+      item.n === recoveredRetryFloor.n && item.target === "claude") &&
+    chargedAfterRetry === chargedBeforeRetry &&
+    !retryCapRoom.receipts.slice(retryCapReceiptMark).some((r) =>
+      r.mode === "hop" && r.turn === retryCapRoot.n),
+    JSON.stringify({ before: chargedBeforeRetry, after: chargedAfterRetry,
+      recovered: recoveredRetryReply, floor: recoveredRetryFloor,
+      caps: retryCapRoom.entries.filter((e) => e.meta && e.meta.relayCap).map((e) => e.meta.relayCap) }));
+
+  // The bounded ledger may discard old completed roots, but not a root still
+  // held for a sleeping seat. Seed more than the retention limit, Wake only,
+  // then launch a charged request: the held root must survive that prune so a
+  // later recovered continuation cannot mint a fresh allowance.
+  const protectedUsageName = "causal-relay-usage-held";
+  const protectedUsageDir = path.join(ROOT, protectedUsageName);
+  fs.mkdirSync(path.join(protectedUsageDir, "workspace"), { recursive: true });
+  const seededRelayUsage = { "1": 1 };
+  for (let n = 1000; n <= 1200; n++) seededRelayUsage[String(n)] = 1;
+  fs.writeFileSync(path.join(protectedUsageDir, "room.json"), JSON.stringify({
+    hopBudget: 1,
+    agents: { claude: { command: FAKE, lurk: false }, codex: { command: FAKE, lurk: false } },
+  }, null, 2));
+  fs.writeFileSync(path.join(protectedUsageDir, "state.json"), JSON.stringify({
+    nextTurn: 2,
+    lastAddressed: "claude",
+    lastUser: { n: 1, text: "HELD_RELAY_ROOT", target: "claude", done: {}, pair: false },
+    relayUsage: seededRelayUsage,
+    agents: {
+      claude: { cursor: 0, asleep: { since: "2026-08-05T02:00:00", reason: "quota" } },
+      codex: { cursor: 1, asleep: null },
+    },
+  }, null, 2));
+  fs.writeFileSync(path.join(protectedUsageDir, "events.jsonl"), JSON.stringify({
+    n: 1, kind: "user", author: "user", target: "claude", text: "HELD_RELAY_ROOT",
+    ts: "2026-08-05T02:00:00", meta: {
+      audience: { addressed: ["claude"], lurking: [], asleep: ["claude"] },
+      relay: { hopBudget: 1, source: "room", solo: false },
+    },
+  }) + "\n");
+  await room(protectedUsageName);
+  await api("POST", "/api/seat/sleep", {
+    room: protectedUsageName, agent: "claude", asleep: false,
+  });
+  await say(protectedUsageName, "@codex CAUSALPASS");
+  const protectedUsageRoom = await idle(protectedUsageName, 30000);
+  const protectedUsageState = JSON.parse(
+    fs.readFileSync(path.join(protectedUsageDir, "state.json"), "utf8"),
+  );
+  ok("relay-usage pruning preserves a root still held for a seat",
+    protectedUsageState.relayUsage["1"] === 1 &&
+    protectedUsageRoom.entries.some((e) => e.kind === "agent" && e.author === "claude"),
+    JSON.stringify({ usage: protectedUsageState.relayUsage,
+      entries: protectedUsageRoom.entries.map((e) => `${e.kind}:${e.author}`) }));
+
+  await api("POST", "/api/rooms", { name: "causal-readonly" });
+  await useFakes("causal-readonly");
+  await cfg("causal-readonly", {
+    mode: "work", hopBudget: 1,
+    agents: {
+      claude: { lurk: false, permissionMode: "bypassPermissions" },
+      codex: { lurk: false },
+    },
+  });
+  await say("causal-readonly", "@claude CAUSALARGS");
+  const causalReadonlyRoom = await idle("causal-readonly", 30000);
+  const causalReadonly = causalReadonlyRoom.entries.find((e) => e.author === "claude" &&
+    e.meta && e.meta.causalAttention && /^ARGVJSON /.test(e.text));
+  const causalReadonlyArgv = argvFrom(causalReadonly);
+  ok("generic causal answer delivery is forced read-only in a Work room",
+    !!causalReadonly && hasArg(causalReadonlyArgv, "--permission-mode", "plan") &&
+    !hasArg(causalReadonlyArgv, "--permission-mode", "bypassPermissions"),
+    JSON.stringify({ entry: causalReadonly, argv: causalReadonlyArgv }));
 
   await api("POST", "/api/rooms", { name: "lurk-custom" });
   await useFakes("lurk-custom");
@@ -2193,17 +2782,20 @@ async function main() {
   await say("hoproom", "@both CALL:codex");
   d = await idle("hoproom");
   ok("a soft direct call responds inside an @both exchange without lurk",
-    d.entries.slice(beforeHop).some((e) => e.author === "codex" && e.meta && e.meta.hop));
+    d.entries.slice(beforeHop).some((e) => e.author === "codex" && e.meta && e.meta.causalRequest));
 
   beforeHop = d.entries.length;
   await say("hoproom", "@both ORDERSTART");
   d = await idle("hoproom");
   const orderedExchange = d.entries.slice(beforeHop);
-  const orderedInitial = orderedExchange.filter((e) => e.kind === "agent" && !(e.meta && e.meta.hop));
-  const orderedHops = orderedExchange.filter((e) => e.kind === "agent" && e.meta && e.meta.hop);
+  const orderedInitial = orderedExchange.filter((e) => e.kind === "agent" &&
+    !(e.meta && (e.meta.hop || e.meta.causalRequest || e.meta.causalAttention)));
+  const orderedAttention = orderedExchange.filter((e) => e.kind === "agent" &&
+    e.meta && e.meta.causalRequest);
   ok("@both cross-calls follow the replies' visible completion order",
     orderedInitial[0] && orderedInitial[0].author === "codex" &&
-    orderedHops[0] && orderedHops[0].author === "claude", JSON.stringify(orderedExchange.map((e) => ({ author: e.author, text: e.text }))));
+    orderedAttention[0] && orderedAttention[0].author === "claude",
+    JSON.stringify(orderedExchange.map((e) => ({ author: e.author, text: e.text }))));
 
   await api("POST", "/api/rooms", { name: "busyhop" });
   await useFakes("busyhop");
@@ -2293,7 +2885,8 @@ async function main() {
     d.room.cfg.hopBudget === 42 && persistedLargeBudget.hopBudget === 42,
     JSON.stringify({ summary: d.room.cfg.hopBudget, disk: persistedLargeBudget.hopBudget }));
 
-  // The selector is a one-message snapshot, not a live edit of room config.
+  // The shortcut is sticky in the browser, while each accepted message gets
+  // its own immutable snapshot rather than a live edit of room config.
   // Prove both override directions, then hold one behind a busy seat and mutate
   // Settings while it waits: its root entry remains the authority.
   await api("POST", "/api/rooms", { name: "hop-override-up" });
@@ -2593,7 +3186,7 @@ async function main() {
       "process.stdin.setEncoding('utf8');",
       "process.stdin.on('data', (chunk) => { raw += chunk; });",
       "process.stdin.on('end', () => {",
-      "  fs.writeFileSync(marker, raw, 'utf8');",
+      "  if (!fs.existsSync(marker)) fs.writeFileSync(marker, raw, 'utf8');",
       "  const out = (value) => process.stdout.write(JSON.stringify(value) + '\\n');",
       "  out({ type: 'thread.started', thread_id: 'fake-catchup-' + crypto.randomUUID() });",
       "  out({ type: 'turn.started' });",
@@ -2634,6 +3227,8 @@ async function main() {
     e.meta && e.meta.lurk && e.text === "@claude PINGPONG");
   const scopeReturn = d.entries.find((e) => e.kind === "agent" && e.author === "claude" &&
     e.meta && e.meta.catchUpReturn);
+  const scopeReturnReceipt = scopeChime && d.receipts.find((r) => r.agent === "claude" &&
+    r.mode === "attention" && r.from < scopeChime.n && scopeChime.n <= r.upTo);
   const capturedScopePrompt = fs.existsSync(catchUpScopeMarker)
     ? fs.readFileSync(catchUpScopeMarker, "utf8") : "";
   const scopeCatchUpReceipts = d.receipts.filter((r) =>
@@ -2650,12 +3245,21 @@ async function main() {
     scopeCatchUpReceipts.length === 1 && scopeCatchUpReceipts[0].upTo >= contextB.n,
     JSON.stringify({ eligibleA, contextB, chime: scopeChime, cursor: d.room.agents.codex.cursor,
       receipts: scopeCatchUpReceipts, prompt: capturedScopePrompt.slice(-1200) }));
-  ok("a spoken catch-up earns exactly one return at hopBudget zero and that return cannot start a third leg",
+  const scopeClosure = d.entries.find((e) => e.kind === "agent" && e.author === "codex" &&
+    e.meta && e.meta.lurkClosure && e.meta.lurkClosure.terminal);
+  ok("a spoken catch-up earns one return and one terminal closure at hopBudget zero",
     !!scopeChime && !!scopeReturn && scopeReturn.meta.replyTo === scopeChime.n &&
-    scopeReturn.text === "@codex PINGPONG" &&
+    scopeReturn.text === "@codex PINGPONG" && !!scopeClosure &&
+    scopeClosure.meta.replyTo === scopeReturn.n && scopeClosure.meta.lurkClosure.requested === true &&
     d.entries.filter((e) => e.kind === "agent" && e.meta && e.meta.catchUpReturn).length === 1 &&
-    !d.entries.some((e) => e.kind === "agent" && e.author === "codex" && e.n > scopeReturn.n),
+    d.entries.filter((e) => e.kind === "agent" && e.meta && e.meta.lurkClosure).length === 1 &&
+    !d.entries.some((e) => e.kind === "agent" && e.n > scopeClosure.n),
     JSON.stringify(d.entries.filter((e) => e.n >= (eligibleA && eligibleA.n))));
+  ok("the delayed catch-up right-of-reply is labelled as free attention, not a charged hop",
+    !!scopeReturnReceipt && scopeReturn.meta.hop === false &&
+    scopeReturn.meta.causalRequest &&
+    scopeReturn.meta.causalRequest.kind === "lurk-catchup-return",
+    JSON.stringify({ return: scopeReturn, receipt: scopeReturnReceipt }));
 
   // The return leg is an observation, even in a Work room. Capture its argv to
   // pin the read-only boundary rather than trusting only the provenance flag.
@@ -2901,6 +3505,149 @@ async function main() {
     JSON.stringify({ attemptedTail, failure: tailFailure, receipt: tailReceipt,
       agent: d.room.agents.codex, prompt: retainedTailTurnPrompt.slice(-1200) }));
 
+  // Completion is scoped to one catch-up attempt, not forever to one user-root
+  // id. Retry can reopen that same root while its earlier catch-up is still in
+  // flight; the recovered reply landed after the first prompt snapshot and must
+  // therefore remain an actionable tail rather than being discarded as an old
+  // causal descendant of the completed attempt.
+  const slowReopenMarker = path.join(ROOT, "catchup-same-root-reopen-prompts.txt");
+  const slowReopenCli = path.join(ROOT, "catchup-same-root-reopen.mjs");
+  fs.writeFileSync(slowReopenCli, [
+    "#!/usr/bin/env node",
+    "import fs from 'node:fs';",
+    "import crypto from 'node:crypto';",
+    `const marker = ${JSON.stringify(slowReopenMarker)};`,
+    "let raw = '';",
+    "process.stdin.setEncoding('utf8');",
+    "process.stdin.on('data', (chunk) => { raw += chunk; });",
+    "process.stdin.on('end', () => setTimeout(() => {",
+    "  fs.appendFileSync(marker, '\\n=== CATCH-UP ATTEMPT ===\\n' + raw, 'utf8');",
+    "  const out = (value) => process.stdout.write(JSON.stringify(value) + '\\n');",
+    "  out({ type: 'thread.started', thread_id: 'fake-catchup-reopen-' + crypto.randomUUID() });",
+    "  out({ type: 'turn.started' });",
+    "  out({ type: 'item.completed', item: { id: 'i1', type: 'agent_message', text: '[pass]' } });",
+    "  out({ type: 'turn.completed', usage: { input_tokens: 3, output_tokens: 1 } });",
+    "}, 1600));",
+    "",
+  ].join("\n"));
+  await api("POST", "/api/rooms", { name: "lurk-catchup-same-root-reopen" });
+  await useFakes("lurk-catchup-same-root-reopen");
+  await cfg("lurk-catchup-same-root-reopen", {
+    hopBudget: 0,
+    agents: { claude: { lurk: false }, codex: { lurk: true } },
+  });
+  await say("lurk-catchup-same-root-reopen", "@codex SLEEP:2400 SAY:REOPENBUSY");
+  await waitRoom("lurk-catchup-same-root-reopen", (x) => x.room.busy.includes("codex"),
+    "same-root blocker to start");
+  await say("lurk-catchup-same-root-reopen", "@claude FAILONCESEAT:claude REOPENROOT");
+  const reopenQueued = await waitRoom("lurk-catchup-same-root-reopen", (x) =>
+    !!x.room.agents.codex.catchUp && x.room.canRetry === true,
+  "failed root to queue its first catch-up", 10000);
+  const reopenRoot = reopenQueued.entries.find((e) => e.kind === "user" && /REOPENROOT/.test(e.text));
+  const firstReopenAttempt = { ...reopenQueued.room.agents.codex.catchUp };
+  await cfg("lurk-catchup-same-root-reopen", { agents: { codex: { command: slowReopenCli } } });
+  await waitRoom("lurk-catchup-same-root-reopen", (x) =>
+    x.room.busyInfo.some((run) => run.agent === "codex" && run.phase === "catching-up"),
+  "the first same-root catch-up to start", 15000);
+  const reopenRetryMark = (await room("lurk-catchup-same-root-reopen")).entries.length;
+  await api("POST", "/api/retry", { room: "lurk-catchup-same-root-reopen" });
+  const reopenExtended = await waitRoom("lurk-catchup-same-root-reopen", (x) => {
+    const pending = x.room.agents.codex.catchUp;
+    return pending && pending.revision > firstReopenAttempt.revision &&
+      pending.throughN > firstReopenAttempt.throughN;
+  }, "Retry to reopen the running catch-up's root", 10000);
+  const recoveredReopenReply = reopenRoot && reopenExtended.entries.find((e) =>
+    e.n >= reopenRetryMark && e.kind === "agent" && e.author === "claude" &&
+    e.meta && e.meta.replyTo === reopenRoot.n);
+  d = await idle("lurk-catchup-same-root-reopen", 40000);
+  const reopenReceipts = d.receipts.filter((r) =>
+    r.agent === "codex" && r.mode === "lurk-catchup" && r.turn === reopenRoot.n);
+  const reopenPrompts = fs.existsSync(slowReopenMarker)
+    ? fs.readFileSync(slowReopenMarker, "utf8") : "";
+  ok("Retry reopens the same root after its in-flight catch-up snapshot instead of losing the recovered tail",
+    !!reopenRoot && !!recoveredReopenReply && reopenReceipts.length === 2 &&
+    reopenReceipts[0].upTo < recoveredReopenReply.n &&
+    reopenReceipts[1].from < recoveredReopenReply.n && recoveredReopenReply.n <= reopenReceipts[1].upTo &&
+    (reopenPrompts.match(/=== CATCH-UP ATTEMPT ===/g) || []).length === 2 &&
+    d.room.agents.codex.catchUp === null,
+    JSON.stringify({ root: reopenRoot, recovered: recoveredReopenReply,
+      receipts: reopenReceipts, pending: d.room.agents.codex.catchUp }));
+
+  // Reopening cannot depend on a rooted reply bubble. A provider failure is a
+  // deliberate recovery attempt too, but its system error is excluded from the
+  // agent delta. Per-root revisions must retain that attempt after the older
+  // catch-up completes, and the explicit root packet must make a second pass
+  // possible even when there are no provider-visible unseen entries.
+  const failedReopenMarker = path.join(ROOT, "catchup-same-root-failed-prompts.txt");
+  const failedReopenCli = path.join(ROOT, "catchup-same-root-failed.mjs");
+  fs.writeFileSync(failedReopenCli, [
+    "#!/usr/bin/env node",
+    "import fs from 'node:fs';",
+    "import crypto from 'node:crypto';",
+    `const marker = ${JSON.stringify(failedReopenMarker)};`,
+    "let raw = '';",
+    "process.stdin.setEncoding('utf8');",
+    "process.stdin.on('data', (chunk) => { raw += chunk; });",
+    "process.stdin.on('end', () => setTimeout(() => {",
+    "  fs.appendFileSync(marker, '\\n=== FAILED-ROOT CATCH-UP ===\\n' + raw, 'utf8');",
+    "  const out = (value) => process.stdout.write(JSON.stringify(value) + '\\n');",
+    "  out({ type: 'thread.started', thread_id: 'fake-catchup-failed-' + crypto.randomUUID() });",
+    "  out({ type: 'turn.started' });",
+    "  out({ type: 'item.completed', item: { id: 'i1', type: 'agent_message', text: '[pass]' } });",
+    "  out({ type: 'turn.completed', usage: { input_tokens: 3, output_tokens: 1 } });",
+    "}, 1600));",
+    "",
+  ].join("\n"));
+  await api("POST", "/api/rooms", { name: "lurk-catchup-same-root-failed-reopen" });
+  await useFakes("lurk-catchup-same-root-failed-reopen");
+  await cfg("lurk-catchup-same-root-failed-reopen", {
+    hopBudget: 0,
+    agents: { claude: { lurk: false }, codex: { lurk: true } },
+  });
+  await say("lurk-catchup-same-root-failed-reopen", "@codex SLEEP:2200 SAY:FAILEDREOPENBUSY");
+  await waitRoom("lurk-catchup-same-root-failed-reopen", (x) => x.room.busy.includes("codex"),
+    "failed-root blocker to start", 10000);
+  await say("lurk-catchup-same-root-failed-reopen", "@claude FAIL");
+  const failedReopenQueued = await waitRoom("lurk-catchup-same-root-failed-reopen", (x) =>
+    !!x.room.agents.codex.catchUp && x.room.canRetry === true,
+  "failed root to queue its first catch-up", 10000);
+  const failedReopenRoot = failedReopenQueued.entries.find((e) =>
+    e.kind === "user" && e.text === "FAIL");
+  await cfg("lurk-catchup-same-root-failed-reopen", {
+    agents: { codex: { command: failedReopenCli } },
+  });
+  await waitRoom("lurk-catchup-same-root-failed-reopen", (x) =>
+    x.room.busyInfo.some((run) => run.agent === "codex" && run.phase === "catching-up"),
+  "the first failed-root catch-up to start", 15000);
+  const failedReopenAttempt = {
+    ...(await room("lurk-catchup-same-root-failed-reopen")).room.agents.codex.catchUp,
+  };
+  await api("POST", "/api/retry", { room: "lurk-catchup-same-root-failed-reopen" });
+  const failedReopenExtended = await waitRoom("lurk-catchup-same-root-failed-reopen", (x) => {
+    const pending = x.room.agents.codex.catchUp;
+    return pending && pending.revision > failedReopenAttempt.revision &&
+      pending.rootRevisions &&
+      pending.rootRevisions[String(failedReopenRoot.n)] >
+        ((failedReopenAttempt.rootRevisions || {})[String(failedReopenRoot.n)] || 0);
+  }, "the repeated failed attempt to revise the same explicit root", 10000);
+  const repeatedFailure = failedReopenExtended.entries.filter((e) => e.kind === "system" &&
+    e.meta && e.meta.agent === "claude" && e.meta.error).at(-1);
+  d = await idle("lurk-catchup-same-root-failed-reopen", 40000);
+  const failedReopenReceipts = d.receipts.filter((r) =>
+    r.agent === "codex" && r.mode === "lurk-catchup" && r.turn === failedReopenRoot.n);
+  const failedReopenPrompts = fs.existsSync(failedReopenMarker)
+    ? fs.readFileSync(failedReopenMarker, "utf8") : "";
+  ok("a repeated failed recovery reopens the same root without a reply bubble or visible delta entry",
+    !!repeatedFailure && failedReopenReceipts.length === 2 &&
+    failedReopenReceipts[0].upTo < repeatedFailure.n &&
+    failedReopenReceipts[1].from < repeatedFailure.n && repeatedFailure.n <= failedReopenReceipts[1].upTo &&
+    (failedReopenPrompts.match(/=== FAILED-ROOT CATCH-UP ===/g) || []).length === 2 &&
+    d.room.agents.codex.catchUp === null,
+    JSON.stringify({ root: failedReopenRoot, attempt: failedReopenAttempt,
+      extended: failedReopenExtended.room.agents.codex.catchUp,
+      failure: repeatedFailure, receipts: failedReopenReceipts,
+      pending: d.room.agents.codex.catchUp }));
+
   // Persisted obligations are dormant on process start: merely listing rooms
   // must not spend a local/provider call in every room on disk. Opening that
   // specific room is the deliberate activation edge that resumes it.
@@ -3091,17 +3838,15 @@ async function main() {
   await waitRoom("lanepriority", (x) => x.room.busy.includes("codex"), "codex to start");
   await say("lanepriority", "@codex SAY:USERFIRST");          // queued behind it
   await say("lanepriority", "@claude TAG:codex");             // free seat, hops at codex
-  // A waiting hop leaves the room briefly idle between polls, so wait for the
-  // hop itself to land rather than for quiet.
-  await waitRoom("lanepriority", (x) =>
-    x.entries.some((e) => e.author === "codex" && e.meta && e.meta.hop), "the delayed hop to land", 20000);
   d = await idle("lanepriority", 40000);
   const priorityLane = d.entries.filter((e) => e.author === "codex" && e.kind === "agent");
   const userItem = priorityLane.findIndex((e) => e.text === "USERFIRST");
-  const hopItem = priorityLane.findIndex((e) => e.meta && e.meta.hop);
-  ok("a hop cannot overtake a message the user already queued for that seat",
-    userItem >= 0 && hopItem >= 0 && userItem < hopItem,
-    JSON.stringify(priorityLane.map((e) => ({ text: e.text, hop: !!(e.meta && e.meta.hop) }))));
+  const laneTrigger = d.entries.find((e) => e.author === "claude" && /@codex/.test(e.text));
+  const carried = laneTrigger && d.receipts.some((r) => r.agent === "codex" &&
+    r.mode === "turn" && r.from < laneTrigger.n && laneTrigger.n <= r.upTo);
+  ok("accepted user work outranks a waiting peer request and can carry it without a duplicate hop",
+    userItem >= 0 && carried && !priorityLane.some((e) => e.meta && e.meta.hop),
+    JSON.stringify({ lane: priorityLane.map((e) => ({ text: e.text, hop: !!(e.meta && e.meta.hop) })), receipts: d.receipts }));
 
   // The deferred seat reads the early seat's reply in its own delta and answers
   // it there. Replaying that same reply as a hop would be one agent answering
@@ -3119,8 +3864,9 @@ async function main() {
     !dupLane.some((e) => e.meta && e.meta.hop),
     JSON.stringify(dupLane.map((e) => ({ text: e.text, hop: !!(e.meta && e.meta.hop), deferred: !!(e.meta && e.meta.deferred) }))));
 
-  // …but suppression is scoped to what that seat actually saw. A reply it has
-  // not read still earns the ordinary hop.
+  // …but suppression is scoped to what that seat actually saw. A late sibling
+  // reply it has not read still earns one structural delivery at the safe
+  // boundary (free, rather than an ordinary charged hop).
   await api("POST", "/api/rooms", { name: "splitunseen" });
   await useFakes("splitunseen");
   await cfg("splitunseen", { maxHops: 4, agents: { claude: { lurk: false }, codex: { lurk: false } } });
@@ -3128,9 +3874,18 @@ async function main() {
   await waitRoom("splitunseen", (x) => x.room.busy.includes("codex"), "codex to start");
   await say("splitunseen", "@both TAG:claude"); // codex's late reply tags claude, who hasn't read it
   d = await idle("splitunseen", 40000);
-  ok("a reply the other seat has not read still triggers its hop",
-    d.entries.some((e) => e.author === "claude" && e.kind === "agent" && e.meta && e.meta.hop),
-    JSON.stringify(d.entries.filter((e) => e.kind === "agent").map((e) => ({ who: e.author, hop: !!(e.meta && e.meta.hop) }))));
+  const unseenLateReply = d.entries.find((e) => e.author === "codex" && e.kind === "agent" &&
+    e.meta && e.meta.deferred && /@claude/.test(e.text));
+  const unseenSiblingDelivery = unseenLateReply && d.entries.find((e) =>
+    e.author === "claude" && e.kind === "agent" && e.meta && e.meta.causalRequest &&
+    e.meta.causalRequest.kind === "sibling" && e.meta.causalRequest.sourceN === unseenLateReply.n);
+  ok("a sibling reply the other seat has not read is delivered once at the safe boundary",
+    !!unseenSiblingDelivery &&
+    d.receipts.some((r) => r.agent === "claude" && r.mode === "attention" &&
+      r.from < unseenLateReply.n && unseenLateReply.n <= r.upTo) &&
+    d.entries.filter((e) => e.meta && e.meta.causalRequest &&
+      e.meta.causalRequest.sourceN === unseenLateReply.n).length === 1,
+    JSON.stringify({ entries: d.entries.filter((e) => e.kind === "agent"), receipts: d.receipts }));
 
   // Stop must close the chain out, not leave it waiting on a turn that will
   // never run — and a pair cycle still claims both seats whole.
@@ -4864,6 +5619,94 @@ async function main() {
     hasArg(bothRetryArgv, "--permission-mode", "plan") &&
     !hasArg(bothRetryArgv, "--permission-mode", "bypassPermissions"),
     JSON.stringify(bothRetryArgv));
+  const bothRoot = d.entries.find((e) => e.kind === "user" && /FAILONCESEAT:claude ARGJSON/.test(e.text));
+  const recoveredClaudeReply = bothRoot && bothRetrySlice.find((e) => e.kind === "agent" &&
+    e.author === "claude" && e.meta && e.meta.replyTo === bothRoot.n);
+  ok("Retry's recovered @both half is causally delivered to the sibling that already answered",
+    !!recoveredClaudeReply && d.receipts.some((r) => r.agent === "codex" &&
+      r.mode === "attention" && r.spoke === false &&
+      r.from < recoveredClaudeReply.n && recoveredClaudeReply.n <= r.upTo) &&
+    !bothRetrySlice.some((e) => e.kind === "agent" && e.author === "codex"),
+    JSON.stringify({ recovered: recoveredClaudeReply, receipts: d.receipts, slice: bothRetrySlice }));
+
+  // A message held for its only addressee has no listener at acceptance time:
+  // there is no exchange yet. Wake & deliver creates that exchange, so an
+  // enabled-but-busy listener must receive a durable catch-up obligation whose
+  // eligible root is explicit rather than inferred from the original audience.
+  await api("POST", "/api/rooms", { name: "sleepdeliverlurk" });
+  await useFakes("sleepdeliverlurk");
+  await cfg("sleepdeliverlurk", {
+    hopBudget: 0,
+    agents: { claude: { lurk: false }, codex: { lurk: true } },
+  });
+  await api("POST", "/api/seat/sleep", { room: "sleepdeliverlurk", agent: "claude" });
+  await say("sleepdeliverlurk", "@claude SAY:RECOVEREDLURK");
+  const heldLurkRoom = await room("sleepdeliverlurk");
+  const heldLurkRoot = heldLurkRoom.entries.find((e) => e.kind === "user" && /RECOVEREDLURK/.test(e.text));
+  ok("a single-seat sleeping message selects no lurker before an exchange exists",
+    !!heldLurkRoot && ((heldLurkRoot.meta || {}).audience || {}).lurking.length === 0,
+    JSON.stringify(heldLurkRoot && heldLurkRoot.meta));
+  await say("sleepdeliverlurk", "@codex SLEEP:2200 SAY:RECOVERYLURKBUSY");
+  await waitRoom("sleepdeliverlurk", (x) => x.room.busy.includes("codex"),
+    "the recovered exchange's listener to be busy");
+  await api("POST", "/api/seat/sleep",
+    { room: "sleepdeliverlurk", agent: "claude", asleep: false, deliver: true });
+  d = await idle("sleepdeliverlurk", 40000);
+  const recoveredLurkReply = d.entries.find((e) => e.kind === "agent" && e.author === "claude" &&
+    e.meta && e.meta.replyTo === heldLurkRoot.n && e.text === "RECOVEREDLURK");
+  ok("Wake & deliver preserves the lurk guarantee with an explicit-root catch-up",
+    !!recoveredLurkReply && d.receipts.some((r) => r.agent === "codex" &&
+      r.mode === "lurk-catchup" && r.spoke === false &&
+      r.from < recoveredLurkReply.n && recoveredLurkReply.n <= r.upTo) &&
+    d.room.agents.codex.catchUp === null,
+    JSON.stringify({ recovered: recoveredLurkReply, receipts: d.receipts, agent: d.room.agents.codex }));
+
+  // Explicit recovery roots are obligations, not merely hints for provenance
+  // discovery. Here the listener starts after the held root and therefore
+  // advances its cursor past that user entry before the recovery attempt ends.
+  // The failed provider produces no rooted agent reply, so only the persisted
+  // root/revision can keep the catch-up actionable.
+  await api("POST", "/api/rooms", { name: "sleepdeliverlurkfail" });
+  await useFakes("sleepdeliverlurkfail");
+  await cfg("sleepdeliverlurkfail", {
+    hopBudget: 0,
+    agents: { claude: { lurk: false }, codex: { lurk: true } },
+  });
+  await api("POST", "/api/seat/sleep", {
+    room: "sleepdeliverlurkfail", agent: "claude", asleep: true, reason: "test",
+  });
+  await say("sleepdeliverlurkfail", "@claude FAILONCESEAT:claude RECOVERYLURKFAIL");
+  const recoveryFailHeld = await room("sleepdeliverlurkfail");
+  const recoveryFailRoot = recoveryFailHeld.entries.find((e) => e.kind === "user" &&
+    /RECOVERYLURKFAIL/.test(e.text));
+  await say("sleepdeliverlurkfail", "@codex SLEEP:2400 SAY:RECOVERYFAILBUSY");
+  const recoveryFailBusy = await waitRoom("sleepdeliverlurkfail", (x) =>
+    x.room.busy.includes("codex") && x.entries.some((e) => e.kind === "user" &&
+      /RECOVERYFAILBUSY/.test(e.text)), "the post-root listener turn to start", 10000);
+  const recoveryFailBusyRoot = recoveryFailBusy.entries.find((e) => e.kind === "user" &&
+    /RECOVERYFAILBUSY/.test(e.text));
+  await api("POST", "/api/seat/sleep", {
+    room: "sleepdeliverlurkfail", agent: "claude", asleep: false, deliver: true,
+  });
+  const recoveryFailQueued = await waitRoom("sleepdeliverlurkfail", (x) => {
+    const pending = x.room.agents.codex.catchUp;
+    return pending && pending.revision >= 1 && Array.isArray(pending.roots) &&
+      pending.roots.includes(recoveryFailRoot.n) && x.entries.some((e) =>
+        e.kind === "system" && e.meta && e.meta.agent === "claude" && e.meta.error);
+  }, "the failed recovery's explicit-root catch-up to persist", 10000);
+  const recoveryFailAttempt = { ...recoveryFailQueued.room.agents.codex.catchUp };
+  d = await idle("sleepdeliverlurkfail", 40000);
+  const recoveryFailReceipt = d.receipts.find((r) => r.agent === "codex" &&
+    r.mode === "lurk-catchup" && r.turn === recoveryFailRoot.n);
+  ok("a failed recovery's explicit root stays actionable after the listener cursor passes the root",
+    !!recoveryFailRoot && !!recoveryFailBusyRoot && recoveryFailAttempt.revision >= 1 &&
+    recoveryFailAttempt.roots.includes(recoveryFailRoot.n) && !!recoveryFailReceipt &&
+    recoveryFailReceipt.from >= recoveryFailBusyRoot.n &&
+    d.room.agents.codex.cursor >= recoveryFailAttempt.throughN &&
+    d.room.agents.codex.catchUp === null,
+    JSON.stringify({ root: recoveryFailRoot, busyRoot: recoveryFailBusyRoot,
+      attempt: recoveryFailAttempt, receipt: recoveryFailReceipt,
+      agent: d.room.agents.codex, outcomes: d.room.lurkOutcomes }));
 
   await api("POST", "/api/rooms", { name: "sleepqueue" });
   await useFakes("sleepqueue");

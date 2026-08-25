@@ -654,17 +654,17 @@
           <button class="chip" data-t="both">@both</button>
           <span id="hopWrap">
             <button id="hopBtn" type="button" aria-haspopup="menu" aria-expanded="false"
-              title="Choose the agent-to-agent follow-up policy for the next message">
+              title="Choose this room's agent-to-agent follow-up policy for the browser session">
               <span id="hopBtnLabel">⛓ Hops: Room (∞)</span><span class="hop-caret">▼</span>
             </button>
-            <div id="hopMenu" role="menu" aria-label="Hops for the next message">
+            <div id="hopMenu" role="menu" aria-label="Agent-to-agent hop policy">
               <button type="button" role="menuitemradio" aria-checked="true" data-hop-choice="default">
                 <b>Room default</b><span class="hm-sub" id="hopRoomDefault">Currently ∞ — follow up until settled</span>
               </button>
               <button type="button" role="menuitemradio" aria-checked="false" data-hop-choice="solo">
-                <b>Solo</b><span class="hm-sub">For the next message, one selected seat responds. The other cannot lurk or react, but can read this transcript later.</span>
+                <b>Solo</b><span class="hm-sub">One selected seat responds until you choose another policy. The other cannot lurk or react, but can read the transcript later.</span>
               </button>
-              <div class="hm-label">Override once · resets after the next accepted message</div>
+              <div class="hm-label">Shortcut · remembered for this room and browser session</div>
               <div class="hm-grid">
                 <button type="button" role="menuitemradio" aria-label="Unlimited hops" aria-checked="false" data-hop-choice="-1" title="Follow up until settled; the safety stop still applies">∞</button>
                 <button type="button" role="menuitemradio" aria-label="No hops" aria-checked="false" data-hop-choice="0" title="No agent-to-agent follow-ups; a lurker may still react">0</button>
@@ -728,7 +728,7 @@
     <div class="mgrid">
       <div class="fld"><label>Agent-to-agent hop budget per message</label>
         <input id="s_hopbudget" type="number" min="-1" step="1">
-        <div class="note">Room default: -1 = ∞ (with a safety stop), 0 = none, any positive integer = that exact cap. The composer keeps quick one-message choices through 8, or Solo.</div></div>
+        <div class="note">Room default: -1 = ∞ (with a safety stop), 0 = none, any positive integer = that exact cap. The composer has sticky shortcuts through 8, or Solo.</div></div>
       <div class="fld"><label>Pair review rounds per message (0 = until approved)</label>
         <input id="s_pairrounds" type="number" min="0" max="99" step="1">
         <div class="note">Pair mode ends when the reviewer approves, so a limit is optional. A high safety stop still catches two agents that never converge.</div></div>
@@ -753,8 +753,21 @@
 "use strict";
 // ------------------------------------------------------------ state
 const $ = (id) => document.getElementById(id);
+const INITIAL_ROOM = new URLSearchParams(location.search).get("room") || "default";
+const hopChoiceStorageKey = (room) => `parley.hopChoice:${room}`;
+function storedHopChoice(room) {
+  try {
+    const choice = sessionStorage.getItem(hopChoiceStorageKey(room));
+    if (choice === "default" || choice === "solo" || /^(?:-1|[0-8])$/.test(choice || "")) return choice;
+  } catch { /* storage may be unavailable; keep the in-memory shortcut */ }
+  return "default";
+}
+function rememberHopChoice(room, choice) {
+  try { sessionStorage.setItem(hopChoiceStorageKey(room), choice); }
+  catch { /* storage may be unavailable; the current page still stays sticky */ }
+}
 const state = {
-  room: new URLSearchParams(location.search).get("room") || "default",
+  room: INITIAL_ROOM,
   entries: [],
   receipts: [],
   summary: null,
@@ -762,8 +775,7 @@ const state = {
   chip: "auto",
   chipRevision: 0,   // manual changes fence off older in-flight send responses
   sendVersion: 0,    // only the newest send may synchronize the selected chip
-  hopChoice: "default", // one-shot message policy: default | solo | -1..8
-  hopRevision: 0,    // a newer choice must survive an older in-flight send
+  hopChoice: storedHopChoice(INITIAL_ROOM), // per-room browser-session shortcut: default | solo | -1..8
   draftImages: [],   // native image attachments waiting for the next successful send
   draftFiles: [],    // other files waiting for the next successful send
   sending: false,
@@ -798,7 +810,7 @@ function toast(msg, isErr) {
 // This blocks blind/cross-origin requests; it is not a secret from local
 // processes, which can fetch the public page and read the embedded token.
 const TOKEN = (document.querySelector('meta[name="parley-token"]') || {}).content || "";
-const REQUIRED_RUNTIME_PROTOCOL = "7";
+const REQUIRED_RUNTIME_PROTOCOL = "9";
 const PAGE_RUNTIME_PROTOCOL = (document.querySelector('meta[name="parley-runtime-protocol"]') || {}).content || "";
 const withToken = (url) => url + (url.includes("?") ? "&" : "?") +
   "token=" + encodeURIComponent(TOKEN) + "&protocol=" + encodeURIComponent(REQUIRED_RUNTIME_PROTOCOL);
@@ -1162,12 +1174,23 @@ function withheldFrom(a, n) {
   const seats = map[String(n)];
   return Array.isArray(seats) && seats.includes(a);
 }
+function cappedFrom(a, n) {
+  return state.entries.find((entry) => entry.kind === "system" && entry.meta &&
+    entry.meta.relayCap && Array.isArray(entry.meta.relayCap.dropped) &&
+    entry.meta.relayCap.dropped.some((item) => Number(item.n) === Number(n) && item.target === a)) || null;
+}
 function computeHeard(a, e) {
   if (withheldFrom(a, e.n)) {
     return { cls: "withheld", title: `${a} · you cancelled this before it was delivered — never shown to ${a}` };
   }
   const r = state.receipts.find((x) => x.agent === a && x.from < e.n && e.n <= x.upTo);
   if (r) {
+    if (r.mode === "closure") return r.spoke
+      ? { cls: "late", title: `${a} · causal answer delivered — replied` }
+      : { cls: "passed", title: `${a} · causal answer delivered — nothing to add` };
+    if (r.mode === "attention") return r.spoke
+      ? { cls: "late", title: `${a} · causal message delivered — replied` }
+      : { cls: "passed", title: `${a} · causal message delivered — nothing to add` };
     if (r.mode === "lurk-catchup") return r.spoke
       ? { cls: "late", title: `${a} · caught up while lurking — chimed in` }
       : { cls: "passed", title: `${a} · caught up while lurking — nothing to add` };
@@ -1184,6 +1207,43 @@ function computeHeard(a, e) {
   const agent = state.summary && state.summary.agents && state.summary.agents[a];
   const cur = agent ? agent.cursor : 0;
   if (cur >= e.n) return { cls: "late", title: `${a} · has seen this` };
+  const capped = cappedFrom(a, e.n);
+  if (capped) {
+    const budget = capped.meta.relayCap.budget;
+    return { cls: "unheard", title: `${a} · delivery deliberately stopped at the ${budget < 0 ? "safety" : "hop"} limit; this remains later context` };
+  }
+  const attention = e.meta && (e.meta.causalAttention || e.meta.lurkClosure);
+  if (e.kind === "agent" && attention && attention.terminal) {
+    return { cls: "unheard", title: `${a} · causal exchange deliberately closed here — this final reply remains later context` };
+  }
+  // Terminal delivery outcomes outrank a seat's unrelated current busy state.
+  // Receipts/cursor above still supersede this history after a later turn heals
+  // the gap, so the record remains truthful without destructive invalidation.
+  const outcomes = ((state.summary && state.summary.lurkOutcomes) || [])
+    .filter((x) => x.agent === a && x.fromN <= e.n && e.n <= x.throughN);
+  const outcome = outcomes.length ? outcomes[outcomes.length - 1] : null;
+  if (outcome) {
+    if (outcome.reason === "closed-by-delivery") {
+      return { cls: "late", title: `${a} · closure was already carried by another delivery` };
+    }
+    if (String(outcome.reason || "").startsWith("closure-")) {
+      const why = outcome.reason === "closure-stopped" ? "was stopped"
+        : outcome.reason === "closure-asleep" ? "was asleep"
+          : outcome.reason === "closure-wait-aborted" ? "could not obtain the seat" : "failed";
+      return { cls: "unheard", title: `${a} · causal closure ${why}; no automatic retry` };
+    }
+    if (String(outcome.reason || "").startsWith("request-")) {
+      const why = outcome.reason === "request-stopped" ? "was stopped"
+        : outcome.reason === "request-asleep" ? "found the seat asleep"
+          : outcome.reason === "request-wait-aborted" ? "could not obtain the seat" : "failed";
+      return { cls: "unheard", title: `${a} · causal request ${why}; no automatic retry` };
+    }
+    const why = outcome.reason === "stopped" ? "was stopped"
+      : outcome.reason === "disabled" ? "was disabled"
+        : outcome.reason === "asleep" ? "went to sleep"
+          : outcome.reason === "cancelled" ? "was cancelled" : "failed";
+    return { cls: "unheard", title: `${a} · lurk ${why} before this was heard` };
+  }
   if (state.summary && (state.summary.busy || []).includes(a)) return { cls: "pending " + a, title: `${a} · receiving…` };
   // Still unheard, but for a reason the user chose — and one that will not
   // resolve on its own, unlike an ordinary seat that simply hasn't caught up.
@@ -1195,16 +1255,6 @@ function computeHeard(a, e) {
   if (e.kind === "user" && e.meta && e.meta.relay && e.meta.relay.solo &&
       !(((e.meta.audience || {}).addressed || []).includes(a))) {
     return { cls: "unheard", title: `${a} · Solo — response intentionally suppressed; it can still see this as later context` };
-  }
-  const outcomes = ((state.summary && state.summary.lurkOutcomes) || [])
-    .filter((x) => x.agent === a && x.fromN <= e.n && e.n <= x.throughN);
-  const outcome = outcomes.length ? outcomes[outcomes.length - 1] : null;
-  if (outcome) {
-    const why = outcome.reason === "stopped" ? "was stopped"
-      : outcome.reason === "disabled" ? "was disabled"
-        : outcome.reason === "asleep" ? "went to sleep"
-          : outcome.reason === "cancelled" ? "was cancelled" : "failed";
-    return { cls: "unheard", title: `${a} · lurk ${why} before this was heard` };
   }
   return { cls: "unheard", title: `${a} · hasn't seen this yet` };
 }
@@ -1276,7 +1326,15 @@ function entryEl(e) {
   // by then depends on which seat freed first, so the badge doesn't claim it.
   const deferTag = e.meta && e.meta.deferred
     ? ' <span style="opacity:.6" title="This agent was busy when you sent the message, so its half of it ran later">· ⏳ delayed</span>' : "";
-  const lurkTag = pairTag || (e.meta && e.meta.lurk ? ' <span style="opacity:.6">· 👂 chimed in</span>'
+  const attentionMeta = e.meta && (e.meta.causalAttention || e.meta.lurkClosure);
+  const requestMeta = e.meta && e.meta.causalRequest;
+  const lurkTag = pairTag || (attentionMeta && attentionMeta.terminal
+    ? ' <span style="opacity:.6" title="Final causal delivery; this reply cannot schedule another automatic leg">· 🔒 closure</span>'
+    : attentionMeta
+      ? ' <span style="opacity:.6" title="Free causal answer return; further continuation uses the hop budget">· ↩ answer</span>'
+    : requestMeta
+      ? ' <span style="opacity:.6" title="Structural causal delivery; the message was delivered without spending a hop">· ↪ attention</span>'
+    : e.meta && e.meta.lurk ? ' <span style="opacity:.6">· 👂 chimed in</span>'
     : e.meta && e.meta.hop && !(e.meta && e.meta.pair) ? ' <span style="opacity:.6">· ⛓ follow-up</span>' : deferTag);
   const userPair = e.meta && e.meta.pair && typeof e.meta.pair === "object"
     ? ` · 🔁 pair ×${e.meta.pair.rounds} (${e.meta.pair.worker} works, ${e.meta.pair.reviewer} reviews)` : "";
@@ -1867,7 +1925,7 @@ function liveStream(agent, text) {
     scrollBottom();
   }, 90);
 }
-function whisper(agent, error, hop, skipped, asleep, held, queued) {
+function whisper(agent, error, hop, skipped, asleep, held, queued, attention) {
   const d = document.createElement("div");
   d.className = "whisper";
   // A sleeping seat is not a busy one: there is no later turn to catch up on
@@ -1884,6 +1942,8 @@ function whisper(agent, error, hop, skipped, asleep, held, queued) {
       : `⏭ ${agent} is busy in another exchange — it'll catch up on its next turn`)
     : error
       ? `👂 ${agent} was listening but hit an error: ${error}`
+      : attention
+        ? `↩ ${agent} received the causal message — nothing to add`
       : hop
         ? `⛓ ${agent} read the mention — nothing to add`
         : `👂 ${agent} listened — nothing to add`;
@@ -2477,10 +2537,10 @@ function renderHopControl() {
   $("hopBtnLabel").textContent = choice === "solo" ? "◎ Solo" : `⛓ Hops: ${shown}`;
   btn.classList.toggle("override", choice !== "default");
   btn.title = choice === "solo"
-    ? "Solo applies once: only one selected seat responds. The other seat cannot lurk or react, but can read the transcript on a later turn."
+    ? "Solo stays selected for this room and browser session: only one selected seat responds. The other seat cannot lurk or react, but can read the transcript on a later turn."
     : choice === "default"
       ? `Room default (${hopBudgetLabel(roomBudget)}): ${hopBudgetDetail(roomBudget)}.`
-      : `Next message only (${hopBudgetLabel(choice)}): ${hopBudgetDetail(choice)}. Taskless Pair controls do not consume it.`;
+      : `Selected for this room and browser session (${hopBudgetLabel(choice)}): ${hopBudgetDetail(choice)}.`;
   $("hopRoomDefault").textContent = `Currently ${hopBudgetLabel(roomBudget)} — ${hopBudgetDetail(roomBudget)}`;
   document.querySelectorAll("#hopMenu [data-hop-choice]").forEach((option) => {
     option.setAttribute("aria-checked", String(option.dataset.hopChoice === choice));
@@ -2514,20 +2574,22 @@ function renderHopControl() {
     const used = Math.max(0, Number(run.used) || 0);
     const budget = normalizedHopBudget(run.budget, -1);
     const capped = run.phase === "capped" || run.phase === "safety";
-    const capNote = capped ? (run.phase === "safety" || budget === -1 ? " · safety stop" : " · limit") : "";
+    const capNote = capped ? (run.phase === "safety" || budget === -1 ? " · safety stop" : " · capped") : "";
     progress.hidden = false;
     progress.classList.toggle("capped", capped);
-    progress.textContent = `Hops ${used}/${hopBudgetLabel(budget)}${capNote}`;
-    progress.title = `Latest active exchange${run.rootN == null ? "" : ` (message ${run.rootN})`} has used ${used} ` +
-      `of ${budget === -1 ? "the until-settled policy (with a safety stop)" : budget} agent-to-agent hops` +
-      (capped ? (budget === -1 ? " and reached the safety stop" : " and reached its limit") : "") + ".";
+    progress.textContent = `Hops used ${used} · limit ${hopBudgetLabel(budget)}${capNote}`;
+    progress.title = `This exchange${run.rootN == null ? "" : ` (message ${run.rootN})`} started with ` +
+      `${budget === -1 ? "the until-settled policy (with a safety stop)" : `a limit of ${budget}`} ` +
+      `and has launched ${used} agent-to-agent ${used === 1 ? "hop" : "hops"}` +
+      (capped ? (budget === -1 ? " and reached the safety stop" : " and reached its limit") : "") +
+      ". Changing the composer shortcut affects later messages, not this running exchange.";
   }
 }
-function selectHopChoice(choice, bumpRevision = true) {
+function selectHopChoice(choice) {
   const normalized = choice === "default" || choice === "solo"
     ? choice : String(normalizedHopBudget(choice, -1));
-  if (bumpRevision) state.hopRevision++;
   state.hopChoice = normalized;
+  rememberHopChoice(state.room, normalized);
   closeHopMenu();
   renderHopControl();
   updateRouteHint();
@@ -2639,7 +2701,7 @@ function connect(resyncOnOpen = false) {
     else if (msg.type === "queue") {
       setQueue(msg.size, msg.items, msg.dispatches);
     }
-    else if (msg.type === "lurk") whisper(msg.agent, msg.error, msg.hop, msg.skipped, msg.asleep, msg.held, msg.queued);
+    else if (msg.type === "lurk") whisper(msg.agent, msg.error, msg.hop, msg.skipped, msg.asleep, msg.held, msg.queued, msg.attention);
     else if (msg.type === "status") {
       if (state.summary) { // keep busy state truthful between room summaries
         const b = state.summary.busy || [];
@@ -2670,6 +2732,8 @@ function connect(resyncOnOpen = false) {
       else if (msg.phase === "catching-up") ensureLive(msg.agent, msg.startedAt, "is catching up 👂");
       else if (msg.phase === "review") ensureLive(msg.agent, msg.startedAt, "is reviewing 🔁");
       else if (msg.phase === "fix") ensureLive(msg.agent, msg.startedAt, "is fixing 🔁");
+      else if (msg.phase === "attention") ensureLive(msg.agent, msg.startedAt, "is receiving an answer ↩");
+      else if (msg.phase === "closure") ensureLive(msg.agent, msg.startedAt, "is closing the exchange 🔒");
       else if (msg.phase === "hop") ensureLive(msg.agent, msg.startedAt, "is following up ⛓");
       else if (msg.phase === "retrying") {
         const l = ensureLive(msg.agent);
@@ -2732,12 +2796,8 @@ async function loadRoom(name) {
   state.eventVersion++;
   const roomName = data.room.name || name;
   if (roomName !== state.room) {
-    // Message policy overrides are drafts scoped to the room where they were
-    // chosen. This revision also prevents an old room's successful send from
-    // resetting a newer choice made after the switch.
-    state.hopRevision++;
-    state.hopChoice = "default";
     closeHopMenu();
+    state.hopChoice = storedHopChoice(roomName);
   }
   state.room = roomName;
   history.replaceState(null, "", roomName === "default" ? location.pathname : "?room=" + encodeURIComponent(roomName));
@@ -3080,7 +3140,6 @@ async function send() {
   const sentResync = state.resyncVersion;
   const chipRevision = state.chipRevision;
   const sentHopChoice = state.hopChoice;
-  const hopRevision = state.hopRevision;
   const sendVersion = ++state.sendVersion;
   const relayControlOnly = pairControlOnly(text, !!(imageDrafts.length || fileDrafts.length));
   if (text.startsWith("/")) {
@@ -3109,8 +3168,8 @@ async function send() {
       data: await fileBase64(draft.file),
     })));
     const body = { room: sentRoom, text, target: sentTarget, images, files };
-    // Pair controls append no user turn, so they neither consume nor transmit
-    // the one-shot relay policy selected for the next actual message.
+    // Pair controls append no user turn, so they do not transmit the sticky
+    // relay shortcut. Every accepted user message snapshots the current choice.
     if (!relayControlOnly && sentHopChoice === "solo") body.solo = true;
     else if (!relayControlOnly && sentHopChoice !== "default") {
       body.hopBudget = normalizedHopBudget(sentHopChoice, -1);
@@ -3121,10 +3180,6 @@ async function send() {
     if (r.explicit && r.target && state.room === sentRoom && state.resyncVersion === sentResync &&
         state.chipRevision === chipRevision && state.sendVersion === sendVersion) {
       selectChip(r.target);
-    }
-    if (!relayControlOnly && sentHopChoice !== "default" && state.room === sentRoom &&
-        state.hopRevision === hopRevision && state.sendVersion === sendVersion) {
-      selectHopChoice("default");
     }
     if (r.queued) toast(`⏳ Queued (#${r.position}) — sends when the target lane is free.`);
     // Partly delivered: the free seat is already answering, the busy one is next.
