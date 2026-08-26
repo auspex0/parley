@@ -17,15 +17,54 @@
     --border2: rgba(255,255,255,.12);
     --text: #dee3ec;
     --text-dim: #8b93a5;
-    --text-faint: #5c6374;
+    /* Was #5c6374, about 3.2:1 on the page background — under AA for the
+       11-12px text this token is actually used for. */
+    --text-faint: #79808f;
     --user: #7aa2f7;
     --claude: #e8845c;
     --codex: #2fd6a8;
     --danger: #f26d6d;
     /* Already the busy-pill amber; naming it keeps the palette the same size. */
     --warn: #ffd479;
+    /* Text that sits ON an accent fill (a chip, the send button) rather than on
+       the page. It was the page background repeated as a literal in five
+       places, which is exactly what made a light theme impossible. */
+    --on-accent: #0b0e14;
+    --code-bg: #0a0d12;
+    --danger-fg: #ffb4b4;
+    --danger-wash: rgba(235,75,90,.14);
+    --danger-edge: rgba(235,75,90,.5);
+    --warn-wash: rgba(255,212,121,.10);
+    --warn-edge: rgba(255,212,121,.35);
     --radius: 14px;
     --mono: ui-monospace, "Cascadia Code", Consolas, "SF Mono", monospace;
+  }
+  /* Parley was dark-only, so anyone on a light desktop got an uninvited dark
+     app. Only the tokens change; every rule below is written against them. */
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f7f8fa;
+      --bg2: #eef1f5;
+      --panel: #ffffff;
+      --panel2: #f2f4f8;
+      --border: rgba(16,20,28,.10);
+      --border2: rgba(16,20,28,.17);
+      --text: #1b2130;
+      --text-dim: #5a6376;
+      --text-faint: #5f6879;
+      --user: #2f6fd0;
+      --claude: #b8502a;
+      --codex: #0f8f6a;
+      --danger: #c22f3f;
+      --warn: #9a6b13;
+      --on-accent: #ffffff;
+      --code-bg: #f4f6fa;
+      --danger-fg: #8c1f2c;
+      --danger-wash: rgba(194,47,63,.10);
+      --danger-edge: rgba(194,47,63,.35);
+      --warn-wash: rgba(154,107,19,.10);
+      --warn-edge: rgba(154,107,19,.32);
+    }
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; }
@@ -61,8 +100,13 @@
   .side-label button:hover { background: var(--panel2); color: var(--text); }
   #roomList { overflow-y: auto; flex: 1; padding: 0 10px; }
   .room-item {
-    display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
-    padding: 8px 10px; border-radius: 9px; color: var(--text-dim); margin-bottom: 2px;
+    display: flex; align-items: center; gap: 4px; width: 100%; text-align: left;
+    padding: 0 6px 0 0; border-radius: 9px; color: var(--text-dim); margin-bottom: 2px;
+  }
+  /* The row is a container; this is the part that opens the room. */
+  .room-item .ropen {
+    display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0;
+    padding: 8px 4px 8px 10px; color: inherit; border-radius: 9px 0 0 9px;
   }
   .room-item:hover { background: var(--panel); color: var(--text); }
   .room-item.active { background: var(--panel2); color: var(--text); }
@@ -72,7 +116,7 @@
   .room-item .rmeta { display: flex; gap: 3px; align-items: center; flex-shrink: 0; }
   .room-item .racts { display: none; gap: 1px; flex-shrink: 0; }
   .room-item:hover .rmeta { display: none; }
-  .room-item:hover .racts { display: flex; }
+  .room-item:hover .racts, .room-item:focus-within .racts { display: flex; }
   .room-item .ract { padding: 1px 4px; border-radius: 5px; color: var(--text-faint); font-size: 12px; line-height: 1.2; cursor: pointer; }
   .room-item .ract:hover { color: var(--text); background: var(--panel2); }
   .room-item .ract.del:hover { color: var(--danger); }
@@ -118,7 +162,7 @@
   .pill.claude b { color: var(--claude); font-weight: 600; }
   .pill.codex b { color: var(--codex); font-weight: 600; }
   .pill.linked .st { background: var(--user); }
-  .pill.busy .st { background: #ffd479; animation: pulse 1s infinite; }
+  .pill.busy .st { background: var(--warn); animation: pulse 1s infinite; }
   .hdot.withheld { background: none; border: 1px solid var(--danger); opacity: .75; position: relative; }
   .pill.bad .st { background: var(--danger); }
   .pill .ear, .pill .moon { font-size: 13px; line-height: 1; padding: 0 1px; opacity: .25; filter: grayscale(1); transition: opacity .15s, filter .15s; }
@@ -173,7 +217,7 @@
   .msg.user .who { color: var(--user); }
   .avatar {
     width: 22px; height: 22px; border-radius: 7px; display: inline-flex; align-items: center; justify-content: center;
-    font-size: 12px; font-weight: 700; color: #0b0e14;
+    font-size: 12px; font-weight: 700; color: var(--on-accent);
   }
   .msg.claude .avatar { background: var(--claude); }
   .msg.codex .avatar { background: var(--codex); }
@@ -233,12 +277,19 @@
   .bubble th:last-child, .bubble td:last-child { border-right: 0; }
   .bubble th.align-center, .bubble td.align-center { text-align: center; }
   .bubble th.align-right, .bubble td.align-right { text-align: right; }
-  .codeblock { position: relative; margin: 10px 0; border: 1px solid var(--border2); border-radius: 10px; background: #0a0d12; overflow: hidden; }
+  .codeblock { position: relative; margin: 10px 0; border: 1px solid var(--border2); border-radius: 10px; background: var(--code-bg); overflow: hidden; }
   .codeblock .cb-head { display: flex; justify-content: space-between; align-items: center; padding: 5px 12px; font-size: 11.5px; color: var(--text-faint); border-bottom: 1px solid var(--border); }
   .codeblock .cb-copy { font-size: 11.5px; color: var(--text-dim); padding: 2px 8px; border-radius: 6px; }
   .codeblock .cb-copy:hover { background: var(--panel2); color: var(--text); }
   .codeblock pre { margin: 0; padding: 12px 14px; overflow-x: auto; }
   .codeblock code { background: none; padding: 0; font-size: 13px; line-height: 1.5; }
+  /* Highlighting reuses the palette rather than introducing a theme of its
+     own, so it follows light and dark with everything else. */
+  .tok-com { color: var(--text-faint); font-style: italic; }
+  .tok-str { color: var(--codex); }
+  .tok-kw  { color: var(--user); }
+  .tok-lit { color: var(--claude); }
+  .tok-num { color: var(--claude); }
 
   .sysmsg { align-self: center; text-align: center; max-width: 85%; font-size: 12.8px; color: var(--text-dim);
     background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 7px 14px; animation: rise .18s ease-out; }
@@ -258,6 +309,14 @@
   @media (prefers-reduced-motion: reduce) {
     .msg, .activity, .sysmsg, .whisper { animation: none; }
     #chatWrap { scroll-behavior: auto; }
+    /* The entrance animations were stopped here, but the infinite ones kept
+       running: pulsing dots and a blinking caret are exactly what someone who
+       asked for less motion is asking to be rid of. A static dimmed state
+       carries the same meaning. */
+    .caret, .hdot.pending, .pill.busy .st, .qp-row.running .bs-dot, #jump.flash {
+      animation: none !important;
+    }
+    .thinking-dots i { animation: none !important; opacity: .6; }
   }
 
   /* who-heard-this receipt dots */
@@ -286,6 +345,11 @@
   .dretry[disabled] { opacity: .5; text-decoration: none; }
   /* Readable, not struck through: the text is still the record. */
   .bubble.dimmed { opacity: .62; }
+
+  /* Day boundary in a long-lived room. */
+  .daysep { display: flex; align-items: center; gap: 10px; margin: 14px 4px 6px;
+    color: var(--text-faint); font-size: 11px; letter-spacing: .04em; text-transform: uppercase; }
+  .daysep::before, .daysep::after { content: ""; flex: 1; height: 1px; background: var(--border); }
 
   .meta .cpy, .meta .ask { opacity: 0; font-size: 11px; padding: 0 4px; transition: opacity .15s; }
   .msg:hover .meta .cpy, .msg:hover .meta .ask { opacity: .6; }
@@ -323,7 +387,7 @@
   .chip:hover { color: var(--text); }
   .chip:disabled { opacity: .35; cursor: not-allowed; }
   .chip:disabled:hover { color: var(--text-dim); }
-  .chip.active { color: #0b0e14; font-weight: 600; }
+  .chip.active { color: var(--on-accent); font-weight: 600; }
   .chip.active[data-t="auto"] { background: var(--text-dim); border-color: var(--text-dim); }
   .chip.active[data-t="claude"] { background: var(--claude); border-color: var(--claude); }
   .chip.active[data-t="codex"] { background: var(--codex); border-color: var(--codex); }
@@ -401,7 +465,7 @@
   #sendBtn, #stopBtn {
     width: 38px; height: 38px; border-radius: 12px; display: flex; align-items: center; justify-content: center; flex-shrink: 0;
   }
-  #sendBtn { background: var(--user); color: #0b0e14; }
+  #sendBtn { background: var(--user); color: var(--on-accent); }
   #sendBtn:disabled { background: var(--panel2); color: var(--text-faint); cursor: default; }
   #stopWrap { position: relative; display: none; flex-shrink: 0; align-items: center; }
   #stopBtn { background: rgba(242,109,109,.15); color: var(--danger); border: 1px solid rgba(242,109,109,.4); border-radius: 12px 3px 3px 12px; }
@@ -615,7 +679,7 @@
   .mrow { display: flex; gap: 10px; margin-top: 18px; justify-content: space-between; align-items: center; }
   .btn { padding: 8px 18px; border-radius: 10px; font-size: 14px; border: 1px solid var(--border2); color: var(--text-dim); }
   .btn:hover { color: var(--text); background: var(--panel); }
-  .btn.primary { background: var(--user); border-color: var(--user); color: #0b0e14; font-weight: 600; }
+  .btn.primary { background: var(--user); border-color: var(--user); color: var(--on-accent); font-weight: 600; }
   .btn.primary:hover { filter: brightness(1.1); }
   .btn.danger { color: var(--danger); border-color: rgba(242,109,109,.4); }
   .btn.danger:hover { background: rgba(242,109,109,.1); }
@@ -630,8 +694,21 @@
   #toast.show { transform: translateX(-50%) translateY(0); }
   #toast.err { border-color: rgba(242,109,109,.5); color: #f2a1a1; }
 
+  #navToggle { display: none; }
+  #navScrim { display: none; position: fixed; inset: 0; z-index: 55; background: rgba(0,0,0,.45); }
   @media (max-width: 760px) {
-    #sidebar { display: none; }
+    /* The sidebar slides over the chat rather than disappearing: without it
+       rooms, the workspace, the transcript and settings were all unreachable,
+       and the only way back to another room was editing ?room= by hand. */
+    #sidebar {
+      position: fixed; inset: 0 auto 0 0; z-index: 60; width: min(280px, 86vw);
+      transform: translateX(-102%); transition: transform .18s ease;
+      box-shadow: 0 0 40px rgba(0,0,0,.5);
+    }
+    body.nav-open #sidebar { transform: none; }
+    body.nav-open #navScrim { display: block; }
+    #navToggle { display: flex; }
+    header { flex-wrap: wrap; row-gap: 6px; }
     .msg { max-width: 92%; }
     #composerWrap { padding: 8px 10px 12px; }
     .chips { gap: 5px; }
@@ -646,6 +723,7 @@
 </head>
 <body>
 <div id="app">
+  <div id="navScrim" hidden></div>
   <aside id="sidebar">
     <div class="logo">
       <svg width="30" height="30" viewBox="0 0 32 32"><circle cx="16" cy="16" r="13" fill="none" stroke="#555c6b" stroke-width="2"/><circle cx="16" cy="7" r="4" fill="#7aa2f7"/><circle cx="8" cy="22" r="4" fill="#e8845c"/><circle cx="24" cy="22" r="4" fill="#2fd6a8"/></svg>
@@ -679,6 +757,7 @@
 
   <div id="main">
     <header>
+      <button class="hbtn" id="navToggle" aria-label="Rooms" aria-expanded="false" title="Rooms">☰</button>
       <div id="connDot" title="connection"></div>
       <div id="roomTitle">default</div>
       <div id="modeToggle" title="Talk: conversational, conservative defaults; explicit seat permission overrides remain active. Work: agents can write files in the workspace and run commands.">
@@ -693,12 +772,12 @@
       <span id="pairBannerText"></span>
       <button id="pairEndBtn" style="margin-left:10px;color:#c9b3f5;text-decoration:underline;font-size:12.5px">End pair mode</button>
     </div>
-    <div id="runtimeBanner" role="alert" style="display:none;padding:8px 20px;font-size:12.5px;color:#ffb4b4;background:rgba(235,75,90,.14);border-bottom:1px solid rgba(235,75,90,.5)"></div>
-    <div id="setupBanner" role="status" style="display:none;padding:8px 20px;font-size:12.5px;color:#ffd479;background:rgba(255,212,121,.10);border-bottom:1px solid rgba(255,212,121,.35)"></div>
+    <div id="runtimeBanner" role="alert" style="display:none;padding:8px 20px;font-size:12.5px;color:var(--danger-fg);background:var(--danger-wash);border-bottom:1px solid var(--danger-edge)"></div>
+    <div id="setupBanner" role="status" style="display:none;padding:8px 20px;font-size:12.5px;color:var(--warn);background:var(--warn-wash);border-bottom:1px solid var(--warn-edge)"></div>
     <div id="workBanner">🔨 <b>Work room</b> — agents can write files in the shared workspace and run commands. Their actions show as inline activity lines.</div>
 
     <div id="chatWrap">
-      <div id="chat"></div>
+      <div id="chat" role="log" aria-live="polite" aria-relevant="additions" aria-label="Conversation"></div>
       <div id="empty" style="display:none">
         <div class="big">🃏</div>
         <h2>The table is set</h2>
@@ -773,8 +852,8 @@
 <div id="askMenu" role="menu"></div>
 
 <div id="overlay">
-  <div class="modal">
-    <h2>Room settings</h2>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+    <h2 id="settingsTitle">Room settings</h2>
     <div class="sub" id="roomPath"></div>
     <div class="mgrid" id="seatCards"></div>
     <div class="fld" style="margin-top:14px"><label>Room note (standing instruction both agents see on every turn — also /note)</label>
@@ -1069,7 +1148,114 @@ $("dlTranscript").onclick = async (ev) => {
   } catch (e) { toast(e.message, true); }
 };
 function hhmm(ts) { return (ts || "").slice(11, 16); }
+function dayOf(ts) { return (ts || "").slice(0, 10); }
+// A room that spans days showed a column of indistinguishable "14:02"s, with
+// nothing saying which day any of them belonged to.
+function dayLabel(ts) {
+  const day = dayOf(ts);
+  if (!day) return "";
+  const today = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  const asDay = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  if (day === asDay(today)) return "Today";
+  const yesterday = new Date(today.getTime() - 86400000);
+  if (day === asDay(yesterday)) return "Yesterday";
+  return day;
+}
 function secs(ms) { return (ms / 1000).toFixed(1) + "s"; }
+
+// ---- syntax highlighting ----
+// For an app whose whole point is watching two coding agents exchange code,
+// monochrome blocks were the most visible gap. This is deliberately a small
+// tokenizer rather than a vendored library: Parley ships two files and no
+// dependencies, and a hundred kilobytes of highlighter inlined into the page
+// would cost more than it is worth.
+//
+// SAFETY: this runs on text that esc() has ALREADY escaped, and it only ever
+// wraps existing characters in <span class="tok-…">. It never unescapes, never
+// interpolates, and never emits an attribute value — so it cannot reintroduce
+// markup that escaping removed. Everything it matches is bounded by the entity
+// forms &lt; &gt; &amp; &quot; that escaping produces, which is why the patterns
+// below look for those rather than for raw angle brackets.
+const HL_LANGS = {
+  js: {
+    keywords: /\b(?:async|await|break|case|catch|class|const|continue|default|delete|do|else|export|extends|finally|for|from|function|if|import|in|instanceof|let|new|of|return|static|super|switch|this|throw|try|typeof|var|void|while|yield)\b/g,
+    literals: /\b(?:true|false|null|undefined|NaN|Infinity)\b/g,
+    line: /\/\/[^\n]*/g,
+    block: /\/\*[\s\S]*?\*\//g,
+  },
+  py: {
+    keywords: /\b(?:and|as|assert|async|await|break|class|continue|def|del|elif|else|except|finally|for|from|global|if|import|in|is|lambda|nonlocal|not|or|pass|raise|return|try|while|with|yield)\b/g,
+    literals: /\b(?:True|False|None|self)\b/g,
+    line: /#[^\n]*/g,
+  },
+  sh: {
+    keywords: /\b(?:case|do|done|elif|else|esac|export|fi|for|function|if|in|local|return|set|then|until|while)\b/g,
+    literals: /\b(?:true|false)\b/g,
+    line: /#[^\n]*/g,
+  },
+  css: {
+    keywords: /@[a-z-]+/g,
+    literals: /#[0-9a-fA-F]{3,8}\b/g,
+    line: null,
+    block: /\/\*[\s\S]*?\*\//g,
+  },
+  json: { literals: /\b(?:true|false|null)\b/g },
+  html: { block: /&lt;!--[\s\S]*?--&gt;/g, keywords: /&lt;\/?[a-zA-Z][\w:-]*|\/?&gt;/g },
+};
+const HL_ALIAS = {
+  javascript: "js", jsx: "js", ts: "js", typescript: "js", tsx: "js", mjs: "js", cjs: "js",
+  python: "py", py3: "py", bash: "sh", shell: "sh", zsh: "sh", console: "sh", sh: "sh",
+  yaml: "json", yml: "json", jsonc: "json", scss: "css", less: "css",
+  xml: "html", svg: "html", vue: "html", markup: "html",
+};
+// Strings and comments are matched first and set aside, so a keyword inside a
+// string is never highlighted as one.
+// Strings and comments are matched first in the alternation below, so a keyword
+// inside a string is never highlighted as one.
+const HL_STRINGS = /&quot;(?:[^&\\\n]|\\.|&(?!quot;))*&quot;|'(?:[^'\\\n]|\\.)*'|`(?:[^`\\]|\\.)*`/;
+const HL_NUMBERS = /\b(?:0[xX][0-9a-fA-F]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\b/;
+
+// One left-to-right scan with a single alternation, rather than a sequence of
+// passes over placeholders: a placeholder scheme has to survive every later
+// pattern, and the number rule cheerfully matched the digits inside its own
+// placeholders. First alternative that matches at a position wins, and anything
+// unmatched is copied through untouched — so the output always reduces back to
+// the input with the spans removed.
+const hlCache = new Map();
+function hlPattern(rules) {
+  if (hlCache.has(rules)) return hlCache.get(rules);
+  const parts = [];
+  const order = [];
+  const add = (cls, re) => { if (re) { parts.push(`(${re.source})`); order.push(cls); } };
+  add("com", rules.block);
+  add("com", rules.line);
+  add("str", HL_STRINGS);
+  add("kw", rules.keywords);
+  add("lit", rules.literals);
+  add("num", HL_NUMBERS);
+  const compiled = { re: new RegExp(parts.join("|"), "g"), order };
+  hlCache.set(rules, compiled);
+  return compiled;
+}
+
+function highlightCode(escaped, lang) {
+  const key = HL_ALIAS[String(lang || "").toLowerCase()] || String(lang || "").toLowerCase();
+  const rules = HL_LANGS[key];
+  if (!rules) return escaped; // an unknown language stays plain rather than guessed at
+  const { re, order } = hlPattern(rules);
+  re.lastIndex = 0;
+  let out = "", at = 0, m;
+  while ((m = re.exec(escaped)) !== null) {
+    // Which alternative matched tells us what to call it.
+    let cls = null;
+    for (let g = 1; g < m.length; g++) if (m[g] !== undefined) { cls = order[g - 1]; break; }
+    out += escaped.slice(at, m.index) + `<span class="tok-${cls}">${m[0]}</span>`;
+    at = m.index + m[0].length;
+    if (m[0] === "") re.lastIndex++; // a zero-width match would loop forever
+  }
+  return out + escaped.slice(at);
+}
 
 // ------------------------------------------------------------ markdown (safe: escape first, then transform)
 // Code blocks are pulled out first and stashed behind private-use-area
@@ -1186,7 +1372,8 @@ function renderMD(src) {
     const b = blocks[+i];
     if (!b) return m;
     return `<div class="codeblock"><div class="cb-head"><span>${esc(b.lang || "code")}</span>` +
-      `<button class="cb-copy">copy</button></div><pre><code>${esc(b.code.replace(/\n$/, ""))}</code></pre></div>`;
+      `<button class="cb-copy">copy</button></div><pre><code>` +
+      `${highlightCode(esc(b.code.replace(/\n$/, "")), b.lang)}</code></pre></div>`;
   });
   return html;
 }
@@ -1521,7 +1708,7 @@ function entryEl(e) {
     ? `You <span style="opacity:.65">→ @${esc(e.target)}${e.meta && e.meta.discussion ? " · 💬 discussion" : ""}${userPair}</span>${askTag}`
     : e.author.charAt(0).toUpperCase() + e.author.slice(1) + lurkTag;
   const av = e.kind === "user" ? "" : `<span class="avatar">${esc(seatAvatar(e.author))}</span>`;
-  div.innerHTML = `<div class="meta">${av}<span class="who">${label}</span><span>${hhmm(e.ts)}${dur}${tok}</span>` +
+  div.innerHTML = `<div class="meta">${av}<span class="who">${label}</span><span title="${esc(String(e.ts || "").replace("T", " "))}">${hhmm(e.ts)}${dur}${tok}</span>` +
     `<button class="ask" title="Ask about this message">↪</button>` +
     `<button class="cpy" title="Copy message">📋</button></div>` +
     entryQuoteHTML(e) +
@@ -1680,12 +1867,27 @@ function appendActivityEntry(e) {
 }
 
 function appendEntryRange(parent, entries) {
+  let lastDay = null;
+  const dayDivider = (e) => {
+    const day = dayOf(e.ts);
+    if (!day || day === lastDay) return;
+    // Not before the very first rendered entry when it opens the window: a
+    // divider there is a label with nothing above it to separate from.
+    if (lastDay !== null) {
+      const sep = document.createElement("div");
+      sep.className = "daysep";
+      sep.setAttribute("role", "separator");
+      sep.innerHTML = `<span>${esc(dayLabel(e.ts))}</span>`;
+      parent.appendChild(sep);
+    }
+    lastDay = day;
+  };
   for (let i = 0; i < entries.length;) {
     const e = entries[i];
     if (e.kind !== "activity") {
       // Filtered at render time only — never removed from state.entries, which
       // every index, jump and quote lookup walks.
-      if (!hiddenEntry(e)) parent.appendChild(entryEl(e));
+      if (!hiddenEntry(e)) { dayDivider(e); parent.appendChild(entryEl(e)); }
       i++;
       continue;
     }
@@ -2644,6 +2846,73 @@ document.addEventListener("click", (e) => {
 });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeAskMenu(); });
 
+// ---- narrow-width room navigation ----
+// Below 760px the sidebar slides over the chat instead of vanishing. Without
+// this, rooms, the workspace, the transcript and settings were all unreachable
+// and the only way to another room was editing ?room= by hand.
+function setNavOpen(open) {
+  document.body.classList.toggle("nav-open", open);
+  $("navToggle").setAttribute("aria-expanded", String(open));
+  $("navScrim").hidden = !open;
+}
+$("navToggle").onclick = () => setNavOpen(!document.body.classList.contains("nav-open"));
+$("navScrim").onclick = () => setNavOpen(false);
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") setNavOpen(false); });
+
+// ---- keyboard-navigable menus ----
+// These surfaces declare role="menu" but had no arrow keys, no focus move on
+// open and, for the stop menu, no Escape. Declaring the semantics without
+// honouring them is worse than not declaring them.
+function menuItems(menu) {
+  return [...menu.querySelectorAll("button")].filter((b) => !b.disabled);
+}
+function focusMenuItem(menu, index) {
+  const items = menuItems(menu);
+  if (!items.length) return;
+  const i = (index + items.length) % items.length;
+  items[i].focus();
+}
+// Called after a menu's contents are written, so the first item takes focus and
+// the arrow keys have somewhere to start.
+function focusMenu(menu) {
+  const items = menuItems(menu);
+  if (items.length) items[0].focus();
+}
+function wireMenuKeys(id, close) {
+  const menu = $(id);
+  if (!menu) return;
+  menu.addEventListener("keydown", (e) => {
+    const items = menuItems(menu);
+    if (!items.length) return;
+    const at = items.indexOf(document.activeElement);
+    if (e.key === "ArrowDown") { e.preventDefault(); focusMenuItem(menu, at + 1); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); focusMenuItem(menu, at - 1); }
+    else if (e.key === "Home") { e.preventDefault(); focusMenuItem(menu, 0); }
+    else if (e.key === "End") { e.preventDefault(); focusMenuItem(menu, items.length - 1); }
+    else if (e.key === "Escape") { e.preventDefault(); close(); }
+  });
+}
+wireMenuKeys("stopMenu", () => closeStopMenu());
+wireMenuKeys("wakeMenu", () => closeWakeMenu());
+wireMenuKeys("hopMenu", () => closeHopMenu());
+wireMenuKeys("askMenu", () => closeAskMenu());
+
+// ---- modal focus ----
+// Tab used to walk straight out of the settings dialog and through the page
+// behind it, and closing left focus on nothing.
+let settingsOpener = null;
+function trapSettingsTab(e) {
+  if (e.key !== "Tab" || $("overlay").style.display === "none") return;
+  const focusable = [...$("overlay").querySelectorAll(
+    'button, input, select, textarea, a[href], [tabindex]:not([tabindex="-1"])')]
+    .filter((el) => !el.disabled && el.offsetParent !== null);
+  if (!focusable.length) return;
+  const first = focusable[0], last = focusable[focusable.length - 1];
+  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+}
+document.addEventListener("keydown", trapSettingsTab);
+
 $("pills").addEventListener("click", async (e) => {
   const moon = e.target.closest(".moon");
   if (moon && state.summary) {
@@ -2792,6 +3061,7 @@ function openStopMenu() {
   $("stopWrap").classList.add("open");
   $("stopMore").setAttribute("aria-expanded", "true");
   if (state.summary) renderStopMenu(state.summary);
+  focusMenu($("stopMenu"));
 }
 function toggleStopMenu() {
   if ($("stopWrap").classList.contains("open")) closeStopMenu();
@@ -3387,21 +3657,27 @@ async function refreshRooms() {
     const seatTag = nonDefault
       ? `<span style="font-size:10px;opacity:.7">${seats.map(seatAvatar).join("+")}</span>`
       : "";
-    const b = document.createElement("button");
-    b.className = "room-item" + (name === state.room ? " active" : "");
-    b.innerHTML = `<span class="dot"></span><span style="flex:1;overflow:hidden;text-overflow:ellipsis">${esc(name)}</span>` +
-      `<span class="rmeta">${seatTag}${linked ? "📁" : ""}${mode === "work" ? "🔨" : ""}</span>` +
-      `<span class="racts"><span class="ract" data-act="rename" title="Rename room">✎</span>` +
+    // A row, not one big button: the rename and delete controls have to be real
+    // buttons to be reachable by keyboard, and nesting a button inside a button
+    // is invalid — which is why they used to be unfocusable spans revealed only
+    // on hover, leaving no keyboard path to either action.
+    const row = document.createElement("div");
+    row.className = "room-item" + (name === state.room ? " active" : "");
+    row.innerHTML =
+      `<button type="button" class="ropen"><span class="dot"></span>` +
+      `<span style="flex:1;overflow:hidden;text-overflow:ellipsis;text-align:left">${esc(name)}</span>` +
+      `<span class="rmeta">${seatTag}${linked ? "📁" : ""}${mode === "work" ? "🔨" : ""}</span></button>` +
+      `<span class="racts"><button type="button" class="ract" data-act="rename" title="Rename room" aria-label="Rename ${esc(name)}">✎</button>` +
       // the default room is the app's fallback; it can be emptied, not removed
-      (name === "default" ? "" : `<span class="ract del" data-act="delete" title="Delete room">✕</span>`) +
+      (name === "default" ? "" : `<button type="button" class="ract del" data-act="delete" title="Delete room" aria-label="Delete ${esc(name)}">✕</button>`) +
       `</span>`;
-    b.onclick = (e) => {
+    row.onclick = (e) => {
       const act = e.target.closest(".ract");
-      if (!act) return loadRoom(name);
+      if (!act) { setNavOpen(false); return loadRoom(name); }
       e.stopPropagation();
       if (act.dataset.act === "rename") renameFlow(name); else deleteFlow(name);
     };
-    list.appendChild(b);
+    list.appendChild(row);
   }
 }
 // New-room seat pickers: pre-filled with the default pair, visible so the
@@ -4156,9 +4432,13 @@ function retireSettingsPick() { settingsPick++; }
 function closeSettings() {
   retireSettingsPick();
   $("overlay").classList.remove("open");
+  // Closing a dialog used to leave focus on nothing at all.
+  if (settingsOpener && document.contains(settingsOpener)) settingsOpener.focus();
+  settingsOpener = null;
 }
 function openSettings() {
   const s = state.summary; if (!s) return;
+  settingsOpener = document.activeElement;
   retireSettingsPick();
   $("roomPath").textContent = s.dir;
   $("mDelete").hidden = s.name === "default"; // the fallback room can't be removed

@@ -1630,11 +1630,42 @@ async function main() {
   console.log("api access");
   const page = await fetch(base + "/").then((r) => r.text());
   const markdownSource = (page.match(/const SENT_A[\s\S]*?\r?\n}\r?\n(?=document\.addEventListener)/) || [])[0];
+  // renderMD calls the highlighter, which lives above it, so the slice has to
+  // carry both or the extracted function throws on the first code block.
+  const highlightSource = (page.match(/\/\/ ---- syntax highlighting ----[\s\S]*?\r?\n}\r?\n(?=\r?\n\/\/ -+ markdown)/) || [])[0];
   let renderMarkdown = null;
+  let highlight = null;
+  const escapeHTML = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
   try {
-    const escapeHTML = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
-    renderMarkdown = markdownSource ? Function("esc", `${markdownSource}; return renderMD;`)(escapeHTML) : null;
+    renderMarkdown = markdownSource
+      ? Function("esc", `${highlightSource || ""}; ${markdownSource}; return renderMD;`)(escapeHTML)
+      : null;
+    highlight = highlightSource ? Function(`${highlightSource}; return highlightCode;`)() : null;
   } catch { /* reported below */ }
+  // The highlighter runs on already-escaped text and may only ever wrap what is
+  // there in spans. Anything else — dropping characters, or emitting a tag —
+  // would mean it had become a second, weaker escaper.
+  const hlCases = [
+    ["js", 'const x = 1; // note\nif (true) return "hi";'],
+    // Literal " 12 " in a string used to be swapped for a highlighted token by
+    // the placeholder scheme this replaced.
+    ["js", 'const s = " 12 "; const n = 12;'],
+    ["python", "def f():\n    return None  # done"],
+    ["js", "</script><img src=x onerror=alert(1)>"],
+    ["html", '<div class="a">hi</div>'],
+    ["bash", 'echo "hi" # comment'],
+    ["rustlang", "fn main() {}"],
+  ];
+  const hlBroken = !highlight ? ["extraction failed"] : hlCases.filter(([lang, code]) => {
+    const input = escapeHTML(code);
+    const out = highlight(input, lang);
+    const stripped = out.replace(/<span class="tok-[a-z]+">/g, "").replace(/<\/span>/g, "");
+    return stripped !== input || /<(?!\/?span)/.test(out);
+  }).map(([lang]) => lang);
+  ok("syntax highlighting only wraps escaped text and never reintroduces markup",
+    !!highlight && hlBroken.length === 0, JSON.stringify(hlBroken));
+  ok("…and an unfamiliar language is left plain rather than guessed at",
+    !!highlight && highlight(escapeHTML("fn main() {}"), "rustlang") === escapeHTML("fn main() {}"));
   const tableHTML = renderMarkdown && renderMarkdown(
     "| Checkpoint | What must be true | If not |\n|:---|:---:|---:|\n| Day 30 | 8 conversations | Change course |",
   );
