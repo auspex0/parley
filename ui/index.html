@@ -281,6 +281,9 @@
   .dchip.cancelled { color: var(--danger); border-color: rgba(242,109,109,.35); }
   .dchip.interrupted { color: var(--warn); border-color: rgba(255,212,121,.35); }
   .dchip.delivered { color: var(--text-faint); }
+  .dretry { color: var(--user); font-weight: 600; font-size: 12px; padding: 1px 4px; }
+  .dretry:hover { text-decoration: underline; }
+  .dretry[disabled] { opacity: .5; text-decoration: none; }
   /* Readable, not struck through: the text is still the record. */
   .bubble.dimmed { opacity: .62; }
 
@@ -496,6 +499,11 @@
   .qp-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 3px 5px 7px; font-size: 11.5px; color: var(--text-faint); }
   .qp-head button { color: var(--danger); font-size: 11.5px; padding: 2px 6px; border-radius: 6px; }
   .qp-head button:hover { background: rgba(242,109,109,.14); }
+  .qp-actions { display: flex; align-items: center; gap: 4px; }
+  /* The hold is not a destructive action, so it does not wear the discard red. */
+  .qp-head .qp-pause { color: var(--text-dim); }
+  .qp-head .qp-pause:hover { background: var(--panel); color: var(--text); }
+  .qp-card.paused { border-style: dashed; opacity: .85; }
   .qp-card { padding: 7px 8px; border-radius: 9px; background: var(--panel); border: 1px solid var(--border); margin-bottom: 6px; }
   .qp-card:last-child { margin-bottom: 0; }
   .qp-top { display: flex; align-items: flex-start; gap: 6px; }
@@ -1318,7 +1326,7 @@ function heardHTML(e) {
 // — still the quote/jump target — and carries its own per-seat status, instead
 // of vanishing behind a pill floating further down the timeline.
 const STATUS_CHIP = {
-  cancelled: { all: "Cancelled before delivery", one: (s) => `Cancelled for ${s}` },
+  cancelled: { all: "Discarded before delivery", one: (s) => `Discarded for ${s}` },
   interrupted: { all: "Response stopped before it finished", one: (s) => `Response stopped for ${s}` },
 };
 function receivedBy(a, e) {
@@ -1360,8 +1368,17 @@ function statusChipHTML(e) {
         ? `Delivered to ${seatLabel(s.seat)}`
         : STATUS_CHIP[s.kind].one(seatLabel(s.seat)),
     }));
+  // The undo lives with the fact it undoes. Per seat, because a split @both can
+  // be discarded for one half and delivered to the other — and the retry joins
+  // the tail of that seat's own lane, so it cannot overtake newer work.
+  const discarded = parts.filter((s) => s.kind === "cancelled").map((s) => s.seat);
+  const one = discarded.length === 1;
+  const retry = discarded.map((a) =>
+    `<button class="dretry" data-retry-discarded="${esc(String(e.n))}" data-retry-seats="${esc(a)}" ` +
+    `title="Deliver this message to ${esc(seatLabel(a))} after everything already queued">` +
+    `${one ? "Retry" : `Retry → ${esc(seatLabel(a))}`}</button>`).join("");
   return `<div class="dstatus">` +
-    chips.map((c) => `<span class="dchip ${c.kind}">${esc(c.text)}</span>`).join("") + `</div>`;
+    chips.map((c) => `<span class="dchip ${c.kind}">${esc(c.text)}</span>`).join("") + retry + `</div>`;
 }
 // The cancellation notice is a durable record for agents and for auditing — it
 // stays in events.jsonl, in transcript.md and in the seat's delta — but it is no
@@ -1742,6 +1759,22 @@ document.addEventListener("click", (e) => {
   if (!target) return;
   closeQueuePop();
   jumpToEntry(Number(target.dataset.jumpN));
+});
+// Re-deliver a message that was discarded before it reached a seat. Delegated,
+// because the button lives on a message that any rebuild may replace.
+document.addEventListener("click", async (e) => {
+  const btn = e.target.closest("[data-retry-discarded]");
+  if (!btn || btn.disabled) return;
+  const n = Number(btn.dataset.retryDiscarded);
+  const agents = (btn.dataset.retrySeats || "").split(",").filter(Boolean);
+  btn.disabled = true; // the summary that follows removes the row entirely
+  try {
+    await api("/api/queue/retry", { room: state.room, n, ...(agents.length ? { agents } : {}) });
+    toast(`Queued again for ${agents.map(seatLabel).join(" and ")}.`);
+  } catch (err) {
+    btn.disabled = false;
+    toast(err.message, true);
+  }
 });
 
 // The reader's place, as a message and an offset rather than a scroll position.
@@ -2325,7 +2358,7 @@ function applySummary(s) {
   for (const a of s.busy) ensureLive(a);
   applyLiveRefs();
   renderBusyStrip();
-  setQueue(s.queued || 0, s.queue, s.queuedDispatches);
+  setQueue(s.queued || 0, s.queue, s.queuedDispatches, s.queuePaused);
   refreshHeard(0, Infinity); // busy/cursor changes can flip pending/unheard dots
   updateBusyUI();
   renderHopControl();
@@ -2433,7 +2466,8 @@ document.querySelectorAll(".mbtn").forEach((b) => {
 // click flip on sub-second timing the user cannot see. The chooser is for the
 // questions a single click genuinely cannot answer: two seats running, work
 // still queued, or a pair cycle larger than the turn on screen.
-const stopIsChoice = (s) => (s.busy || []).length > 1 || (s.queued || 0) > 0 || !!s.workingPair;
+const stopIsChoice = (s) => (s.busy || []).length > 1 || (s.queued || 0) > 0 ||
+  !!s.workingPair || !!s.queuePaused;
 
 // The open menu is a snapshot of the moment it was opened. Status events land
 // several times a second while agents work, and rebuilding the list under an
@@ -2462,9 +2496,18 @@ function stopMenuRows(summary) {
     key: "active", cls: "stop-scope", attrs: `data-stop-scope="active"`,
     html: `■ Stop current responses<span class="sm-sub">keeps queued work</span>`,
   });
+  const held = !!summary.queuePaused;
+  // Not a stop scope: this row must never reach /api/stop.
+  if (queued > 0 || held) rows.push({
+    key: "hold", cls: "stop-scope", attrs: `data-queue-pause="${held ? "0" : "1"}"`,
+    html: `${held ? "▶ Resume the queue" : "⏸ Pause the queue"}` +
+      `<span class="sm-sub">${held
+        ? "queued messages start again, in order"
+        : "nothing new starts; running responses finish"}</span>`,
+  });
   if (queued > 0) rows.push({
     key: "queue", cls: "stop-scope", attrs: `data-stop-scope="queue"`,
-    html: `✕ Cancel ${queuedMessages} queued message${queuedMessages === 1 ? "" : "s"}` +
+    html: `✕ Discard ${queuedMessages} queued message${queuedMessages === 1 ? "" : "s"}` +
       `<span class="sm-sub">keeps active responses</span>`,
   });
   rows.push({
@@ -2523,7 +2566,8 @@ function updateBusyUI() {
   const active = summary ? summary.busy : [];
   // Queued-but-idle counts: the queue is work the user asked for, and the menu
   // is where they cancel it without touching anything that is running.
-  const visible = !!summary && (active.length > 0 || summary.working || (summary.queued || 0) > 0);
+  const visible = !!summary &&
+    (active.length > 0 || summary.working || (summary.queued || 0) > 0 || !!summary.queuePaused);
   const wrap = $("stopWrap");
   wrap.style.display = visible ? "flex" : "none"; // sending stays allowed — messages queue
   if (!visible) { closeStopMenu(); return; }
@@ -2539,17 +2583,25 @@ function updateBusyUI() {
 }
 
 // ---- queued work ----
-function setQueue(n, items, dispatches) {
+function setQueue(n, items, dispatches, paused) {
   if (items) state.queue = items;
   if (state.summary) {
     state.summary.queued = n;
     if (dispatches !== undefined) state.summary.queuedDispatches = dispatches;
+    if (paused !== undefined) state.summary.queuePaused = !!paused;
   }
+  const held = !!(state.summary && state.summary.queuePaused);
   const shown = dispatches === undefined ? n : dispatches;
   const b = $("queueBadge");
-  b.style.display = n > 0 ? "inline-flex" : "none";
-  b.textContent = `⏳ ${shown} queued`;
-  if (n <= 0) closeQueuePop();
+  // An armed pause is never invisible: it survives an empty queue on purpose,
+  // so the badge has to stay and say so, or the next message the user sends
+  // would be held with nothing on screen explaining why.
+  b.style.display = (n > 0 || held) ? "inline-flex" : "none";
+  b.textContent = held ? (n > 0 ? `⏸ ${shown} held` : "⏸ queue paused") : `⏳ ${shown} queued`;
+  b.title = held
+    ? "The queue is paused — nothing new starts until you resume it"
+    : "See what's waiting";
+  if (n <= 0 && !held) closeQueuePop();
   else if ($("queueWrap").classList.contains("open")) renderQueuePop();
   // The Stop menu offers "cancel the queue" and counts what it would drop, so
   // it goes stale the moment the queue moves — including when the queue drains
@@ -2596,26 +2648,42 @@ function queueCardHTML(g) {
   const runRows = running.map((b) =>
     `<span class="qp-row running"><i class="bs-dot" style="background:${esc(seatColor(b.agent))}"></i>` +
     `${esc(seatLabel(b.agent))} ${esc(RUNNING_VERB[b.phase] || "responding")}</span>`);
+  // Position survives a hold — that is exactly what pause preserves — so the
+  // "#3" suffix stays in both wordings.
+  const held = !!(state.summary && state.summary.queuePaused);
   const waitRows = g.rows.map((r) =>
     `<span class="qp-row"><i class="bs-dot" style="background:${esc(seatColor(r.agent))}"></i>` +
-    `${esc(seatLabel(r.agent))} ${r.kind === "cycle" ? "pair cycle queued" : "queued"}` +
+    `${esc(seatLabel(r.agent))} ${r.kind === "cycle"
+      ? (held ? "pair cycle held" : "pair cycle queued")
+      : (held ? "held" : "queued")}` +
     `${r.pos ? ` #${r.pos}` : ""}</span>`);
   const meta = [hhmm(g.ts), g.target ? `@${g.target}` : ""].filter(Boolean).join(" · ");
-  return `<div class="qp-card">` +
+  return `<div class="qp-card${held ? " paused" : ""}">` +
     `<div class="qp-top">` +
     `<button class="qp-src"${g.sourceN === null || g.sourceN === undefined ? "" : ` data-jump-n="${esc(String(g.sourceN))}"`} title="Jump to this message">` +
     `<span class="qp-snip">${esc(g.text || "(no text)")}</span><span class="qp-meta">${esc(meta)}</span></button>` +
     (g.groupId ? `<button class="qp-x" data-cancel-group="${esc(g.groupId)}" ` +
-      `title="Cancel everything this message still has waiting — anything already running continues">✕</button>` : "") +
+      `title="Discard everything this message still has waiting — anything already running continues">✕</button>` : "") +
     `</div><div class="qp-rows">${runRows.join("")}${waitRows.join("")}</div></div>`;
 }
 function renderQueuePop() {
   const groups = queueGroups();
-  $("queuePop").innerHTML = groups.length
-    ? `<div class="qp-head"><span>Queued work</span>` +
-      `<button data-cancel-group="" title="Drop everything still waiting; running responses continue">Cancel all queued</button></div>` +
-      groups.map(queueCardHTML).join("")
-    : `<div class="qp-empty">Nothing is waiting.</div>`;
+  const held = !!(state.summary && state.summary.queuePaused);
+  const head = `<div class="qp-head"><span>${held ? "Held by you" : "Queued work"}</span>` +
+    `<span class="qp-actions">` +
+    `<button class="qp-pause" data-queue-pause="${held ? "0" : "1"}" title="${held
+      ? "Start delivering queued work again, in order"
+      : "Hold everything still waiting; running responses finish and nothing is lost"}">` +
+    `${held ? "▶ Resume" : "⏸ Pause"}</button>` +
+    (groups.length
+      ? `<button data-cancel-group="" title="Discard everything still waiting; running responses continue">Discard all queued</button>`
+      : "") +
+    `</span></div>`;
+  $("queuePop").innerHTML = head + (groups.length
+    ? groups.map(queueCardHTML).join("")
+    : `<div class="qp-empty">${held
+      ? "Nothing is waiting — anything you send now is held."
+      : "Nothing is waiting."}</div>`);
 }
 $("queueBadge").onclick = (e) => {
   e.stopPropagation();
@@ -2626,13 +2694,15 @@ $("queueBadge").onclick = (e) => {
   if (open) renderQueuePop();
 };
 $("queuePop").addEventListener("click", async (e) => {
+  const hold = e.target.closest("[data-queue-pause]");
+  if (hold) return setQueuePaused(hold.dataset.queuePause === "1");
   const btn = e.target.closest("[data-cancel-group]");
   if (!btn) return;
   const groupId = btn.dataset.cancelGroup;
   try {
     const r = await api("/api/queue/cancel", { room: state.room, ...(groupId ? { groupId } : {}) });
     // Already drained is not a failure: what the user asked to be gone is gone.
-    toast(r.cancelled ? `Cancelled ${r.cancelled} queued deliver${r.cancelled === 1 ? "y" : "ies"}.`
+    toast(r.cancelled ? `Discarded ${r.cancelled} queued deliver${r.cancelled === 1 ? "y" : "ies"}.`
       : "That was already out of the queue.");
   } catch (err) { toast(err.message, true); }
 });
@@ -2893,7 +2963,7 @@ function connect(resyncOnOpen = false) {
     if (msg.type === "entry") addEntry(msg.entry);
     else if (msg.type === "receipt") addReceipt(msg.receipt);
     else if (msg.type === "queue") {
-      setQueue(msg.size, msg.items, msg.dispatches);
+      setQueue(msg.size, msg.items, msg.dispatches, msg.paused);
     }
     else if (msg.type === "lurk") whisper(msg.agent, msg.error, msg.hop, msg.skipped, msg.asleep, msg.held, msg.queued, msg.attention);
     else if (msg.type === "status") {
@@ -3445,9 +3515,21 @@ async function stopResponses(scope, agent) {
     if (r && r.stale) return; // already over; the user's intent already holds
     if (scope === "queue") {
       toast(r && r.cancelled
-        ? `Cancelled ${r.cancelled} queued deliver${r.cancelled === 1 ? "y" : "ies"} — running responses continue.`
+        ? `Discarded ${r.cancelled} queued deliver${r.cancelled === 1 ? "y" : "ies"} — running responses continue.`
         : "Nothing was left in the queue.");
     }
+  } catch (e) { toast(e.message, true); }
+}
+// A hold, not a stop: nothing is dropped, reordered or abandoned, and running
+// responses finish. Shared by the Stop menu row and the queue popover.
+async function setQueuePaused(paused) {
+  closeStopMenu();
+  try {
+    const r = await api("/api/queue/pause", { room: state.room, paused });
+    setQueue(r.queued, undefined, r.dispatches, r.paused);
+    toast(r.paused
+      ? "Queue paused — running responses finish; anything you send is held."
+      : "Queue resumed.");
   } catch (e) { toast(e.message, true); }
 }
 // One click, one meaning. With a single response running and nothing queued the
@@ -3470,6 +3552,8 @@ $("stopBtn").onclick = () => {
 $("stopMore").onclick = () => { if (state.summary) toggleStopMenu(); };
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeStopMenu(); });
 $("stopMenu").onclick = (e) => {
+  const hold = e.target.closest("[data-queue-pause]");
+  if (hold && !hold.disabled) return setQueuePaused(hold.dataset.queuePause === "1");
   const choice = e.target.closest("[data-stop-scope]");
   // A row whose run ended while the menu was open is disabled where it stands.
   if (!choice || choice.disabled) return;

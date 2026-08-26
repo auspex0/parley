@@ -888,7 +888,7 @@ async function checkFolderPickerUi() {
   const menu = probe.stopMenu();
   ok("the Stop menu names each scope and counts messages, not deliveries",
     /data-stop-scope="seat" /.test(menu) && /data-stop-scope="active"/.test(menu) &&
-    /Cancel 2 queued messages/.test(menu) && /data-stop-scope="all"/.test(menu), menu);
+    /Discard 2 queued messages/.test(menu) && /data-stop-scope="all"/.test(menu), menu);
 
   ok("a reply that directly follows its source still carries the quote",
     /data-jump-n="4"/.test(probe.entryQuote({ n: 5, kind: "agent", author: "claude", meta: { replyTo: 4 } })));
@@ -1006,7 +1006,7 @@ async function checkFolderPickerUi() {
   uiSummary.cancelledDeliveries = { "4": ["claude", "codex"] };
   probe.seedRoom(uiSummary, [bothEntry], []);
   ok("when every addressed seat shared one outcome the chip says it once",
-    probe.statusChip(4) === '<div class="dstatus"><span class="dchip cancelled">Cancelled before delivery</span></div>',
+    /^<div class="dstatus"><span class="dchip cancelled">Discarded before delivery<\/span>/.test(probe.statusChip(4)),
     probe.statusChip(4));
   uiSummary.cancelledDeliveries = { "4": ["codex"] };
   uiSummary.interruptedResponses = {};
@@ -1014,7 +1014,12 @@ async function checkFolderPickerUi() {
     [{ agent: "claude", from: 0, upTo: 4, turn: 4, mode: "turn", spoke: true, ts: "2026-08-05T02:03:00" }]);
   const split = probe.statusChip(4);
   ok("a split outcome names each seat and what it actually got",
-    /Delivered to Claude/.test(split) && /Cancelled for Codex/.test(split), split);
+    /Delivered to Claude/.test(split) && /Discarded for Codex/.test(split), split);
+  // The undo lives with the fact it undoes, and only for the seat that missed
+  // it — the half that was delivered must not be offered a second copy.
+  ok("only the discarded half of a split @both offers a retry",
+    (split.match(/data-retry-discarded/g) || []).length === 1 &&
+    /data-retry-seats="codex"/.test(split) && !/data-retry-seats="claude"/.test(split), split);
   uiSummary.cancelledDeliveries = {};
   uiSummary.interruptedResponses = { "4": ["claude"] };
   probe.seedRoom(uiSummary, [bothEntry], []);
@@ -1769,7 +1774,7 @@ async function main() {
     page.includes("if (r && r.stale) return;"));
   ok("queue cards group by dispatch, not by source message",
     page.includes("item.queueGroupId || `seq:${item.seq}`") &&
-    page.includes("data-cancel-group") && page.includes("Cancel all queued"));
+    page.includes("data-cancel-group") && page.includes("Discard all queued"));
   ok("a historical Pair Continue button pins the exact cap it represents",
     page.includes('api("/api/pair/continue", { room: state.room, capN: e.n })'));
   ok("folder picker UI names the taskbar fallback that now exists",
@@ -4938,6 +4943,71 @@ async function main() {
   const cancelGone = await api("POST", "/api/queue/cancel", { room: "queueview", groupId: rows[0].queueGroupId });
   ok("cancelling an already-drained dispatch is not an error",
     cancelGone.status === 200 && cancelGone.data.cancelled === 0);
+
+  // A hold, not a stop. Nothing starts while it is armed — including work sent
+  // afterwards, which is the whole point of pause-then-compose — and nothing is
+  // dropped, reordered or abandoned. Releasing it runs everything in order.
+  await api("POST", "/api/rooms", { name: "queuehold" });
+  await useFakes("queuehold");
+  const holdOn = await api("POST", "/api/queue/pause", { room: "queuehold", paused: true });
+  ok("pausing an empty queue is allowed and arms the hold",
+    holdOn.status === 200 && holdOn.data.paused === true && holdOn.data.changed === true,
+    JSON.stringify(holdOn.data));
+  ok("a second pause is idempotent rather than an error",
+    (await api("POST", "/api/queue/pause", { room: "queuehold", paused: true })).data.changed === false);
+  ok("the pause must be a boolean",
+    (await api("POST", "/api/queue/pause", { room: "queuehold", paused: "yes" })).status === 400);
+  await say("queuehold", "@claude SAY:HELD_ONE");
+  await say("queuehold", "@claude SAY:HELD_TWO");
+  const heldRoom = await waitRoom("queuehold", (d) => d.room.queued === 2, "both messages held");
+  ok("a held queue accepts new work and starts none of it",
+    heldRoom.room.queuePaused === true && heldRoom.room.busy.length === 0 &&
+    heldRoom.room.queued === 2 && !texts(heldRoom).includes("HELD_ONE"),
+    JSON.stringify({ paused: heldRoom.room.queuePaused, busy: heldRoom.room.busy, queued: heldRoom.room.queued }));
+  const holdOff = await api("POST", "/api/queue/pause", { room: "queuehold", paused: false });
+  ok("resuming reports the release", holdOff.status === 200 && holdOff.data.paused === false);
+  d = await idle("queuehold");
+  const heldTexts = texts(d);
+  ok("…and everything held runs, in the order it was sent",
+    heldTexts.includes("HELD_ONE") && heldTexts.includes("HELD_TWO") &&
+    heldTexts.indexOf("HELD_ONE") < heldTexts.indexOf("HELD_TWO"),
+    JSON.stringify(heldTexts));
+
+  // Retrying a discarded delivery is an ordinary enqueue at the tail of the
+  // seat's own lane: it needs no idle seat, and it cannot overtake newer work.
+  await api("POST", "/api/rooms", { name: "queueretry" });
+  await useFakes("queueretry");
+  await say("queueretry", "@claude SLEEP:1500 SAY:BLOCKER");
+  await waitRoom("queueretry", (d) => d.room.busy.includes("claude"), "claude busy");
+  await say("queueretry", "@claude SAY:DISCARDED_ONE");
+  const qr = await waitRoom("queueretry", (d) => (d.room.queue || []).length === 1, "one queued");
+  const discardN = (qr.room.queue || [])[0].sourceN;
+  await api("POST", "/api/queue/cancel", { room: "queueretry", groupId: (qr.room.queue || [])[0].queueGroupId });
+  const discarded = await waitRoom("queueretry",
+    (d) => ((d.room.cancelledDeliveries || {})[String(discardN)] || []).includes("claude"),
+    "the discard is durably recorded");
+  ok("a discarded delivery is recorded against the message, per seat",
+    (discarded.room.cancelledDeliveries[String(discardN)] || []).includes("claude"),
+    JSON.stringify(discarded.room.cancelledDeliveries));
+  const badRetry = await api("POST", "/api/queue/retry", { room: "queueretry", n: 99999 });
+  ok("retrying a message that was never discarded is refused",
+    badRetry.status === 400, JSON.stringify(badRetry.data));
+  const discardRetry = await api("POST", "/api/queue/retry", { room: "queueretry", n: discardN });
+  ok("retrying a discarded delivery is accepted while the seat is still busy",
+    discardRetry.status === 200 && discardRetry.data.n === discardN &&
+    JSON.stringify(discardRetry.data.agents) === JSON.stringify(["claude"]),
+    JSON.stringify(discardRetry.data));
+  d = await idle("queueretry");
+  const retryTexts = texts(d);
+  ok("…and it runs after the response that was already going, not before it",
+    retryTexts.includes("DISCARDED_ONE") && retryTexts.includes("BLOCKER") &&
+    retryTexts.indexOf("BLOCKER") < retryTexts.indexOf("DISCARDED_ONE"),
+    JSON.stringify(retryTexts));
+  ok("…and the withheld marker is cleared once it is actually delivered",
+    !((d.room.cancelledDeliveries || {})[String(discardN)] || []).includes("claude"),
+    JSON.stringify(d.room.cancelledDeliveries));
+  ok("retrying the same message twice is refused once nothing is discarded",
+    (await api("POST", "/api/queue/retry", { room: "queueretry", n: discardN })).status === 400);
 
   // The contract behind "Stop everything": one press, and nothing this exchange
   // would still have spawned — the hop the reply earns, the lurk check after it

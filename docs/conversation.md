@@ -29,11 +29,19 @@ While anything is running you can always see **what each agent is answering**: a
 
 ### The queue
 
-The **⏳ queued** badge opens the queue itself. One card per *dispatch* — the batch of deliveries one send created — showing which agents are responding and which are waiting, with their positions; clicking a card jumps to the message that produced it. Its ✕ cancels everything that dispatch still has waiting without touching anything already running, and "Cancel all queued" is there for the blunt version.
+The **⏳ queued** badge opens the queue itself. One card per *dispatch* — the batch of deliveries one send created — showing which agents are responding and which are waiting, with their positions; clicking a card jumps to the message that produced it. Its ✕ discards everything that dispatch still has waiting without touching anything already running, and "Discard all queued" is there for the blunt version.
 
-### Cancelling — withdrawal, not deletion
+### Holding the queue ⏸
 
-Cancelling withdraws the *delivery*, not the durable room record: the message was accepted the moment you sent it and remains part of the room's history, but the withdrawn seat receives none of its content. From then on Parley stops putting it in front of the agent it was withdrawn from — not in that turn's prompt, not in any later one, not in the history replayed after a session reset, and not as a native image or staged file. That agent is told only that a message was sent and cancelled; an agent that *did* receive it keeps it in full and is told who missed it. Stop everything drops the queue on the same terms. If a later retry of that turn re-delivers the message, its withheld markers are cleared — the seat then receives it in full, and later deltas stop describing it as withheld.
+**Pause** holds the queue without dropping any of it. Nothing new starts, responses already running finish normally, and the queue keeps its exact contents and order — the badge switches to **⏸ held** and cards read "held #2" rather than "queued #2". Anything you send while it is held joins the queue too, so pause-then-compose works: line up three messages, read what came back, then release them. **Resume** starts everything whose seat is free, in order.
+
+The hold is about *your* work, not the agents'. Hops, a live lurker's right of reply and causal answers between the agents are unaffected — a paused delivery stops competing for the seat, so an agent follow-up is not left waiting on a seat nobody is going to claim. A lurk catch-up owed to a held seat becomes a persisted obligation that runs on resume, exactly as it would behind a busy seat.
+
+Pause is deliberately not saved across a restart: there would be no queue behind it, and it would silently swallow the first thing you sent. It is also armed rather than counted — pausing an empty queue is allowed and holds whatever you send next, which is why the badge stays visible saying so.
+
+### Discarding — withdrawal, not deletion
+
+Discarding withdraws the *delivery*, not the durable room record: the message was accepted the moment you sent it and remains part of the room's history, but the withdrawn seat receives none of its content. The message keeps its place in the thread, dims, and grows a **Discarded before delivery · Retry** line — that Retry re-delivers it to the seat that missed it, at the tail of that seat's lane, so it cannot overtake anything you sent since. From then on Parley stops putting it in front of the agent it was withdrawn from — not in that turn's prompt, not in any later one, not in the history replayed after a session reset, and not as a native image or staged file. That agent is told only that a message was sent and cancelled; an agent that *did* receive it keeps it in full and is told who missed it. Stop everything drops the queue on the same terms. If a later retry of that turn re-delivers the message, its withheld markers are cleared — the seat then receives it in full, and later deltas stop describing it as withheld.
 
 This is about what Parley sends, not a secrecy guarantee. The message is still in `transcript.md`, and every agent is told where that file is — a work-mode agent that goes looking can read it, exactly as it can read anything else in the room. Per-seat transcript privacy would be a different feature; if you need a message to be unreadable rather than undelivered, start a fresh conversation.
 

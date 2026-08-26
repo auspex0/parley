@@ -48,6 +48,10 @@ const UI_HTML = fs.readFileSync(UI_FILE, "utf8");
 //    is about instead of as a floating pill. A cached older UI reads a stopped
 //    response as "hasn't seen this yet" — claiming a seat never received a
 //    message it did receive — and still draws the pill the new page moved.
+//    Finally, the queue can be deliberately held: summaries and the queue event
+//    carry `queuePaused`, and a discarded message carries its own per-seat
+//    Retry. A cached older page would render held work as ordinary waiting on a
+//    seat that is visibly idle, with no control to release it.
 const RUNTIME_PROTOCOL = "10";
 const IS_WIN = process.platform === "win32";
 
@@ -1501,6 +1505,11 @@ function loadRoom(name, seatChoice, create = false) {
     cfgEpoch: {},
     busy: new Map(),      // agent -> { startedAt, runId }
     streams: new Map(),   // agent -> coalesced live-reply state, see streamText
+    // A deliberate hold on the queue, not a property of the conversation. In
+    // memory beside `pending` for the same reason `pending` is: a restart has no
+    // queue to hold, so a persisted flag would come back armed with nothing
+    // behind it and silently swallow the next message the user sent.
+    queuePaused: false,
     procs: new Map(),     // agent -> child process
     // agent -> the run record that owns the seat right now. Unlike `procs`,
     // this exists from the instant the seat is claimed, so a Stop pressed
@@ -1999,6 +2008,8 @@ function roomSummary(room) {
     // for both seats is two of them. Anything the user reads has to count
     // messages instead, or a single held @both reads as "2 queued messages".
     queuedDispatches: queuedDispatchCount(room),
+    // Held on purpose, not merely waiting: the seat may well be free.
+    queuePaused: !!room.queuePaused,
     queue: queueSnapshot(room),
     canRetry: retryTargets(room).length > 0,
   };
@@ -2880,9 +2891,13 @@ function findHopTarget(room, entry, opts = {}) {
 // A hop waits for the seat's running turn *and* for any user delivery held for
 // it: the user asked first, so their message must not be answered after a
 // follow-up the agents generated between themselves.
+// A paused delivery is the exception. It will not run until the user says so,
+// and this wait has a deadline (seatTimeout + 5s) — so leaving it in would spend
+// that whole deadline and then record the request as `wait-aborted`, silently
+// losing an agent follow-up because the user pressed ⏸.
 async function waitForHopSeat(room, agent, gen, chain) {
   const deadline = Date.now() + seatTimeout(room, agent) + 5000;
-  while (seatOccupied(room, agent)) {
+  while (seatBlocked(room, agent)) {
     if (gen !== room.generation || chainHalted(room, chain)) return false;
     if (Date.now() > deadline) return false;
     await new Promise((resolve) => setTimeout(resolve, 150));
@@ -3960,16 +3975,16 @@ function relayPolicyForEntry(room, entry) {
 // scheduler as a normal accepted message. Keeping the exchange counter open
 // through attention work prevents a false-idle window and gives Stop/config
 // guards the same chain object for the entire recovered conversation.
-function startRecoveredDelivery(room, userTurn, targets, scope, turnOptions = null) {
+function startRecoveredDelivery(room, userTurn, targets, scope, turnOptions = null, opts = {}) {
   const gen = room.generation;
   const chain = newChain(room);
   const queueGroupId = `d${room.dispatchSeq++}`;
   const relayPolicy = relayPolicyForEntry(room, userTurn);
-  const noteStoppedRecoveryLurkers = (invoked = new Set(targets)) => {
+  const noteRecoveryLurkers = (reason, invoked = new Set(targets)) => {
     if (relayPolicy.solo || userTurn.target === "both") return;
     for (const agent of seatIds(room)) {
       if (!invoked.has(agent) && room.cfg.agents[agent].lurk) {
-        noteLurkOutcome(room, agent, userTurn.n, "stopped");
+        noteLurkOutcome(room, agent, userTurn.n, reason);
       }
     }
   };
@@ -3981,9 +3996,18 @@ function startRecoveredDelivery(room, userTurn, targets, scope, turnOptions = nu
   room.hopRuns.set(queueGroupId, hopRun);
   (async () => {
     try {
+      const dispatch = { queueGroupId, chain };
       const results = await Promise.allSettled(targets.map((agent) => {
-        chain.delivered++;
         const extra = typeof turnOptions === "function" ? (turnOptions(agent) || {}) : (turnOptions || {});
+        // Retrying a discarded delivery is an ordinary enqueue, never a launch:
+        // it joins the tail of the seat's own lane, so it cannot overtake work
+        // the user sent afterwards and needs no idle seat to be accepted.
+        if (opts.viaQueue) {
+          return deferDelivery(room, agent, userTurn, scope, dispatch, {
+            turnOptions: extra, onStart: opts.onStart || null,
+          });
+        }
+        chain.delivered++;
         return runAgentTurn(room, agent, userTurn, scope, {
           ...extra, queueGroupId, chain,
         });
@@ -3991,8 +4015,14 @@ function startRecoveredDelivery(room, userTurn, targets, scope, turnOptions = nu
       if (gen !== room.generation) return;
       await withRootRelay(room, userTurn.n, async () => {
         if (gen !== room.generation) return;
+        // Every re-delivery this retry owed was discarded again before it ran.
+        // There is no exchange to continue and no lurk check to run.
+        if (chain.cancelled && !chain.delivered) {
+          noteRecoveryLurkers("cancelled");
+          return;
+        }
         if (chainHalted(room, chain)) {
-          noteStoppedRecoveryLurkers();
+          noteRecoveryLurkers("stopped");
           return;
         }
         const replies = results
@@ -4019,7 +4049,7 @@ function startRecoveredDelivery(room, userTurn, targets, scope, turnOptions = nu
         // too instead of creating one permanently un-overheard exchange class.
         if (gen !== room.generation) return;
         if (chainHalted(room, chain)) {
-          noteStoppedRecoveryLurkers(coordinator.invoked);
+          noteRecoveryLurkers("stopped", coordinator.invoked);
           return;
         }
         const listeners = relayPolicy.solo || userTurn.target === "both"
@@ -4211,7 +4241,10 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles, rawRel
   // sent to two busy agents still reaches whichever frees first instead of
   // waiting for the slower one. A pair turn has no half to deliver, so what
   // waits is its whole cycle; the mode change and the task still land now.
-  const deferred = new Set(asPairTurn ? [] : agents.filter((a) => seatOccupied(room, a)));
+  // A paused queue holds new work too. A "pause" that only held what was already
+  // there would keep launching everything sent afterwards, which is the opposite
+  // of what someone reaching for it wants.
+  const deferred = new Set(asPairTurn ? [] : agents.filter((a) => room.queuePaused || seatOccupied(room, a)));
   // Every occupied seat is deferred above, so this cannot fire — it guards the
   // invariant that nothing starts a second turn on a seat already running one.
   if (!asPairTurn && agents.some((a) => room.busy.has(a) && !deferred.has(a))) {
@@ -4286,7 +4319,7 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles, rawRel
     // line drawn behind it.
     const start = () => runPairCycle(room, userTurn, snap, gen, chain)
       .catch((e) => noteChainFailure(room, "pair cycle", e));
-    if (room.pairActive || allSeats.some((a) => seatOccupied(room, a))) {
+    if (room.queuePaused || room.pairActive || allSeats.some((a) => seatOccupied(room, a))) {
       enqueue(room, {
         kind: "cycle", agents: [...allSeats], pairTurn: true, gen,
         stopAt: chain.stopAt, chain,
@@ -4958,6 +4991,7 @@ function broadcastQueue(room) {
   broadcast(room, {
     type: "queue", size: queueSize(room),
     dispatches: queuedDispatchCount(room), items: queueSnapshot(room),
+    paused: !!room.queuePaused,
   });
 }
 
@@ -4976,6 +5010,18 @@ function seatOccupied(room, agent) {
   return room.busy.has(agent) || room.pending.some((p) => p.agents.includes(agent));
 }
 
+// The *scheduling* view of the same seat. A paused delivery keeps its place in
+// the user's arrival order — seatOccupied still reports it, which is what stops
+// a later message overtaking it — but it has stopped competing for the seat,
+// because the user asked for it to wait. Work that ranks below user deliveries
+// and would otherwise sit in a timed wait for a seat nobody is going to claim
+// asks this instead.
+function seatBlocked(room, agent) {
+  if (room.busy.has(agent)) return true;
+  if (room.queuePaused) return false;
+  return room.pending.some((p) => p.agents.includes(agent));
+}
+
 function enqueue(room, item) {
   room.pending.push({ seq: room.pendingSeq++, ...item });
   broadcastQueue(room);
@@ -4985,7 +5031,7 @@ function enqueue(room, item) {
 // The entry is never appended twice; only its delivery is split. Resolves with
 // the reply entry, or null if the turn failed, was stopped or was abandoned —
 // so the single hop/lurk chain that awaits it always runs exactly once.
-function deferDelivery(room, agent, userTurn, scope, dispatch = {}) {
+function deferDelivery(room, agent, userTurn, scope, dispatch = {}, opts = {}) {
   let settle;
   const done = new Promise((resolve) => { settle = resolve; });
   enqueue(room, {
@@ -5001,7 +5047,13 @@ function deferDelivery(room, agent, userTurn, scope, dispatch = {}) {
       // own lane is the ordinary case and needs no marking.
       const deferred = userTurn.target === "both";
       if (dispatch.chain) dispatch.chain.delivered++;
+      // A re-delivery clears its withheld marker here rather than at enqueue.
+      // Cleared early, the receipt dot would immediately fall through to the
+      // seat's cursor — long past this entry — and claim the seat has seen a
+      // message that is still sitting in the queue.
+      if (opts.onStart) opts.onStart(agent);
       runAgentTurn(room, agent, userTurn, scope, {
+        ...(opts.turnOptions || {}),
         deferred, queueGroupId: dispatch.queueGroupId || null, chain: dispatch.chain || null,
       }).then(settle, () => settle(null));
     },
@@ -5025,6 +5077,13 @@ function drainLanes(room) {
     scheduleCatchUps(room);
     return;
   }
+  // Pause is a hold, not a stop: checked here, before the claim loop, so nothing
+  // is started, dropped, reordered or abandoned while held. The queue the user
+  // sees is byte-for-byte the queue that was there when they pressed ⏸. The two
+  // things that can make a pending item stale — a generation bump (/new) and a
+  // stop-epoch bump (Stop everything) — both empty `pending` themselves, so
+  // skipping the drop pass here cannot leak a stale item.
+  if (room.queuePaused) return;
   const claimed = new Set([...room.busy.keys()]);
   const still = [], go = [], drop = [];
   for (const item of room.pending) {
@@ -5129,7 +5188,7 @@ function recordWithdrawals(room, dropped, cause = null) {
     kind: "system", author: "system",
     text: asleepSeat
       ? `⏹ ${asleepSeat} was put to sleep with work still queued — ${detail}.`
-      : `⏹ Cancelled before delivery — ${detail}.`,
+      : `⏹ Discarded before delivery — ${detail}.`,
     meta: { cancelledQueue: true, withdrawals, ...(asleepSeat ? { asleepSeat } : {}) },
   });
   // Receipt dots derive from the room summary. The queue event was emitted
@@ -5152,6 +5211,29 @@ function clearWithdrawals(room, n, seats) {
   // Retry changes the meaning of the receipt dot before the response finishes;
   // do not leave the browser showing a stale withheld state until releaseSeat.
   broadcast(room, { type: "room", room: roomSummary(room) });
+}
+
+// The one low-level re-dispatch primitive. It reuses the original bubble, joins
+// the tail of the seat's own lane, and clears the withheld markers for the seats
+// that never received it. `priority` is deliberately not a free parameter:
+// head-of-lane has exactly one producer in the system, and it is not this one.
+function dispatchFromSource(room, { sourceN, seats, instruction = null, priority = "tail", clearWithdrawal = true }) {
+  if (priority !== "tail") {
+    throw Object.assign(new Error(`unsupported dispatch priority: ${priority}`), { status: 400 });
+  }
+  if (instruction) {
+    throw Object.assign(new Error("instruction dispatch is not implemented yet"), { status: 400 });
+  }
+  const root = room.entries.find((e) => e.n === Number(sourceN) && e.kind === "user");
+  if (!root) throw Object.assign(new Error("that message isn't in this conversation any more"), { status: 400 });
+  // The boundary the original ran under, latched exactly as Retry does, so a
+  // Work→Talk flip since the discard cannot widen this delivery.
+  const scope = makeScope(room, root.n, root.target, rootDiscussion(room, root.n));
+  startRecoveredDelivery(room, root, seats, scope, null, {
+    viaQueue: true,
+    ...(clearWithdrawal ? { onStart: (agent) => clearWithdrawals(room, root.n, [agent]) } : {}),
+  });
+  return { n: root.n, agents: [...seats] };
 }
 
 // ---- sleep and wake ----
@@ -5325,6 +5407,38 @@ function asleepRefusal(room, agents, detail) {
   return Object.assign(
     new Error(`${agents.join(" and ")} ${plural ? "are" : "is"} asleep — ${detail(plural ? "them" : "it")}`),
     { status: 409 });
+}
+
+// Retry any message that was discarded before delivery. Eligibility comes from
+// `cancelledDeliveries`, not from `lastUser.done`: the durable record is per
+// message and per seat, it survives newer traffic replacing `lastUser`, and it
+// is what prevents re-delivering to a seat that already received this.
+function handleRetryDiscarded(room, sourceN, requested = null) {
+  const n = Number(sourceN);
+  if (!Number.isSafeInteger(n) || n <= 0) throw Object.assign(new Error("n must be a turn number"), { status: 400 });
+  const seats = seatIds(room);
+  const withheld = (room.state.cancelledDeliveries || {})[String(n)] || [];
+  let wanted = withheld.filter((a) => seats.includes(a));
+  if (Array.isArray(requested) && requested.length) {
+    const asked = requested.map((a) => String(a).toLowerCase());
+    for (const a of asked) {
+      if (!seats.includes(a)) throw Object.assign(new Error(`unknown agent: ${a}`), { status: 400 });
+    }
+    wanted = wanted.filter((a) => asked.includes(a));
+  }
+  if (!wanted.length) throw Object.assign(new Error("nothing was discarded for that message"), { status: 400 });
+  // Already waiting is not an error worth reporting, but it must not produce a
+  // second delivery of the same message to the same seat.
+  const already = wanted.filter((a) => room.pending.some((p) => p.sourceN === n && p.agents.includes(a)));
+  const dozing = wanted.filter((a) => isAsleep(room, a));
+  const targets = wanted.filter((a) => !already.includes(a) && !dozing.includes(a));
+  if (!targets.length) {
+    if (already.length) {
+      throw Object.assign(new Error(`that message is already queued for ${already.join(" and ")}`), { status: 409 });
+    }
+    throw asleepRefusal(room, dozing, (them) => `wake ${them} to retry that delivery.`);
+  }
+  return dispatchFromSource(room, { sourceN: n, seats: targets });
 }
 
 function handleRetry(room) {
@@ -5747,6 +5861,9 @@ function handleNewConversation(room) {
   room.entries = [];
   room.receipts = [];
   room.hopRuns.clear();
+  // A fresh conversation starts unheld; the queue this pause was holding is
+  // being archived with everything else.
+  room.queuePaused = false;
   // No withdrawal record here, unlike Stop-everything: the entry a held
   // delivery would have delivered is being archived along with the rest of the
   // conversation, and the fresh state has nothing to be truthful about.
@@ -6087,7 +6204,40 @@ const server = http.createServer(async (req, res) => {
       // Cancelling a group that already drained is not a failure — the user
       // asked for it to be gone and it is gone.
       const cancelled = cancelQueued(room, body.groupId ? String(body.groupId) : null);
-      return json(res, 200, { ok: true, cancelled, queued: queueSize(room) });
+      return json(res, 200, { ok: true, cancelled, queued: queueSize(room), paused: !!room.queuePaused });
+    }
+
+    if (route === "POST /api/queue/pause") {
+      const body = await readBody(req);
+      const room = loadRoom(body.room || "default");
+      if (typeof body.paused !== "boolean") {
+        return json(res, 400, { error: "paused must be true or false" });
+      }
+      // Idempotent, like /api/seat/sleep: a second click, or a second tab,
+      // reports the state the user asked for rather than an error they would
+      // answer by clicking again.
+      const changed = room.queuePaused !== body.paused;
+      room.queuePaused = body.paused;
+      broadcastQueue(room);
+      broadcast(room, { type: "room", room: roomSummary(room) });
+      // Releasing the hold starts everything whose seat is already free.
+      if (changed && !body.paused) drainLanes(room);
+      return json(res, 200, {
+        ok: true, paused: room.queuePaused, changed,
+        queued: queueSize(room), dispatches: queuedDispatchCount(room),
+      });
+    }
+
+    if (route === "POST /api/queue/retry") {
+      const body = await readBody(req);
+      const room = loadRoom(body.room || "default");
+      // The deliveries themselves arrive over SSE, like every other dispatch.
+      const result = handleRetryDiscarded(room, body.n,
+        Array.isArray(body.agents) ? body.agents : null);
+      return json(res, 200, {
+        ok: true, ...result, queued: queueSize(room),
+        dispatches: queuedDispatchCount(room), paused: !!room.queuePaused,
+      });
     }
 
     if (route === "POST /api/new") {
