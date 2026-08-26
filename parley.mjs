@@ -41,7 +41,13 @@ const UI_HTML = fs.readFileSync(UI_FILE, "utf8");
 //    explicit hops, concurrent @both replies and recovered Wake/Retry work.
 // 10: stream events carry increments ({from, delta}) rather than the whole
 //    reply each time, with periodic full-text keyframes. An older UI reads only
-//    `text` and would blank the live bubble on every increment.
+//    `text` and would blank the live bubble on every increment. The summary
+//    also gains `interruptedResponses` beside `cancelledDeliveries`, so "you
+//    stopped this seat's answer" is a distinct persisted fact rather than
+//    nothing at all, and the cancellation record renders inside the message it
+//    is about instead of as a floating pill. A cached older UI reads a stopped
+//    response as "hasn't seen this yet" — claiming a seat never received a
+//    message it did receive — and still draws the pill the new page moved.
 const RUNTIME_PROTOCOL = "10";
 const IS_WIN = process.platform === "win32";
 
@@ -288,6 +294,13 @@ function defaultState(seats = DEFAULT_SEATS) {
     // Persisted, because "nobody received this" has to stay true on every
     // later turn, not just for the exchange that was cancelled.
     cancelledDeliveries: {},
+    // turn number -> seats that DID receive it and whose launched response the
+    // user stopped before it produced anything durable. The amber half of the
+    // same truth: red says "never delivered", this says "delivered, answer cut
+    // short". Persisted for the same reason — it is a fact about a message/seat
+    // pair, not live lifecycle state — and superseded only by that seat
+    // completing a run rooted in this same entry.
+    interruptedResponses: {},
     // Terminal outcomes for a lurk obligation that was selected but could not
     // complete. Successful/caught-up receipts outrank these historical ranges
     // in the UI, so they never need destructive invalidation.
@@ -1974,6 +1987,11 @@ function roomSummary(room) {
     // spans a withdrawn entry, so without this the UI cheerfully reports that
     // the seat caught up on a message it was never shown.
     cancelledDeliveries: { ...(room.state.cancelledDeliveries || {}) },
+    // Amber, and ahead of every receipt for the same reason: this seat received
+    // the message and every later turn carries it again in context, so a
+    // receipt-first read would quietly erase the fact that the user stopped its
+    // answer.
+    interruptedResponses: { ...(room.state.interruptedResponses || {}) },
     lurkOutcomes: [...(room.state.lurkOutcomes || [])],
     hopRuns: [...(room.hopRuns || new Map()).values()].map((run) => ({ ...run })),
     queued: queueSize(room),
@@ -2156,6 +2174,51 @@ function withdrawalNote(room, agent, e) {
   return seats.length
     ? `(the user cancelled delivery of this message to ${seats.join(" and ")} before it started) `
     : "";
+}
+
+// The amber half of the same per-message truth as cancelledDeliveries. Red says
+// the seat never received it; this says the seat did receive it and the user cut
+// its answer short before anything durable existed. Written only where a turn
+// that actually launched throws `stopped` — never for a delivery dropped from
+// the queue (that is a withdrawal) and never for a request the causal
+// coordinator declined to launch (that is already a terminal outcome with its
+// own copy).
+function interruptedFor(room, n) {
+  const map = room.state.interruptedResponses || {};
+  const seats = map[String(n)];
+  return Array.isArray(seats) ? seats : [];
+}
+
+function recordInterrupted(room, agent, n) {
+  if (n === undefined || n === null) return false;
+  if (!room.state.interruptedResponses) room.state.interruptedResponses = {};
+  const map = room.state.interruptedResponses;
+  const key = String(n);
+  if ((map[key] || []).includes(agent)) return false;
+  map[key] = [...(map[key] || []), agent];
+  saveState(room);
+  // Same reason clearWithdrawals broadcasts: the dot's meaning changes before
+  // the seat is released, and the browser must not sit on a stale one.
+  broadcast(room, { type: "room", room: roomSummary(room) });
+  return true;
+}
+
+// Superseded, never cleared on a timer or by unrelated traffic: only this seat
+// completing a run rooted in this same entry resolves it. Every later turn
+// carries the message in its context bundle, so resolving on a receipt or a
+// cursor advance would degenerate into "amber clears on the next completed
+// turn, whatever it is about". If the replacement run is stopped too, the
+// record simply stands.
+function resolveInterrupted(room, agent, n) {
+  const map = room.state.interruptedResponses;
+  if (!map) return false;
+  const key = String(n);
+  if (!Array.isArray(map[key]) || !map[key].includes(agent)) return false;
+  const left = map[key].filter((seat) => seat !== agent);
+  if (left.length) map[key] = left; else delete map[key];
+  saveState(room);
+  broadcast(room, { type: "room", room: roomSummary(room) });
+  return true;
 }
 
 // Rendered per source and per seat, because the notice must neither reveal a
@@ -2459,6 +2522,11 @@ async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) 
     // backward, or later turns would re-send context the seat already heard.
     room.state.agents[agent].cursor = Math.max(heardFrom, userTurn.n, heardThrough);
     if (room.state.lastUser && room.state.lastUser.n === userTurn.n) room.state.lastUser.done[agent] = true;
+    // This seat has now completed a run explicitly rooted in this message — the
+    // one thing that supersedes an earlier stopped attempt at it. Above the
+    // emptyReply branch so a [pass]/empty completion counts too: the seat was
+    // handed the message again and chose to say nothing.
+    resolveInterrupted(room, agent, userTurn.n);
     if (res.emptyReply) {
       appendReceipt(room, {
         agent, from: heardFrom, upTo: Math.max(userTurn.n, heardThrough),
@@ -2497,11 +2565,23 @@ async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) 
     return replyEntry;
   } catch (e) {
     if (gen !== room.generation) return null; // room was reset; drop the stale error
+    // Amber. The seat received this message — the process ran with it in the
+    // prompt — and the user cut the answer short. Recorded before the notice so
+    // the durable fact survives even if the append throws, and deliberately not
+    // recorded for a provider failure: a failure already renders an error entry
+    // with its own Retry button, while "stopped" is the vocabulary for a run the
+    // user ended. A timeout is not `stopped` and correctly stays a failure.
+    if (e.stopped) recordInterrupted(room, agent, userTurn.n);
     const icon = e.stopped ? "⏹" : "⚠";
     appendEntry(room, {
       kind: "system", author: "system",
       text: `${icon} ${e.stopped ? e.message : `${agent} failed: ${e.message}`}`,
-      meta: { agent, error: !e.stopped, stopped: !!e.stopped },
+      meta: {
+        agent, error: !e.stopped, stopped: !!e.stopped,
+        // Ties the click to the message it interrupted, for auditing and for
+        // asking the same question again from the stop notice.
+        ...(e.stopped ? { interrupted: { agent, sourceN: userTurn.n, rootN: run.rootN } } : {}),
+      },
     });
     return e.stopped && opts.signalStop ? STEP_STOPPED : null;
   } finally {
@@ -2667,6 +2747,12 @@ async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE, opts = 
     // already say this with a neutral ⏹ entry; routing a deliberate Stop down
     // the lurk-error whisper instead put an error in front of the user for
     // something they asked for.
+    // Deliberately no interrupted record on either branch below. A stopped or
+    // failed lurk did not move the cursor and produced no reply anyone was
+    // owed, so the honest status is still "hasn't seen it" — which the
+    // lurkOutcomes range already says precisely, and which a later deliberate
+    // delivery heals. Amber means "received it, answer cut short"; a lurk has
+    // no answer the user asked for.
     if (e.stopped) {
       if (opts.onTerminal) opts.onTerminal("stopped", {
         sinceN: heardFrom + 1, throughN: lastSeen, triggerN: userTurnN,
@@ -2958,6 +3044,11 @@ async function runHopTurn(room, agent, triggerEntry, rootN, scope = NO_SCOPE, op
     applyAdapterSession(room, agent, res, epoch);
     stampPromptDelivery(room, agent, res, epoch, delivery);
     room.state.agents[agent].cursor = Math.max(heardFrom, triggerEntry.n, heardThrough);
+    // A hop, pair review/fix, sibling attention or answer return is explicitly
+    // rooted at the entry it was handed. Completing one supersedes an earlier
+    // stopped attempt at that same entry for this seat. Keyed on the entry the
+    // turn was answering, not the root: that is the one that went amber.
+    resolveInterrupted(room, agent, triggerEntry.n);
     if (res.emptyReply) {
       saveState(room);
       appendReceipt(room, {
@@ -2993,10 +3084,17 @@ async function runHopTurn(room, agent, triggerEntry, rootN, scope = NO_SCOPE, op
   } catch (e) {
     if (gen !== room.generation) return null;
     if (e.stopped) {
+      // Same amber rule as an ordinary turn, and it covers hops, pair
+      // review/fix steps, sibling attention delivery and answer returns
+      // uniformly — every one of them actually launched a provider process.
+      recordInterrupted(room, agent, triggerEntry.n);
       appendEntry(room, {
         kind: "system", author: "system",
         text: `⏹ ${e.message}`,
-        meta: { agent, error: false, stopped: true },
+        meta: {
+          agent, error: false, stopped: true,
+          interrupted: { agent, sourceN: triggerEntry.n, rootN: run.rootN },
+        },
       });
       // Pair review/fix callers must distinguish this from both a failed hop
       // and a silent/pass reply. Ordinary hops deliberately retain null.

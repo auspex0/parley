@@ -22,6 +22,8 @@
     --claude: #e8845c;
     --codex: #2fd6a8;
     --danger: #f26d6d;
+    /* Already the busy-pill amber; naming it keeps the palette the same size. */
+    --warn: #ffd479;
     --radius: 14px;
     --mono: ui-monospace, "Cascadia Code", Consolas, "SF Mono", monospace;
   }
@@ -268,6 +270,19 @@
   .hdot.late { border: 1.5px solid var(--hc); opacity: .75; }
   .hdot.unheard { border: 1.5px solid var(--text-faint); opacity: .35; }
   .hdot.pending { border: 1.5px solid var(--hc); opacity: .8; animation: pulse 1s infinite; }
+  .hdot.interrupted { background: none; border: 1.5px solid var(--warn); opacity: .9; }
+
+  /* Per-seat delivery status, inline and in chronological place. The message is
+     permanent; its delivery state is changeable — so it says what happened to
+     it here, rather than being explained by a pill floating somewhere below. */
+  .dstatus { display: flex; flex-wrap: wrap; gap: 6px; margin: 5px 8px 0; font-size: 12px; }
+  .dchip { border-radius: 999px; padding: 1px 8px; border: 1px solid var(--border2);
+    background: var(--panel); color: var(--text-dim); }
+  .dchip.cancelled { color: var(--danger); border-color: rgba(242,109,109,.35); }
+  .dchip.interrupted { color: var(--warn); border-color: rgba(255,212,121,.35); }
+  .dchip.delivered { color: var(--text-faint); }
+  /* Readable, not struck through: the text is still the record. */
+  .bubble.dimmed { opacity: .62; }
 
   .meta .cpy { opacity: 0; font-size: 11px; padding: 0 4px; transition: opacity .15s; }
   .msg:hover .meta .cpy { opacity: .6; }
@@ -1188,6 +1203,12 @@ function withheldFrom(a, n) {
   const seats = map[String(n)];
   return Array.isArray(seats) && seats.includes(a);
 }
+// The amber sibling: the seat did receive this, and its answer was stopped.
+function interruptedFrom(a, n) {
+  const map = (state.summary && state.summary.interruptedResponses) || {};
+  const seats = map[String(n)];
+  return Array.isArray(seats) && seats.includes(a);
+}
 function cappedFrom(a, n) {
   return state.entries.find((entry) => entry.kind === "system" && entry.meta &&
     entry.meta.relayCap && Array.isArray(entry.meta.relayCap.dropped) &&
@@ -1196,6 +1217,16 @@ function cappedFrom(a, n) {
 function computeHeard(a, e) {
   if (withheldFrom(a, e.n)) {
     return { cls: "withheld", title: `${a} · you cancelled this before it was delivered — never shown to ${a}` };
+  }
+  // Amber, and above receipts, cursor, busy state and terminal outcomes on
+  // purpose: the seat received this and the user stopped its answer. Every
+  // later turn carries the message in context, so anything that read a receipt
+  // first would resolve amber on the next completed turn, whatever it was
+  // about. Only the server supersedes it — by removing the record when that
+  // seat completes a run rooted here.
+  if (interruptedFrom(a, e.n)) {
+    return { cls: "interrupted",
+      title: `${a} · received this, but you stopped its response — nothing is retried automatically` };
   }
   const r = state.receipts.find((x) => x.agent === a && x.from < e.n && e.n <= x.upTo);
   if (r) {
@@ -1281,6 +1312,65 @@ function heardHTML(e) {
     return `<span class="hdot ${a} ${h.cls}" title="${esc(h.title)}"></span>`;
   }).join("") + `</div>`;
 }
+
+// The record model: the message is permanent, its delivery state is changeable.
+// A cancelled or interrupted message keeps its bubble in chronological position
+// — still the quote/jump target — and carries its own per-seat status, instead
+// of vanishing behind a pill floating further down the timeline.
+const STATUS_CHIP = {
+  cancelled: { all: "Cancelled before delivery", one: (s) => `Cancelled for ${s}` },
+  interrupted: { all: "Response stopped before it finished", one: (s) => `Response stopped for ${s}` },
+};
+function receivedBy(a, e) {
+  if (state.receipts.some((x) => x.agent === a && x.from < e.n && e.n <= x.upTo)) return true;
+  const agent = state.summary && state.summary.agents && state.summary.agents[a];
+  return !!agent && agent.cursor >= e.n;
+}
+// User messages only: an agent reply has no audience the user chose, so a
+// per-seat delivery chip on one would be inventing an addressee. A stopped hop
+// or answer return is carried by the amber dot alone.
+function deliveryStatus(e) {
+  if (e.kind !== "user") return [];
+  const aud = (e.meta && e.meta.audience) || {};
+  const named = [...new Set([...(aud.addressed || []), ...(aud.asleep || [])])];
+  const seats = named.length ? named
+    : ((state.summary && state.summary.seats) || []).filter((a) => e.target === "both" || e.target === a);
+  return seats.map((seat) => ({
+    seat,
+    kind: withheldFrom(seat, e.n) ? "cancelled"
+      : interruptedFrom(seat, e.n) ? "interrupted"
+        : receivedBy(seat, e) ? "delivered" : "pending",
+  }));
+}
+function statusDimmed(e) {
+  return deliveryStatus(e).some((s) => s.kind === "cancelled" || s.kind === "interrupted");
+}
+function statusChipHTML(e) {
+  const parts = deliveryStatus(e);
+  if (!statusDimmed(e)) return ""; // an ordinary message stays clean
+  const kinds = new Set(parts.map((s) => s.kind));
+  // Every addressed seat shared one outcome: say it once, without naming them.
+  const chips = kinds.size === 1 && STATUS_CHIP[parts[0].kind]
+    ? [{ kind: parts[0].kind, text: STATUS_CHIP[parts[0].kind].all }]
+    // A seat still waiting in the queue contributes nothing — the ⏳ badge and
+    // its own dot already say that, and it is not part of what went wrong.
+    : parts.filter((s) => s.kind !== "pending").map((s) => ({
+      kind: s.kind,
+      text: s.kind === "delivered"
+        ? `Delivered to ${seatLabel(s.seat)}`
+        : STATUS_CHIP[s.kind].one(seatLabel(s.seat)),
+    }));
+  return `<div class="dstatus">` +
+    chips.map((c) => `<span class="dchip ${c.kind}">${esc(c.text)}</span>`).join("") + `</div>`;
+}
+// The cancellation notice is a durable record for agents and for auditing — it
+// stays in events.jsonl, in transcript.md and in the seat's delta — but it is no
+// longer timeline furniture: the message it is about now says it itself, in
+// chronological place. The sleep variant is NOT hidden; it is the only thing
+// that explains why a seat went quiet with work still owed.
+function hiddenEntry(e) {
+  return e.kind === "system" && !!(e.meta && e.meta.cancelledQueue) && !(e.meta && e.meta.asleepSeat);
+}
 // Every status event asks for a full refresh, so this has to be cheap and it
 // has to leave untouched rows alone: replacing one restarts the pulse on a
 // pending dot, inside a message the reader may be part-way through.
@@ -1290,11 +1380,21 @@ function refreshHeard(fromN, upToN) {
     if (e.n <= fromN || e.n > upToN) continue;
     if (state.renderFromN !== null && e.n < state.renderFromN) continue; // not rendered
     const html = heardHTML(e);
-    if (!html || heardSig.get(e.n) === html) continue;
-    const el = chat.querySelector(`[data-n="${e.n}"] .heard`);
+    // The chip and the dots are one fact seen two ways, so they refresh in the
+    // same pass and share a signature — they can never disagree on screen.
+    const chip = statusChipHTML(e);
+    const sig = `${chip}${html}`;
+    if (!html || heardSig.get(e.n) === sig) continue;
+    const row = chat.querySelector(`[data-n="${e.n}"]`);
+    const el = row && row.querySelector(".heard");
     if (!el) continue;
+    const cur = row.querySelector(".dstatus"); // before el.outerHTML invalidates el
+    if (chip) { if (cur) cur.outerHTML = chip; else el.insertAdjacentHTML("beforebegin", chip); }
+    else if (cur) cur.remove();
+    const bub = row.querySelector(".bubble");
+    if (bub) bub.classList.toggle("dimmed", statusDimmed(e));
     el.outerHTML = html;
-    heardSig.set(e.n, html);
+    heardSig.set(e.n, sig);
   }
 }
 
@@ -1359,7 +1459,8 @@ function entryEl(e) {
   div.innerHTML = `<div class="meta">${av}<span class="who">${label}</span><span>${hhmm(e.ts)}${dur}${tok}</span>` +
     `<button class="cpy" title="Copy message">📋</button></div>` +
     entryQuoteHTML(e) +
-    `<div class="bubble">${renderMD(e.text)}</div>` + heardHTML(e);
+    `<div class="bubble${statusDimmed(e) ? " dimmed" : ""}">${renderMD(e.text)}</div>` +
+    statusChipHTML(e) + heardHTML(e);
   renderEntryAttachments(e, div.querySelector(".bubble"));
   if ((e.text || "").length > 2500) {
     const bub = div.querySelector(".bubble");
@@ -1516,7 +1617,9 @@ function appendEntryRange(parent, entries) {
   for (let i = 0; i < entries.length;) {
     const e = entries[i];
     if (e.kind !== "activity") {
-      parent.appendChild(entryEl(e));
+      // Filtered at render time only — never removed from state.entries, which
+      // every index, jump and quote lookup walks.
+      if (!hiddenEntry(e)) parent.appendChild(entryEl(e));
       i++;
       continue;
     }
@@ -1735,6 +1838,10 @@ function addEntry(e) {
   const last = state.entries[state.entries.length - 1];
   const inOrder = !last || e.n > last.n;
   state.entries = mergeEntries(state.entries, [e]);
+  // Kept in state (it is real history and the transcript replays it) but never
+  // drawn: the message it is about now carries its own status, and the room
+  // summary that follows this entry repaints that chip.
+  if (hiddenEntry(e)) return;
   // an arriving entry replaces any live bubble for that agent
   if (e.kind === "agent" && state.live[e.author]) removeLive(e.author);
   if (e.kind === "system" && e.meta && e.meta.agent && state.live[e.meta.agent]) removeLive(e.meta.agent);

@@ -766,6 +766,11 @@ async function checkFolderPickerUi() {
     const entry = state.entries.find((candidate) => candidate.n === n);
     return entry ? computeHeard(agent, entry) : null;
   },
+  statusChip(n) {
+    const entry = state.entries.find((candidate) => candidate.n === n);
+    return entry ? statusChipHTML(entry) : null;
+  },
+  hiddenEntry(entry) { return hiddenEntry(entry); },
   setWithdrawals(map) {
     state.summary.cancelledDeliveries = map;
     refreshHeard(0, Infinity);
@@ -963,6 +968,68 @@ async function checkFolderPickerUi() {
   probe.setWithdrawals({});
   ok("clearing the withdrawal immediately restores the ordinary receipt dot",
     probe.heard("claude", 4)?.cls === "live", JSON.stringify(probe.heard("claude", 4)));
+
+  // Amber. The seat DID receive this one — that is the whole difference from
+  // red — so a spanning receipt and an advanced cursor must not be allowed to
+  // report it as heard-and-answered. Every later turn carries the message in
+  // context, so anything reading a receipt first would quietly erase the fact
+  // that the user cut the answer short.
+  uiSummary.interruptedResponses = { "4": ["claude"] };
+  probe.seedRoom(uiSummary, [
+    { n: 4, kind: "user", author: "user", target: "claude", ts: "2026-08-05T02:02:00", text: "the original ask", meta: {} },
+  ], [{ agent: "claude", from: 0, upTo: 9, turn: 4, mode: "turn", spoke: true, ts: "2026-08-05T02:03:00" }]);
+  ok("a stopped response dot beats a spanning receipt and an advanced cursor",
+    probe.heard("claude", 4)?.cls === "interrupted" &&
+    /stopped its response/.test(probe.heard("claude", 4)?.title || ""),
+    JSON.stringify(probe.heard("claude", 4)));
+  // Red outranks amber: never-delivered is the stronger claim, and the two are
+  // disjoint per seat in practice because a relaunch clears the withdrawal.
+  uiSummary.cancelledDeliveries = { "4": ["claude"] };
+  probe.seedRoom(uiSummary, [
+    { n: 4, kind: "user", author: "user", target: "claude", ts: "2026-08-05T02:02:00", text: "the original ask", meta: {} },
+  ], []);
+  ok("a withheld message still outranks a stopped response",
+    probe.heard("claude", 4)?.cls === "withheld", JSON.stringify(probe.heard("claude", 4)));
+  uiSummary.cancelledDeliveries = {};
+  uiSummary.interruptedResponses = {};
+
+  // The message carries its own delivery state, in chronological place, instead
+  // of a pill floating further down the timeline. An ordinary message stays
+  // clean; a half-cancelled @both names which seat got what.
+  const bothEntry = {
+    n: 4, kind: "user", author: "user", target: "both", ts: "2026-08-05T02:02:00",
+    text: "the original ask", meta: { audience: { addressed: ["claude", "codex"] } },
+  };
+  probe.seedRoom(uiSummary, [bothEntry], []);
+  ok("an ordinary message carries no delivery chip at all",
+    probe.statusChip(4) === "", probe.statusChip(4));
+  uiSummary.cancelledDeliveries = { "4": ["claude", "codex"] };
+  probe.seedRoom(uiSummary, [bothEntry], []);
+  ok("when every addressed seat shared one outcome the chip says it once",
+    probe.statusChip(4) === '<div class="dstatus"><span class="dchip cancelled">Cancelled before delivery</span></div>',
+    probe.statusChip(4));
+  uiSummary.cancelledDeliveries = { "4": ["codex"] };
+  uiSummary.interruptedResponses = {};
+  probe.seedRoom(uiSummary, [bothEntry],
+    [{ agent: "claude", from: 0, upTo: 4, turn: 4, mode: "turn", spoke: true, ts: "2026-08-05T02:03:00" }]);
+  const split = probe.statusChip(4);
+  ok("a split outcome names each seat and what it actually got",
+    /Delivered to Claude/.test(split) && /Cancelled for Codex/.test(split), split);
+  uiSummary.cancelledDeliveries = {};
+  uiSummary.interruptedResponses = { "4": ["claude"] };
+  probe.seedRoom(uiSummary, [bothEntry], []);
+  ok("a stopped response says so on the message it was answering",
+    /dchip interrupted/.test(probe.statusChip(4)) &&
+    /Response stopped/.test(probe.statusChip(4)), probe.statusChip(4));
+  // The notice stays in events.jsonl, the transcript and the agent's delta —
+  // it just stops being timeline furniture. The sleep variant is the exception:
+  // it is the only thing explaining why a seat went quiet with work owed.
+  ok("the floating cancellation pill is hidden, but the sleep notice is not",
+    probe.hiddenEntry({ kind: "system", meta: { cancelledQueue: true } }) === true &&
+    probe.hiddenEntry({ kind: "system", meta: { cancelledQueue: true, asleepSeat: "codex" } }) === false &&
+    probe.hiddenEntry({ kind: "system", meta: { agent: "claude", stopped: true } }) === false &&
+    probe.hiddenEntry({ kind: "user", meta: {} }) === false);
+  uiSummary.interruptedResponses = {};
 
   uiSummary.busy = [];
   uiSummary.cancelledDeliveries = {};

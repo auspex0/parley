@@ -63,8 +63,15 @@ Under every message, one dot per other participant shows how they experienced it
 - **outlined** — caught up later via the delta (tooltip says at which turn)
 - **dim outline** — hasn't seen it yet
 - **red outline** — you cancelled that delivery before the agent saw it
+- **amber outline** — the agent *did* receive it and you stopped its response part-way
 
-Powered by an audience snapshot stamped on each user message, append-only delivery receipts in `events.jsonl`, and persisted per-seat withdrawal, catch-up, causal-answer and terminal-outcome state. The dot reflects the latest truth: a later successful delivery supersedes an earlier queued or failed lurk, while cap and terminal copy distinguish a deliberate stop from an answer still owed.
+Powered by an audience snapshot stamped on each user message, append-only delivery receipts in `events.jsonl`, and persisted per-seat withdrawal, interruption, catch-up, causal-answer and terminal-outcome state. The dot reflects the latest truth: a later successful delivery supersedes an earlier queued or failed lurk, while cap and terminal copy distinguish a deliberate stop from an answer still owed.
+
+Red and amber are the two halves of the same fact, and both outrank every receipt. Red says the agent never saw the message; amber says it saw it and you cut the answer short. Neither resolves on its own — every later turn carries the message in context, so nothing but that same seat completing a run rooted in that same message clears it. Retry, Wake & deliver and a fresh explicit ask all count; an unrelated later exchange does not.
+
+### A message says what happened to it
+
+A message whose delivery you cancelled, or whose response you stopped, keeps its place in the thread and stays the quote and jump target — the record does not move or disappear. It dims, and grows a small per-seat status line underneath: **Cancelled before delivery**, **Delivered to Claude · Cancelled for Codex**, **Response stopped before it finished**. The old floating cancellation pill is gone from the timeline; the record itself is unchanged and still reaches the agents and `transcript.md`, it just no longer explains itself from somewhere further down the page.
 
 ## Lurk mode 👂
 
