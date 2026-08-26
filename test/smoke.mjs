@@ -98,7 +98,18 @@ async function idle(name, ms = 30000) {
   const until = Date.now() + ms;
   for (;;) {
     const d = await room(name);
-    if (d.room.busy.length === 0 && !d.room.queued && !d.room.working) return d;
+    // A pending catch-up obligation is invisible to busy/queued/working during
+    // the tick between an exchange finishing and the scheduler launching it —
+    // `exchanges` only rises when maybeRunCatchUp actually starts, one
+    // setImmediate later. A poll landing in that window read the room as idle
+    // and every assertion after it saw a half-finished conversation, which is
+    // what produced the macOS-only CI failures on PR #5. An obligation parked
+    // behind a sleeping seat is genuinely not in flight, so it does not count.
+    const owed = (d.room.seats || []).some((a) => {
+      const seat = (d.room.agents || {})[a] || {};
+      return !!seat.catchUp && !seat.asleep;
+    });
+    if (d.room.busy.length === 0 && !d.room.queued && !d.room.working && !owed) return d;
     if (Date.now() > until) throw new Error("timed out waiting for " + name);
     await sleep(120);
   }
@@ -129,6 +140,7 @@ async function watchRoomSummaries(name) {
   });
   if (res.status !== 200) throw new Error(`could not watch ${name}: HTTP ${res.status}`);
   const seen = [];
+  const streamed = [];
   let readError = null;
   const done = (async () => {
     const reader = res.body.getReader();
@@ -149,12 +161,17 @@ async function watchRoomSummaries(name) {
         try {
           const event = JSON.parse(raw);
           if (event.type === "room") seen.push(event.room);
+          // Streaming is a progressive enhancement, so nothing else in the
+          // suite would notice if it broke entirely. Capture the raw events so
+          // one test can assert the increment/keyframe protocol directly.
+          else if (event.type === "stream") streamed.push(event);
         } catch { /* a malformed frame is not a room summary */ }
       }
     }
   })().catch((e) => { if (!controller.signal.aborted) readError = e; });
   return {
     seen,
+    streamed,
     async stop() {
       controller.abort();
       await done;
@@ -194,6 +211,14 @@ const server = spawn(process.execPath, [SERVER, "--no-open", "--port", "0", "--r
 let serverLog = "";
 server.stdout.on("data", (d) => { serverLog += d.toString(); });
 server.stderr.on("data", (d) => { serverLog += d.toString(); });
+// Interrupting the runner used to leak the server and its fake-CLI children,
+// which then sat holding a temp root nobody would clean up.
+for (const sig of ["SIGINT", "SIGTERM"]) {
+  process.once(sig, () => {
+    try { server.kill(); } catch { /* already gone */ }
+    process.exit(130);
+  });
+}
 
 base = await new Promise((resolve, reject) => {
   const t = setTimeout(() => reject(new Error("server never reported a URL:\n" + serverLog)), 15000);
@@ -5015,6 +5040,34 @@ async function main() {
   ok("retrying the same message twice is refused once nothing is discarded",
     (await api("POST", "/api/queue/retry", { room: "queueretry", n: discardN })).status === 400);
 
+  // Live streaming. The final entry has always been authoritative, so nothing
+  // else in the suite notices if the streaming path breaks entirely — which is
+  // how both adapters' delta parsing stayed dead code under test.
+  for (const [streamRoom, seat, marker] of [["streamclaude", "claude", "CLAUDE_STREAMED"], ["streamcodex", "codex", "CODEX_STREAMED"]]) {
+    await api("POST", "/api/rooms", { name: streamRoom });
+    await useFakes(streamRoom);
+    const tap = await watchRoomSummaries(streamRoom);
+    await say(streamRoom, `@${seat} STREAM SAY:${marker}`);
+    await idle(streamRoom);
+    await tap.stop();
+    const evts = tap.streamed.filter((e) => e.agent === seat);
+    const keyframes = evts.filter((e) => typeof e.text === "string");
+    const increments = evts.filter((e) => typeof e.delta === "string");
+    ok(`${seat}: the live reply is streamed as increments with a full keyframe first`,
+      evts.length > 0 && keyframes.length >= 1 && increments.length >= 1 &&
+      keyframes[0].text !== undefined && increments.every((e) => Number.isSafeInteger(e.from)),
+      JSON.stringify({ total: evts.length, keyframes: keyframes.length, increments: increments.length }));
+    // The whole point of the change: replaying the events must reconstruct the
+    // text exactly, without any single event carrying the entire reply twice.
+    let rebuilt = "";
+    for (const e of evts) {
+      if (typeof e.text === "string") rebuilt = e.text;
+      else if (e.from === rebuilt.length) rebuilt += e.delta;
+    }
+    ok(`${seat}: replaying the increments reconstructs the reply exactly`,
+      rebuilt.includes(marker), JSON.stringify({ rebuilt: rebuilt.slice(0, 120) }));
+  }
+
   // Ask again / Redirect. The new turn is a real user entry that says what it is
   // about, the quoted message is restaged into the prompt so the seat can answer
   // even after a session reset, and stop-and-ask is one request.
@@ -7547,9 +7600,28 @@ try {
   await main();
 } catch (e) {
   failures.push("threw: " + e.message);
-  console.log("\n✗ " + e.message);
+  console.log("\n✗ " + (e.stack || e.message));
 }
 try { server.kill(); } catch { /* already gone */ }
+
+// A CI-only failure used to be diagnosable from one assertion line: the room
+// state was deleted unconditionally and the server log was only ever printed if
+// boot itself failed. Keep both when something went wrong.
+if (failures.length) {
+  const bundle = path.join(here, "..", "smoke-failure");
+  try {
+    fs.rmSync(bundle, { recursive: true, force: true });
+    fs.mkdirSync(bundle, { recursive: true });
+    fs.cpSync(ROOT, path.join(bundle, "rooms"), { recursive: true });
+    fs.writeFileSync(path.join(bundle, "server.log"), serverLog, "utf8");
+    fs.writeFileSync(path.join(bundle, "failures.txt"), failures.join("\n"), "utf8");
+    console.log(`\nkept the room state and server log in ${bundle}`);
+  } catch (e) {
+    console.log(`\ncould not save the failure bundle (${e.message}); room state is at ${ROOT}`);
+  }
+  console.log("\n--- last 60 lines of the server log ---\n" +
+    serverLog.split(/\r?\n/).slice(-60).join("\n"));
+}
 try { fs.rmSync(ROOT, { recursive: true, force: true }); } catch { /* windows may hold a handle */ }
 
 console.log(`\n${pass} passed, ${failures.length} failed`);
