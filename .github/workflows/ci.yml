@@ -13,14 +13,18 @@ jobs:
   smoke:
     name: smoke (${{ matrix.os }}, node ${{ matrix.node }})
     runs-on: ${{ matrix.os }}
+    # A hung cell would otherwise burn the 360-minute default. A green run takes
+    # about seven minutes on the slowest runner.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        node: ["20", "22"]
+        node: ["20", "22", "24"]
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      # Pinned to commit SHAs: a moved tag would run arbitrary code here.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ matrix.node }}
       - name: Syntax check
@@ -32,3 +36,38 @@ jobs:
       # provider login, no API keys and no network access.
       - name: Smoke test
         run: npm test
+      # A CI-only failure was otherwise diagnosable from one assertion line. On
+      # failure the suite leaves its room state and server log in smoke-failure/
+      # instead of deleting them.
+      - name: Collect failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: smoke-failure-${{ matrix.os }}-node${{ matrix.node }}
+          path: smoke-failure/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+      # c8 is installed here only. The package itself stays dependency-free, and
+      # coverage is reported rather than gated — it exists to show which parts of
+      # parley.mjs the suite never reaches. The server runs as a child process,
+      # so it needs NODE_V8_COVERAGE propagation, which c8 handles.
+      - name: Smoke test with coverage
+        run: npx --yes c8@10 --reporter=text --reporter=json-summary node test/smoke.mjs
+      - name: Upload coverage summary
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-summary
+          path: coverage/
+          if-no-files-found: ignore
+          retention-days: 7

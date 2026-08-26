@@ -1,6 +1,6 @@
 {
   "name": "parley-room",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": false,
   "description": "Multi-agent chat room for you, Claude Code, and Codex - runs locally, using the CLI sessions you're already signed into.",
   "type": "module",
@@ -34,6 +34,7 @@
     "parley.mjs",
     "ui/",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ]
 }

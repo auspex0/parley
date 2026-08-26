@@ -8,7 +8,7 @@
  *   logins. Never reads, stores or forwards credentials.
  * - Binds to 127.0.0.1 only.
  *
- * Usage: node parley.mjs [--port N] [--root DIR] [--no-open]
+ * Usage: node parley.mjs [--port N] [--root DIR] [--no-open] [--version]
  */
 
 import { spawn, spawnSync } from "node:child_process";
@@ -76,14 +76,28 @@ function argValue(flag) {
   const i = argv.indexOf(flag);
   return i >= 0 && argv[i + 1] ? argv[i + 1] : null;
 }
+// Read from the packaged manifest rather than a second literal that would drift
+// from it. A source checkout and an npm install both keep it one level up from
+// this file, but a bug report is worth more than a crash if that ever changes.
+function packageVersion() {
+  try { return JSON.parse(fs.readFileSync(path.join(__dirname, "package.json"), "utf8")).version || "unknown"; }
+  catch { return "unknown"; }
+}
+if (argv.includes("--version") || argv.includes("-v")) {
+  console.log(packageVersion());
+  process.exit(0);
+}
 if (argv.includes("--help") || argv.includes("-h")) {
   console.log(`Parley — a shared chat room for you, Claude and Codex.
 
-Usage: parley [--port N] [--root DIR] [--no-open]
+Usage: parley [--port N] [--root DIR] [--no-open] [--version]
 
-  --port N     Port to serve the UI on (default 4141, auto-increments if busy)
+  --port N     Port to serve the UI on (default 4141, auto-increments if busy;
+               0 asks the OS for any free port)
   --root DIR   Directory that holds room folders (default ~/.parley)
-  --no-open    Don't open the browser automatically`);
+  --no-open    Don't open the browser automatically
+  --version    Print the version and exit
+  --help       Print this message and exit`);
   process.exit(0);
 }
 const portArg = argValue("--port");
@@ -6231,7 +6245,7 @@ function listen(attempt = 0) {
   server.listen(port, "127.0.0.1", () => {
     const u = `http://127.0.0.1:${server.address().port}`;
     loadRoom("default", undefined, true); // bootstrap: always somewhere to land
-    console.log(`\n  Parley is running\n\n  UI:     ${u}\n  Rooms:  ${ROOT}\n\n  Ctrl+C to quit.\n`);
+    console.log(`\n  Parley ${packageVersion()} is running\n\n  UI:     ${u}\n  Rooms:  ${ROOT}\n\n  Ctrl+C to quit.\n`);
     if (!NO_OPEN) openBrowser(u);
   });
 }

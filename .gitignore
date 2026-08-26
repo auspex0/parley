@@ -13,3 +13,22 @@ coverage/
 # OS/editor noise
 .DS_Store
 Thumbs.db
+
+# Demo captures and screenshots live in the working copy while a release is
+# being put together; docs/ holds the ones the README actually links.
+/*.webm
+/*.mp4
+/*.gif
+/*.png
+/*.jpg
+
+# Scratch dirs from ad-hoc browser/demo runs. The test suite itself works out
+# of the OS temp dir, so nothing here is ever needed again.
+.tmp-*/
+
+# What the smoke suite leaves behind when it fails, for CI to upload.
+smoke-failure/
+
+# Local scratch: drafts and captured command output.
+/radmeopus5.md
+/vlc-help.txt

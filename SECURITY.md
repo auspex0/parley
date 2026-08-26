@@ -4,7 +4,7 @@ Parley drives local coding-agent CLIs, can spend usage on the accounts already c
 
 ## Supported versions
 
-Until Parley publishes versioned releases, security fixes target the latest commit on `main`. Once releases exist, this section will identify the supported release line.
+Security fixes target the latest published version on npm (`parley-room`) and the latest commit on `main`. Older versions are not patched — upgrade to the current release. Run `parley --version` to see which version you have.
 
 ## Reporting a vulnerability
 

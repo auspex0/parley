@@ -5,12 +5,14 @@ Rooms, configuration, attachments, slash commands and housekeeping.
 ## CLI flags
 
 ```
-parley [--port N] [--root DIR] [--no-open]
+parley [--port N] [--root DIR] [--no-open] [--version] [--help]
 ```
 
-- `--port N` — default `4141`, auto-increments if taken.
+- `--port N` — default `4141`, auto-increments if taken (up to 20 tries). `--port 0` asks the OS for any free port.
 - `--root DIR` — where room folders live, default `~/.parley`.
 - `--no-open` — don't launch a browser.
+- `--version`, `-v` — print the version and exit.
+- `--help`, `-h` — print usage and exit.
 
 After updating, restart the running Parley process before reloading the page — builds pin the UI to the backend that served it, and an older server meeting a newer page blocks its controls and shows a persistent **Restart Parley** warning instead of silently mixing runtime versions. The current source uses internal runtime protocol **9**, covering generalized causal-attention and relay-cap state plus recovered Wake/Retry integration. That number is a stale-tab compatibility fence, not Parley's package version or a public API version.
 
