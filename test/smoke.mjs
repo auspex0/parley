@@ -34,7 +34,7 @@ function ok(name, cond, detail) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 let TOKEN = ""; // read out of the served page, exactly as the browser does
-const RUNTIME_PROTOCOL = "9";
+const RUNTIME_PROTOCOL = "10";
 
 async function api(method, route, body) {
   const res = await fetch(base + route, method === "GET"

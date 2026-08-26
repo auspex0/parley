@@ -39,7 +39,10 @@ const UI_HTML = fs.readFileSync(UI_FILE, "utf8");
 //    distinguish a deliberately bounded exchange from an undelivered reply.
 // 9: live causal request/answer scheduling generalizes that guarantee across
 //    explicit hops, concurrent @both replies and recovered Wake/Retry work.
-const RUNTIME_PROTOCOL = "9";
+// 10: stream events carry increments ({from, delta}) rather than the whole
+//    reply each time, with periodic full-text keyframes. An older UI reads only
+//    `text` and would blank the live bubble on every increment.
+const RUNTIME_PROTOCOL = "10";
 const IS_WIN = process.platform === "win32";
 
 const IMAGE_TYPES = new Map([
@@ -1484,6 +1487,7 @@ function loadRoom(name, seatChoice, create = false) {
     // fence. See applyAdapterSession.
     cfgEpoch: {},
     busy: new Map(),      // agent -> { startedAt, runId }
+    streams: new Map(),   // agent -> coalesced live-reply state, see streamText
     procs: new Map(),     // agent -> child process
     // agent -> the run record that owns the seat right now. Unlike `procs`,
     // this exists from the instant the seat is claimed, so a Stop pressed
@@ -1526,6 +1530,61 @@ function broadcast(room, obj) {
   for (const res of room.clients) {
     try { res.write(payload); } catch { room.clients.delete(res); }
   }
+}
+
+// ---- live reply streaming ----
+// Each provider hands us the whole reply so far on every token, and that is
+// what used to go out to every tab: an L-character reply cost on the order of
+// L²/32 bytes through JSON.stringify, the socket and the browser's parser —
+// tens of megabytes for one long reply. Send the increment instead, coalesced
+// into at most one event per tick, with a periodic full-text keyframe so a tab
+// that connects mid-reply (or misses an event) can resynchronise. Streaming has
+// always been a progressive enhancement: the entry appended at the end is the
+// authoritative text, so a dropped increment costs nothing but a moment of
+// staleness in the bubble.
+const STREAM_FLUSH_MS = 90;
+const STREAM_KEYFRAME_MS = 2000;
+
+function streamText(room, agent, text) {
+  let st = room.streams.get(agent);
+  if (!st) {
+    st = { text: "", sent: 0, timer: null, keyframeAt: 0, needKeyframe: true };
+    room.streams.set(agent, st);
+  }
+  st.text = text;
+  if (!st.timer) st.timer = setTimeout(() => flushStream(room, agent), STREAM_FLUSH_MS);
+}
+
+function flushStream(room, agent) {
+  const st = room.streams.get(agent);
+  if (!st) return;
+  st.timer = null;
+  const now = Date.now();
+  if (st.needKeyframe || now - st.keyframeAt >= STREAM_KEYFRAME_MS) {
+    st.needKeyframe = false;
+    st.keyframeAt = now;
+    st.sent = st.text.length;
+    broadcast(room, { type: "stream", agent, text: st.text });
+    return;
+  }
+  if (st.text.length <= st.sent) return;
+  broadcast(room, { type: "stream", agent, from: st.sent, delta: st.text.slice(st.sent) });
+  st.sent = st.text.length;
+}
+
+// The run is over. Whatever was still coalescing is superseded by the durable
+// entry the caller is about to append, which replaces the live bubble outright.
+function endStream(room, agent) {
+  const st = room.streams.get(agent);
+  if (!st) return;
+  if (st.timer) clearTimeout(st.timer);
+  room.streams.delete(agent);
+}
+
+// A tab that joins mid-reply holds none of the increments, so the next flush
+// has to carry full text rather than an offset it cannot apply.
+function markStreamsForKeyframe(room) {
+  for (const st of room.streams.values()) st.needKeyframe = true;
 }
 
 function transcriptHeader(e) {
@@ -1957,6 +2016,9 @@ function beginRun(room, agent, { phase, startedAt, rootN = null, sourceN = null,
     stopRequested: false,
     child: null,
   };
+  // Anything left over from the previous run would make this one's first
+  // increment arrive at a stale offset.
+  endStream(room, agent);
   room.busy.set(agent, { startedAt, runId: run.runId });
   room.runs.set(agent, run);
   broadcast(room, {
@@ -2321,7 +2383,7 @@ async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) 
     phase: "start", startedAt, rootN: userTurn.n, sourceN: userTurn.n,
     queueGroupId: opts.queueGroupId || null, chain: opts.chain || null,
   });
-  const onStream = (text) => broadcast(room, { type: "stream", agent, text });
+  const onStream = (text) => streamText(room, agent, text);
   const onActivity = (label) => {
     if (gen === room.generation) appendEntry(room, { kind: "activity", author: agent, text: label }, { md: false });
   };
@@ -2507,7 +2569,7 @@ async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE, opts = 
     sourceN: (catchUpSource || ordinarySource || catchUpRootEntries[catchUpRootEntries.length - 1]).n,
     chain: opts.chain || null,
   });
-  const onStream = (text) => broadcast(room, { type: "stream", agent, text });
+  const onStream = (text) => streamText(room, agent, text);
   const onActivity = (label) => {
     if (gen === room.generation) appendEntry(room, { kind: "activity", author: agent, text: label }, { md: false });
   };
@@ -2820,7 +2882,7 @@ async function runHopTurn(room, agent, triggerEntry, rootN, scope = NO_SCOPE, op
     sourceN: triggerEntry.n,
     chain: opts.chain || null,
   });
-  const onStream = (text) => broadcast(room, { type: "stream", agent, text });
+  const onStream = (text) => streamText(room, agent, text);
   const onActivity = (label) => {
     if (gen === room.generation) appendEntry(room, { kind: "activity", author: agent, text: label }, { md: false });
   };
@@ -4893,6 +4955,7 @@ function drainLanes(room) {
 }
 
 function releaseSeat(room, agent, run = null) {
+  endStream(room, agent);
   room.busy.delete(agent);
   if (run) endRun(room, agent, run); else room.runs.delete(agent);
   broadcast(room, { type: "status", agent, phase: "done", ...(run ? { runId: run.runId } : {}) });
@@ -5675,11 +5738,23 @@ function listRooms() {
   return names.sort((a, b) => (a === "default" ? -1 : b === "default" ? 1 : a.localeCompare(b)));
 }
 
+// The room picker needs three fields, all of which live in room.json. Calling
+// loadRoom for them read every room's entire events.jsonl into memory,
+// synchronously, and pinned it there for the life of the process — so merely
+// opening the UI blocked the event loop parsing history nobody asked for. Read
+// the config, and let an already-open room answer from memory.
 function roomsWithModes() {
   return listRooms().map((n) => {
     try {
-      const r = loadRoom(n);
-      return { name: n, mode: r.cfg.mode || "talk", linked: !!r.cfg.projectDir, seats: seatIds(r) };
+      const open = rooms.get(n);
+      const cfg = open ? open.cfg : readJSON(path.join(ROOT, n, "room.json"));
+      const seats = Object.keys(cfg.agents || {}).filter((k) => PROVIDERS[k]);
+      return {
+        name: n,
+        mode: cfg.mode || "talk",
+        linked: !!cfg.projectDir,
+        seats: seats.length ? seats : [...DEFAULT_SEATS],
+      };
     } catch { return { name: n, mode: "talk", linked: false, seats: [...DEFAULT_SEATS] }; }
   });
 }
@@ -5778,6 +5853,16 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, snapshot);
     }
 
+    // The summary alone, without the transcript. Refreshing the git branch on
+    // every window focus went through GET /api/room, which serialises the whole
+    // of a room's history to deliver one label — megabytes of work per alt-tab
+    // in a long-lived room.
+    if (route === "GET /api/room/summary") {
+      const wanted = url.searchParams.get("name") || "default";
+      const room = loadRoom(wanted, undefined, wanted === "default");
+      return json(res, 200, { room: roomSummary(room) });
+    }
+
     if (route === "GET /api/attachment") {
       const room = loadRoom(url.searchParams.get("room") || "default");
       const id = String(url.searchParams.get("id") || "");
@@ -5819,6 +5904,7 @@ const server = http.createServer(async (req, res) => {
       });
       res.write(":connected\n\n");
       room.clients.add(res);
+      markStreamsForKeyframe(room);
       scheduleCatchUps(room);
       const ping = setInterval(() => { try { res.write(":ping\n\n"); } catch { /* closed */ } }, 20000);
       req.on("close", () => { clearInterval(ping); room.clients.delete(res); });

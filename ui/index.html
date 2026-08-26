@@ -810,7 +810,7 @@ function toast(msg, isErr) {
 // This blocks blind/cross-origin requests; it is not a secret from local
 // processes, which can fetch the public page and read the embedded token.
 const TOKEN = (document.querySelector('meta[name="parley-token"]') || {}).content || "";
-const REQUIRED_RUNTIME_PROTOCOL = "9";
+const REQUIRED_RUNTIME_PROTOCOL = "10";
 const PAGE_RUNTIME_PROTOCOL = (document.querySelector('meta[name="parley-runtime-protocol"]') || {}).content || "";
 const withToken = (url) => url + (url.includes("?") ? "&" : "?") +
   "token=" + encodeURIComponent(TOKEN) + "&protocol=" + encodeURIComponent(REQUIRED_RUNTIME_PROTOCOL);
@@ -1911,9 +1911,17 @@ $("busyStrip").addEventListener("click", (e) => {
 function clearLive() {
   for (const agent of Object.keys(state.live)) removeLive(agent);
 }
-function liveStream(agent, text) {
+// The server sends increments, not the whole reply each time: `text` is a full
+// keyframe, `{from, delta}` extends what we already hold. An increment that
+// does not start exactly where our text ends means we missed one, so hold the
+// bubble as-is and wait for the next keyframe (at most two seconds) rather than
+// splicing text at the wrong offset. The finished entry is authoritative either
+// way, so the worst case is a briefly stale bubble.
+function liveStream(agent, msg) {
   const l = ensureLive(agent);
-  l.text = text;
+  if (typeof msg.text === "string") l.text = msg.text;
+  else if (msg.from === l.text.length) l.text += msg.delta;
+  else return;
   if (state.streamTimer[agent]) return;
   state.streamTimer[agent] = setTimeout(() => {
     delete state.streamTimer[agent];
@@ -2072,7 +2080,9 @@ async function refreshGitId() {
   const room = state.room;
   if (!room) return;
   try {
-    const data = await api("/api/room?name=" + encodeURIComponent(room));
+    // The summary endpoint, not /api/room: this needs one field, and the full
+    // snapshot grows with the room's whole history.
+    const data = await api("/api/room/summary?name=" + encodeURIComponent(room));
     if (state.room !== room) return;
     if (state.summary) state.summary.git = data.room.git;
     renderGitId(data.room.git);
@@ -2743,7 +2753,7 @@ function connect(resyncOnOpen = false) {
       renderBusyStrip();
       if ($("queueWrap").classList.contains("open")) renderQueuePop();
     }
-    else if (msg.type === "stream") liveStream(msg.agent, msg.text);
+    else if (msg.type === "stream") liveStream(msg.agent, msg);
     else if (msg.type === "room") {
       applySummary(msg.room);
     }

@@ -14,7 +14,7 @@ parley [--port N] [--root DIR] [--no-open] [--version] [--help]
 - `--version`, `-v` — print the version and exit.
 - `--help`, `-h` — print usage and exit.
 
-After updating, restart the running Parley process before reloading the page — builds pin the UI to the backend that served it, and an older server meeting a newer page blocks its controls and shows a persistent **Restart Parley** warning instead of silently mixing runtime versions. The current source uses internal runtime protocol **9**, covering generalized causal-attention and relay-cap state plus recovered Wake/Retry integration. That number is a stale-tab compatibility fence, not Parley's package version or a public API version.
+After updating, restart the running Parley process before reloading the page — builds pin the UI to the backend that served it, and an older server meeting a newer page blocks its controls and shows a persistent **Restart Parley** warning instead of silently mixing runtime versions. The current source uses internal runtime protocol **10**, covering generalized causal-attention and relay-cap state, recovered Wake/Retry integration, and incremental reply streaming. That number is a stale-tab compatibility fence, not Parley's package version or a public API version.
 
 ## The room folder
 
