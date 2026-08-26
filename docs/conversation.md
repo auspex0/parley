@@ -41,6 +41,8 @@ This is about what Parley sends, not a secrecy guarantee. The message is still i
 
 **Stop** is four separate intentions rather than one button and a guess: stop a named agent's current response, stop the current responses but keep queued work, cancel the queue but let the running responses finish, or stop everything — responses, pair cycle, hops, lurkers and queue. Each click names the response it meant, so a click that lands after that response has already ended does nothing rather than killing the next one, and it never reports an error you would answer by clicking again.
 
+**The ■ button acts; the ▾ beside it chooses.** When one seat is replying and nothing is queued — the ordinary case — ■ stops that response on the first click, and the follow-ups it would have triggered stop with it. It widens only when a single click genuinely cannot answer the question: two seats running, work still queued, or a pair cycle in flight all open the chooser instead. The ▾ opens that same chooser whenever you want it, which is where per-seat stops live. An open menu is a snapshot: rows never reorder under your cursor, and work that finishes while you are aiming goes grey in place rather than vanishing.
+
 Each reply shows its **output tokens** (and Codex's reasoning tokens) in the message meta — flip the reasoning-effort setting and watch the numbers move; that's ground truth from the CLI, not model self-reporting.
 
 ## What each agent sees

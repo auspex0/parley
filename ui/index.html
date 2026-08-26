@@ -385,8 +385,18 @@
   }
   #sendBtn { background: var(--user); color: #0b0e14; }
   #sendBtn:disabled { background: var(--panel2); color: var(--text-faint); cursor: default; }
-  #stopWrap { position: relative; display: none; flex-shrink: 0; }
-  #stopBtn { background: rgba(242,109,109,.15); color: var(--danger); border: 1px solid rgba(242,109,109,.4); }
+  #stopWrap { position: relative; display: none; flex-shrink: 0; align-items: center; }
+  #stopBtn { background: rgba(242,109,109,.15); color: var(--danger); border: 1px solid rgba(242,109,109,.4); border-radius: 12px 3px 3px 12px; }
+  /* The arrow is always there, so the deliberate scopes — seat-only above all —
+     never depend on the primary happening to be ambiguous. */
+  #stopMore {
+    width: 20px; height: 38px; flex-shrink: 0; font-size: 10px; margin-left: 2px;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: 3px 12px 12px 3px;
+    background: rgba(242,109,109,.15); color: var(--danger);
+    border: 1px solid rgba(242,109,109,.4);
+  }
+  #stopBtn:hover, #stopMore:hover, #stopWrap.open #stopMore { background: rgba(242,109,109,.28); }
   #stopMenu {
     position: absolute; right: 0; bottom: calc(100% + 7px); display: none; min-width: 170px;
     padding: 5px; background: var(--panel2); border: 1px solid var(--border2); border-radius: 11px;
@@ -398,6 +408,11 @@
   #stopMenu button.stop-all { color: var(--danger); border-top: 1px solid var(--border); border-radius: 0 0 7px 7px; margin-top: 4px; padding-top: 9px; }
   #stopMenu button.stop-scope { color: var(--text-dim); }
   #stopMenu button .sm-sub { display: block; font-size: 10.5px; opacity: .62; margin-top: 1px; }
+  /* A row whose work ended while the menu was open is disabled where it stands,
+     never removed: pulling it out moves the row the cursor was aiming at. */
+  #stopMenu button:disabled { opacity: .4; cursor: default; }
+  #stopMenu button:disabled:hover { background: transparent; color: var(--text-dim); }
+  #stopMenu button.stop-all:disabled:hover { color: var(--danger); }
 
   /* Wake menu. Waking a seat with messages held for it is a three-way choice —
      deliver, wake only, or cancel — which a native confirm() cannot express:
@@ -693,7 +708,9 @@
           <button id="attachBtn" type="button" title="Attach files" aria-label="Attach files">📎</button>
           <textarea id="input" rows="1" placeholder="Message the table…  (@claude, @codex, @both)"></textarea>
           <div id="stopWrap">
-            <button id="stopBtn" title="Stop the running response" aria-haspopup="menu" aria-expanded="false">■</button>
+            <button id="stopBtn" title="Stop the running response">■</button>
+            <button id="stopMore" title="Choose what to stop" aria-label="Stop options"
+                    aria-haspopup="menu" aria-expanded="false">▾</button>
             <div id="stopMenu" role="menu"></div>
           </div>
           <button id="sendBtn" title="Send (Enter)">➤</button>
@@ -1132,10 +1149,7 @@ document.addEventListener("click", (e) => {
       cpy.textContent = "✓"; setTimeout(() => (cpy.textContent = "📋"), 1200);
     });
   }
-  if (!e.target.closest("#stopWrap")) {
-    $("stopWrap").classList.remove("open");
-    $("stopBtn").setAttribute("aria-expanded", "false");
-  }
+  if (!e.target.closest("#stopWrap")) closeStopMenu();
   if (!e.target.closest("#hopWrap")) closeHopMenu();
   if (!e.target.closest("#queueWrap")) closeQueuePop();
 });
@@ -2302,14 +2316,100 @@ document.querySelectorAll(".mbtn").forEach((b) => {
     catch (e) { toast(e.message, true); }
   };
 });
-// Two different questions. `working` — any chain mid-flight, including the gaps
-// between its turns — decides whether Stop is offered at all, so it doesn't
-// blink out between an agent's reply and the follow-up it triggers.
-// `workingPair` is narrower and controls wording only. The chooser follows the
-// whole exchange: when one half of @both finishes first, the remaining seat
-// must still be stoppable without turning the main button into Stop-all.
-const stopIsChoice = (s) => (s.busy || []).length > 1 || s.queued > 0 ||
-  (!!s.working && (s.busy || []).length > 0);
+// Two different questions, and only one of them is about the button's blast
+// radius. `working` — any chain mid-flight, including the gaps between its
+// turns — decides whether Stop is offered at all, so the button doesn't blink
+// out between an agent's reply and the follow-up it triggers. It is
+// deliberately *absent* from the chooser test: `working` is true for every
+// ordinary exchange, so ORing it in turned the commonest action in the room —
+// one seat replying — into two clicks, and made the blast radius of a single
+// click flip on sub-second timing the user cannot see. The chooser is for the
+// questions a single click genuinely cannot answer: two seats running, work
+// still queued, or a pair cycle larger than the turn on screen.
+const stopIsChoice = (s) => (s.busy || []).length > 1 || (s.queued || 0) > 0 || !!s.workingPair;
+
+// The open menu is a snapshot of the moment it was opened. Status events land
+// several times a second while agents work, and rebuilding the list under an
+// aiming cursor moves the row out from under the click. So while it is open the
+// row set and its order are frozen: work that ends goes disabled in place, work
+// that starts waits for the next open.
+let stopMenuShown = null;
+
+// Five explicit intentions instead of one button and a guess: each seat on its
+// own, the actives without the queue, the queue without the actives, and the
+// blunt everything. Each entry says what survives it. The key is stable so an
+// open menu can be reconciled instead of rebuilt.
+function stopMenuRows(summary) {
+  const active = summary.busy || [];
+  const queued = summary.queued || 0;
+  // Deliveries are what the lanes owe; messages are what the user sent. One
+  // @both held for both seats is two deliveries and one message — so labels
+  // count dispatches, never rows.
+  const queuedMessages = summary.queuedDispatches === undefined ? queued : summary.queuedDispatches;
+  const rows = active.map((a) => ({
+    key: `seat:${a}`, cls: "stop-scope",
+    attrs: `data-stop-scope="seat" data-stop-agent="${esc(a)}"`,
+    html: `■ Stop ${esc(seatLabel(a))}'s current response`,
+  }));
+  if (active.length) rows.push({
+    key: "active", cls: "stop-scope", attrs: `data-stop-scope="active"`,
+    html: `■ Stop current responses<span class="sm-sub">keeps queued work</span>`,
+  });
+  if (queued > 0) rows.push({
+    key: "queue", cls: "stop-scope", attrs: `data-stop-scope="queue"`,
+    html: `✕ Cancel ${queuedMessages} queued message${queuedMessages === 1 ? "" : "s"}` +
+      `<span class="sm-sub">keeps active responses</span>`,
+  });
+  rows.push({
+    key: "all", cls: "stop-all", attrs: `data-stop-scope="all"`,
+    html: `■ Stop everything<span class="sm-sub">responses, pair cycle, hops, lurkers and queue</span>`,
+  });
+  return rows;
+}
+
+function stopMenuHTML(rows) {
+  return rows.map((r) =>
+    `<button role="menuitem" class="${r.cls}${r.gone ? " stop-gone" : ""}"` +
+    `${r.gone ? " disabled" : ""} data-stop-key="${esc(r.key)}" ${r.attrs}>${r.html}</button>`).join("");
+}
+
+function renderStopMenu(s) {
+  const live = stopMenuRows(s);
+  if (stopMenuShown && $("stopWrap").classList.contains("open")) {
+    const byKey = new Map(live.map((r) => [r.key, r]));
+    // Order and membership are frozen. Only the label of a row already on
+    // screen may change, and a row whose work ended is marked, never dropped.
+    stopMenuShown = stopMenuShown.map((row) => {
+      const next = byKey.get(row.key);
+      return next ? { ...next, gone: false } : { ...row, gone: true };
+    });
+  } else {
+    stopMenuShown = live;
+  }
+  const html = stopMenuHTML(stopMenuShown);
+  const menu = $("stopMenu");
+  // Most status events change nothing here. Writing innerHTML anyway restarted
+  // hover and could interrupt a click already in flight.
+  if (menu.dataset.sig === html) return;
+  menu.dataset.sig = html;
+  menu.innerHTML = html;
+}
+
+function closeStopMenu() {
+  $("stopWrap").classList.remove("open");
+  $("stopMore").setAttribute("aria-expanded", "false");
+  stopMenuShown = null; // the snapshot dies with the menu
+}
+function openStopMenu() {
+  stopMenuShown = null; // every open takes a fresh snapshot
+  $("stopWrap").classList.add("open");
+  $("stopMore").setAttribute("aria-expanded", "true");
+  if (state.summary) renderStopMenu(state.summary);
+}
+function toggleStopMenu() {
+  if ($("stopWrap").classList.contains("open")) closeStopMenu();
+  else openStopMenu();
+}
 
 function updateBusyUI() {
   const summary = state.summary;
@@ -2318,40 +2418,17 @@ function updateBusyUI() {
   // is where they cancel it without touching anything that is running.
   const visible = !!summary && (active.length > 0 || summary.working || (summary.queued || 0) > 0);
   const wrap = $("stopWrap");
-  wrap.style.display = visible ? "block" : "none"; // sending stays allowed — messages queue
-  if (!visible) {
-    wrap.classList.remove("open");
-    $("stopBtn").setAttribute("aria-expanded", "false");
-    return;
-  }
+  wrap.style.display = visible ? "flex" : "none"; // sending stays allowed — messages queue
+  if (!visible) { closeStopMenu(); return; }
   const choose = stopIsChoice(summary);
-  $("stopBtn").title = choose ? "Choose which response to stop" :
-    active.length === 1 ? `Stop ${seatLabel(active[0])}` :
-      summary.workingPair ? "Stop the pair cycle" : "Stop the exchange";
-  // Five explicit intentions instead of one button and a guess: each seat on
-  // its own, the actives without the queue, the queue without the actives, and
-  // the blunt everything. Each entry says what survives it.
-  // Deliveries are what the lanes owe; messages are what the user sent. One
-  // @both held for both seats is two deliveries and one message — so labels
-  // count dispatches, never rows.
-  const queued = summary.queued || 0;
-  const queuedMessages = summary.queuedDispatches === undefined
-    ? queued : summary.queuedDispatches;
-  const rows = active.map((a) =>
-    `<button role="menuitem" class="stop-scope" data-stop-scope="seat" data-stop-agent="${esc(a)}">` +
-    `■ Stop ${esc(seatLabel(a))}'s current response</button>`);
-  if (active.length) {
-    rows.push(`<button role="menuitem" class="stop-scope" data-stop-scope="active">` +
-      `■ Stop current responses<span class="sm-sub">keeps queued work</span></button>`);
-  }
-  if (queued > 0) {
-    rows.push(`<button role="menuitem" class="stop-scope" data-stop-scope="queue">` +
-      `✕ Cancel ${queuedMessages} queued message${queuedMessages === 1 ? "" : "s"}` +
-      `<span class="sm-sub">keeps active responses</span></button>`);
-  }
-  rows.push(`<button role="menuitem" class="stop-all" data-stop-scope="all">` +
-    `■ Stop everything<span class="sm-sub">responses, pair cycle, hops, lurkers and queue</span></button>`);
-  $("stopMenu").innerHTML = rows.join("");
+  // Say what the primary click will actually do. A run-pinned `active` stop
+  // ends the chain the reply would have continued into, which is the part the
+  // user cares about and the part a seat-scoped stop deliberately does not do.
+  $("stopBtn").title = choose ? "Choose what to stop" :
+    active.length === 1
+      ? `Stop ${seatLabel(active[0])} and the follow-ups this reply would trigger`
+      : "Stop the exchange";
+  renderStopMenu(summary);
 }
 
 // ---- queued work ----
@@ -3242,8 +3319,7 @@ window.addEventListener("drop", (e) => {
 // ended the server says so and this returns quietly — an error toast there is
 // exactly what makes someone press Stop a second time.
 async function stopResponses(scope, agent) {
-  $("stopWrap").classList.remove("open");
-  $("stopBtn").setAttribute("aria-expanded", "false");
+  closeStopMenu();
   const info = agent ? busyInfoFor(agent) : null;
   // "Stop the current responses" means the ones on screen when it was clicked.
   // Between the click and the request landing, a run can finish and the queue
@@ -3267,19 +3343,30 @@ async function stopResponses(scope, agent) {
     }
   } catch (e) { toast(e.message, true); }
 }
+// One click, one meaning. With a single response running and nothing queued the
+// primary stops exactly that run — pinned to its runId, `active` scope, so the
+// chain it would have continued into stops with it rather than hopping on after
+// the reply the user just killed. It never widens: a second seat, queued work or
+// a pair cycle each raise a question one click cannot answer, and those open the
+// chooser. In the gap between a reply and the hop it triggers there is no run to
+// name, so the only honest meaning left is the room-wide line — and the queue is
+// empty there by construction, because queued work would have opened the chooser
+// instead of reaching this branch.
 $("stopBtn").onclick = () => {
   if (!state.summary) return;
+  if (stopIsChoice(state.summary)) return toggleStopMenu();
   const active = state.summary.busy || [];
-  if (!stopIsChoice(state.summary)) {
-    return active.length === 1 ? stopResponses("seat", active[0]) : stopResponses("all", null);
-  }
-  const wrap = $("stopWrap");
-  const open = wrap.classList.toggle("open");
-  $("stopBtn").setAttribute("aria-expanded", String(open));
+  return active.length === 1 ? stopResponses("active", null) : stopResponses("all", null);
 };
+// The deliberate scopes stay one click away whatever the primary does —
+// seat-only is otherwise unreachable now that one busy seat stops directly.
+$("stopMore").onclick = () => { if (state.summary) toggleStopMenu(); };
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeStopMenu(); });
 $("stopMenu").onclick = (e) => {
   const choice = e.target.closest("[data-stop-scope]");
-  if (choice) stopResponses(choice.dataset.stopScope, choice.dataset.stopAgent || null);
+  // A row whose run ended while the menu was open is disabled where it stands.
+  if (!choice || choice.disabled) return;
+  stopResponses(choice.dataset.stopScope, choice.dataset.stopAgent || null);
 };
 input.addEventListener("keydown", (e) => {
   if (mentionKeydown(e)) return;

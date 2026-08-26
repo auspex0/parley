@@ -780,6 +780,10 @@ async function checkFolderPickerUi() {
   queuePop() { renderQueuePop(); return $("queuePop").innerHTML; },
   queueBadgeText() { setQueue(state.summary.queued, state.summary.queue, state.summary.queuedDispatches); return $("queueBadge").textContent; },
   stopMenu() { updateBusyUI(); return $("stopMenu").innerHTML; },
+  stopClick() { updateBusyUI(); return $("stopBtn").onclick(); },
+  stopCaretClick() { updateBusyUI(); return $("stopMore").onclick(); },
+  get stopMenuOpen() { return $("stopWrap").classList.contains("open"); },
+  get stopMenuHTML() { return $("stopMenu").innerHTML; },
   entryQuote(entry) { return entryQuoteHTML(entry); },
   gitLine(git) {
     renderGitId(git);
@@ -880,8 +884,44 @@ async function checkFolderPickerUi() {
   ok("the Stop menu names each scope and counts messages, not deliveries",
     /data-stop-scope="seat" /.test(menu) && /data-stop-scope="active"/.test(menu) &&
     /Cancel 2 queued messages/.test(menu) && /data-stop-scope="all"/.test(menu), menu);
+
   ok("a reply that directly follows its source still carries the quote",
     /data-jump-n="4"/.test(probe.entryQuote({ n: 5, kind: "agent", author: "claude", meta: { replyTo: 4 } })));
+
+  // Stop's primary click. Queued work is a question one click cannot answer, so
+  // this room — two queued dispatches — must still open the chooser and send
+  // nothing.
+  let stopBody = null;
+  nextFetch = async (_url, opts) => { stopBody = JSON.parse(opts.body); return ok200({ ok: true }); };
+  await probe.stopClick();
+  ok("Stop opens the chooser while work is queued, and sends nothing",
+    probe.stopMenuOpen === true && stopBody === null, JSON.stringify(stopBody));
+  await probe.stopCaretClick(); // close it again
+  // The commonest case — one seat replying, nothing queued — stops that run
+  // directly instead, pinned to its runId on the `active` scope so the hop the
+  // reply would have triggered dies with it. A `seat` stop deliberately would
+  // not, which is why the primary is not scoped that way.
+  probe.seedRoom({
+    ...uiSummary, queued: 0, queue: [], queuedDispatches: 0, workingPair: null,
+    busy: ["claude"], busyInfo: [{ agent: "claude", runId: "r7", phase: "start" }],
+  }, []);
+  stopBody = null;
+  await probe.stopClick();
+  ok("one response and an empty queue: the primary click stops that run directly",
+    probe.stopMenuOpen === false && !!stopBody && stopBody.scope === "active" &&
+    JSON.stringify(stopBody.runs) === JSON.stringify([{ agent: "claude", runId: "r7" }]),
+    JSON.stringify(stopBody));
+  // The caret is what keeps seat-only reachable now that the primary acts.
+  await probe.stopCaretClick();
+  ok("the caret still opens every deliberate scope",
+    probe.stopMenuOpen === true && /data-stop-scope="seat" /.test(probe.stopMenuHTML),
+    probe.stopMenuHTML);
+  await probe.stopCaretClick();
+  nextFetch = () => new Promise(() => {});
+  probe.seedRoom(uiSummary, [
+    { n: 4, kind: "user", author: "user", target: "claude", ts: "2026-08-05T02:02:00", text: "the original ask", meta: {} },
+    { n: 5, kind: "agent", author: "claude", ts: "2026-08-05T02:03:00", text: "answer", meta: { replyTo: 4 } },
+  ]);
 
   // A long room must remain windowed after one reveal. The old implementation
   // dropped renderFrom to null on the first click/scroll, making every later
@@ -1548,14 +1588,35 @@ async function main() {
   let stopChoice = null;
   try { stopChoice = stopChoiceSource ? Function(`${stopChoiceSource}; return stopIsChoice;`)() : null; }
   catch { /* reported below */ }
-  // `working` covers ordinary exchanges too, so the remaining half of @both
-  // still opens a per-seat chooser; `workingPair` is only wording.
-  ok("Stop treats a pair cycle and an ordinary exchange differently",
+  // The commonest case in the room — one seat replying, nothing queued — is a
+  // direct stop, not a chooser. `working` is true for every ordinary exchange,
+  // so including it made a single click cost two and let its blast radius flip
+  // on sub-second timing. The chooser is for the questions one click genuinely
+  // cannot answer: a second seat, queued work, or a pair cycle.
+  ok("Stop's primary click is direct for one response and a chooser only when ambiguous",
     typeof stopChoice === "function" &&
-    stopChoice({ busy: ["claude"], queued: 0, working: true, workingPair: null }) === true &&
-    stopChoice({ busy: [], queued: 0, working: false, workingPair: null }) === false &&
-    page.includes('summary.workingPair ? "Stop the pair cycle" : "Stop the exchange"') &&
+    stopChoice({ busy: ["claude"], queued: 0, working: true, workingPair: null }) === false &&
+    stopChoice({ busy: ["claude", "codex"], queued: 0, working: true, workingPair: null }) === true &&
+    stopChoice({ busy: ["claude"], queued: 2, working: true, workingPair: null }) === true &&
+    stopChoice({ busy: ["claude"], queued: 0, working: true, workingPair: true }) === true &&
+    stopChoice({ busy: [], queued: 0, working: false, workingPair: null }) === false,
+    stopChoiceSource);
+  // The unambiguous click is run-pinned `active`, never `seat`: it must also end
+  // the chain the killed reply would have continued into. A `seat` stop
+  // deliberately does not, which would leave the hop running after the user
+  // stopped the reply that triggered it.
+  ok("the direct stop is a run-pinned active stop, and the caret keeps every scope reachable",
+    page.includes('return active.length === 1 ? stopResponses("active", null) : stopResponses("all", null);') &&
+    page.includes('$("stopMore").onclick = () => { if (state.summary) toggleStopMenu(); };') &&
     !/const choose = active\.length > 1 \|\| state\.summary\.queued > 0/.test(page));
+  // Status events land several times a second while agents work. Rebuilding the
+  // open menu moved the row out from under an aiming cursor.
+  ok("an open stop menu is a frozen snapshot: rows never move, ended work goes disabled in place",
+    page.includes("let stopMenuShown = null;") &&
+    /if \(stopMenuShown && \$\("stopWrap"\)\.classList\.contains\("open"\)\)/.test(page) &&
+    page.includes("return next ? { ...next, gone: false } : { ...row, gone: true };") &&
+    page.includes("if (menu.dataset.sig === html) return;") &&
+    page.includes("if (!choice || choice.disabled) return;"));
   // The jump is useless precisely when the target sits in collapsed
   // scrollback, but revealing the whole transcript makes one quote click scale
   // with the lifetime of the room. Widen only to the target before lookup.
