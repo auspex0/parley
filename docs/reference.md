@@ -107,6 +107,21 @@ The hops control beside the composer is a sticky per-room browser-session shortc
 
 Causal settlement is serialized per original root, so overlapping live/recovered `@both` halves cannot miss one another or double-spend. Explicit recovered-root catch-up obligations are versioned, which prevents an older in-flight attempt from erasing a newer attempt for the same user message.
 
+## Seats and providers
+
+A room has two **seats**. A seat's **id** is its @mention name, its key in `room.json` and `state.json`, and the author on every transcript line and receipt — it is the primary key of everything durable in the room, so it is fixed for the room's life. Its **provider** (`agents.<id>.provider`) says which CLI drives it.
+
+The id defaults to the provider name, which is why every room created before the two were separate keeps working: it gains one field and renames nothing. Two seats may share a provider as long as their names differ, so a Claude-vs-Claude room (say `alpha` and `beta`, one on Opus and one on Sonnet) is an ordinary room.
+
+Seat names are lowercase letters, numbers and dashes, up to 20 characters, and cannot be `both`, `user`, `system`, `all` or `none` — those would collide with routing or with Parley's own voices in the transcript.
+
+```jsonc
+"agents": {
+  "alpha": { "provider": "claude", "model": "opus", ... },
+  "beta":  { "provider": "claude", "model": "sonnet", ... }
+}
+```
+
 ## Adding a provider
 
 Parley's two seats can host any CLI coding agent. To add one: write a `send(room, opts)` adapter in [parley.mjs](../parley.mjs) with the same contract as `claudeSend`/`codexSend` (read your config from `room.cfg.agents.<yourname>`, return `{ text, sessionRef, resetSession?, usage? }`), add it to the `adapters` map, and describe it in the `PROVIDERS` registry (label, avatar, color, default seat config, settings fields). The seat picker, settings UI, routing and receipts pick it up automatically.

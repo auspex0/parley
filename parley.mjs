@@ -149,14 +149,39 @@ function sameSecret(given, expected) {
 
 /**
  * Providers — the kinds of agent that can sit at the table. A room seats
- * exactly TWO, chosen at creation. The seat's key in room config IS the
- * provider name, so existing rooms need no migration and @mentions match.
+ * exactly TWO seats. Each seat has an **id** (its @mention name, its key in
+ * cfg.agents and state.agents, and the author on every entry and receipt) and a
+ * **provider** (`cfg.agents[id].provider`, a key of this registry).
  *
- * ADDING A PROVIDER: implement a send(room, opts) adapter with the same
- * contract as claudeSend/codexSend (return { text, sessionRef, usage? };
- * read your seat config from room.cfg.agents.<yourname>), add it to the
- * `adapters` map below the adapter definitions, and describe it here. The
- * seat picker, settings, colors and routing pick it up automatically.
+ * The id defaults to the provider name, which is why every room written before
+ * seats and providers were separate migrates by gaining one field and renaming
+ * nothing. That matters more than it looks: the seat id is the primary key of
+ * every durable record in the room — sessions, cursors, receipts, withdrawals,
+ * sleep, pair roles, queue lanes and the author of every transcript line. A
+ * migration that renamed seats would orphan all of it at once.
+ *
+ * ADDING A PROVIDER: implement an adapter with the same contract as
+ * claudeSend/codexSend/geminiSend — read config from `room.cfg.agents[seat]`
+ * and state from `room.state.agents[seat]`, pass `{ room, agent: seat }` to
+ * runCli or Stop cannot reach your process, and return
+ * `{ text, sessionRef, usage? }`. Add it to the `adapters` map below and to
+ * this registry. Anything the engine needs to know about your provider is
+ * *declared* in `capabilities`, never branched on by name outside the adapter:
+ *   sessions            "resume" (Parley can reattach) or "none"
+ *   sessionScope        { field, of(seatCfg, roomMode) } — the permission
+ *                       provenance stamped on a saved session, so a session
+ *                       created under looser rules is never silently resumed
+ *   isolateProtectedTurn(seatCfg, roomMode) — true when a read-only turn must
+ *                       not reuse this seat's saved session at all
+ *   extraArgsIssue(args) — provider-specific dangerous-flag rules
+ *   resumeLostPatterns  stderr shapes meaning "that session is gone"
+ *   sentinelSessionRefs session refs that are not durable identities
+ *   sentinelNote        one-time warning text when a sentinel is in use
+ *   nativeImageBytes    cap on natively-attached image bytes
+ *   sessionFixedFields  seat fields baked in at session creation; changing one
+ *                       must start a fresh session
+ *   resetOnRoomModeChange whether a Talk/Work flip invalidates the session
+ * The seat picker, settings, colours and routing pick it up automatically.
  */
 const PROVIDERS = {
   claude: {
@@ -171,6 +196,43 @@ const PROVIDERS = {
     efforts: ["low", "medium", "high", "xhigh", "max", "ultracode"],
     models: ["fable", "opus", "sonnet", "haiku"],
     effortLabels: { xhigh: "Extra High", ultracode: "Ultracode (xhigh + workflow orchestration)" },
+    capabilities: {
+      sessions: "resume",
+      // Arrow functions, so effectiveClaudePermissionMode being declared later
+      // in the file is fine — they are evaluated at call time, not at load.
+      sessionScope: { field: "permissionScope", of: (seatCfg, roomMode) => effectiveClaudePermissionMode(seatCfg, roomMode) },
+      isolateProtectedTurn: (seatCfg, roomMode) => effectiveClaudePermissionMode(seatCfg, roomMode) === "bypassPermissions",
+      nativeImageBytes: CLAUDE_NATIVE_IMAGE_BYTES,
+      // Room Settings is the supported, warned route to Full access; these are
+      // the raw argument shapes that would reach it without the warning.
+      extraArgsIssue: (args) => {
+        let seen = 0;
+        for (let i = 0; i < args.length; i++) {
+          const raw = args[i];
+          if (raw.split("=", 1)[0].toLowerCase() !== "--permission-mode") continue;
+          if (++seen > 1) return "Only one Claude --permission-mode override is allowed";
+          const mode = raw.includes("=") ? raw.slice(raw.indexOf("=") + 1) : args[i + 1];
+          if (!String(mode || "").trim() || String(mode).startsWith("-")) {
+            return "Claude --permission-mode requires a value";
+          }
+          if (String(mode || "").trim().toLowerCase() === "bypasspermissions") {
+            return "Use Claude's warned Full access setting instead of bypassPermissions in Extra CLI args";
+          }
+        }
+        return null;
+      },
+      resumeLostPatterns: [
+        /\bno conversation found with session id\b/i,
+        /\bconversation(?:\s+with)?(?:\s+session)?(?:\s+id)?[^\r\n]{0,80}\b(?:not found|does not exist)\b/i,
+      ],
+      enums: {
+        permissionMode: {
+          values: () => CLAUDE_PERMISSION_MODES,
+          fallback: "auto",
+          error: (v) => `Unknown Claude permission mode: ${v}. Choose room default, plan, acceptEdits, or full access.`,
+        },
+      },
+    },
   },
   codex: {
     label: "Codex", sub: "OpenAI Codex CLI", desc: "OpenAI's coding agent",
@@ -199,14 +261,108 @@ const PROVIDERS = {
       }
       return models.length ? { models, efforts: [...efforts].map(([value, hint]) => ({ value, hint })) } : null;
     },
+    capabilities: {
+      sessions: "resume",
+      resumeLostPatterns: [
+        /\bno rollout found for (?:thread|conversation) id\b/i,
+        /\bsession not found for (?:thread|request)_id\b/i,
+        /\bthread not found\b/i,
+      ],
+      // `--last` resumes "whatever ran most recently", which is not this room's
+      // thread and not a durable identity.
+      sentinelSessionRefs: ["--last"],
+      sentinelNote: "Note: {seat} did not report a thread id, so Parley will resume its most recent session (--last). Using {seat} outside Parley at the same time could cross threads.",
+      sessionFixedFields: ["sandbox"],
+      resetOnRoomModeChange: true,
+    },
+  },
+  gemini: {
+    label: "Gemini", sub: "Google Gemini CLI", desc: "Google's coding agent",
+    avatar: "G", color: "#8ab4f8",
+    defaults: { command: "gemini", model: null, extraArgs: [], lurk: false, lurkStyle: "balanced", lurkPrompt: null, approvalMode: "auto" },
+    fields: ["command", "model", "approvalMode", "extraArgs"],
+    // The CLI exposes no reasoning-effort dial, so the seat card omits it.
+    models: ["gemini-3-pro", "gemini-3-flash"],
+    capabilities: {
+      // Verified against gemini 0.53.0: `--session-id <uuid>` starts a session
+      // with an id we choose and `--resume <uuid>` reattaches to it, so the
+      // delta protocol works here exactly as it does for the other two.
+      sessions: "resume",
+      sessionScope: { field: "approvalScope", of: (seatCfg, roomMode) => effectiveGeminiApprovalMode(seatCfg, roomMode) },
+      fullAccessScope: "yolo",
+      resumeLostPatterns: [
+        /\bsession not found\b/i,
+        /\bno session\b[^\r\n]{0,40}\bfound\b/i,
+      ],
+      nativeImageBytes: Infinity,
+      // Same reasoning as Claude's: Room Settings is the warned route to yolo.
+      extraArgsIssue: (args) => {
+        for (let i = 0; i < args.length; i++) {
+          const flag = args[i].split("=", 1)[0].toLowerCase();
+          if (flag === "-y" || flag === "--yolo") {
+            return "Use Gemini's warned Full access setting instead of --yolo in Extra CLI args";
+          }
+          if (flag === "--approval-mode") {
+            const mode = args[i].includes("=") ? args[i].slice(args[i].indexOf("=") + 1) : args[i + 1];
+            if (String(mode || "").trim().toLowerCase() === "yolo") {
+              return "Use Gemini's warned Full access setting instead of --approval-mode yolo in Extra CLI args";
+            }
+          }
+        }
+        return null;
+      },
+      // The approval mode is chosen per invocation, so nothing about it is
+      // baked into the session.
+      enums: {
+        approvalMode: {
+          values: () => GEMINI_APPROVAL_MODES,
+          fallback: "auto",
+          error: (v) => `Unknown Gemini approval mode: ${v}. Choose room default, plan, auto_edit, or full access.`,
+        },
+      },
+    },
   },
 };
 const DEFAULT_SEATS = ["claude", "codex"];
 const CLAUDE_PERMISSION_MODES = new Set(["auto", "plan", "acceptEdits", "bypassPermissions"]);
+// Gemini's own vocabulary, minus the interactive-only cases. "auto" is Parley's
+// room default rather than one of the CLI's values, matching Claude's field.
+const GEMINI_APPROVAL_MODES = new Set(["auto", "plan", "auto_edit", "yolo"]);
 
 function seatIds(room) { return Object.keys(room.cfg.agents); }
 function otherSeat(room, id) { return seatIds(room).find((s) => s !== id) || id; }
-function providerOf(id) { return PROVIDERS[id] || PROVIDERS[DEFAULT_SEATS[0]]; }
+// A seat's provider comes from its config; a seat written before the two were
+// separate has none, and its id is the provider name. Null means the seat
+// resolves to nothing real — the same condition a junk seat key produced before.
+function providerIdFor(seatCfg, seatId) {
+  const p = seatCfg && seatCfg.provider;
+  return PROVIDERS[p] ? p : (PROVIDERS[seatId] ? seatId : null);
+}
+// Only where there is no room to consult, i.e. building a default config.
+function providerById(id) { return PROVIDERS[id] || PROVIDERS[DEFAULT_SEATS[0]]; }
+// The state field a provider stamps its session's permission provenance into,
+// or null if its sessions carry none. Takes a seat config rather than a room so
+// defaultState can use it before the room object exists.
+function sessionScopeField(seatCfg, seatId) {
+  const pid = providerIdFor(seatCfg, seatId);
+  const scope = pid && (PROVIDERS[pid].capabilities || {}).sessionScope;
+  return scope ? scope.field : null;
+}
+function providerOf(room, seatId) { return providerById(providerIdFor(room.cfg.agents[seatId], seatId)); }
+// Everything the engine needs to know about a seat's provider, declared rather
+// than branched on by name. See the PROVIDERS doc comment for the keys.
+function capsOf(room, seatId) { return providerOf(room, seatId).capabilities || {}; }
+// The provider id that drives a seat, for keying the adapters map.
+function providerIdOf(room, seatId) { return providerIdFor(room.cfg.agents[seatId], seatId) || DEFAULT_SEATS[0]; }
+
+// A seat id is an @mention, a config key, an author on every transcript line and
+// a lane name, so it has to be unambiguous and it can never change afterwards.
+// `both` would collide with the routing target; the other two name Parley's own
+// voices in the transcript.
+const RESERVED_SEAT_IDS = new Set(["both", "user", "system", "all", "none"]);
+function validSeatId(id) {
+  return /^[a-z][a-z0-9-]{0,19}$/.test(String(id || "")) && !RESERVED_SEAT_IDS.has(id);
+}
 // Effort names sort by depth, not alphabetically, however they arrive.
 const EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "ultracode"];
 const byDepth = (a, b) => {
@@ -241,25 +397,67 @@ function providerCatalog() {
   }));
   return catalogCache;
 }
+
+// The same catalog, resolved per seat, so a seat can be called anything and the
+// UI still knows which CLI's label, colour, avatar and settings fields to draw.
+// Deliberately not memoized: it has to follow config edits.
+function seatCatalog(room) {
+  const cat = providerCatalog();
+  return Object.fromEntries(seatIds(room).map((id) => {
+    const pid = providerIdOf(room, id);
+    const caps = (PROVIDERS[pid] || {}).capabilities || {};
+    return [id, {
+      ...cat[pid],
+      provider: pid,
+      sessions: caps.sessions || "resume",
+      // Which field, if any, holds this seat's permission choice, and which of
+      // its values means host-level trust — so the warning dialog does not have
+      // to know the provider by name.
+      permissionField: Object.keys(caps.enums || {})[0] || null,
+      fullAccessValue: caps.fullAccessScope || null,
+    }];
+  }));
+}
+
 // Drop config keys that aren't real seats (typos, junk from hand-edits).
 function pruneSeats(cfg) {
-  const keys = Object.keys(cfg.agents || {}).filter((k) => PROVIDERS[k]).slice(0, 2);
+  // Resolvability, not "the key happens to be a provider name": a seat is real
+  // if its config names a provider, or if its own id is one — which is what
+  // every room written before the two were separate looks like.
+  const keys = Object.keys(cfg.agents || {}).filter((k) => providerIdFor(cfg.agents[k], k)).slice(0, 2);
   cfg.agents = keys.length === 2
     ? Object.fromEntries(keys.map((k) => [k, cfg.agents[k]]))
     : defaultConfig().agents;
+  // Write the resolved provider back, so the migration happens once and the
+  // file says plainly what drives each seat.
+  for (const k of Object.keys(cfg.agents)) {
+    cfg.agents[k].provider = providerIdFor(cfg.agents[k], k) || k;
+  }
   return cfg;
 }
 
+// Seats arrive either as a bare id (id === provider, the shape every room used
+// before the two were separate) or as { id, provider }.
+function seatSpecs(seats) {
+  return (seats || DEFAULT_SEATS).map((s) => typeof s === "string"
+    ? { id: s, provider: s }
+    : { id: String(s.id), provider: String(s.provider || s.id) });
+}
+
 function defaultConfig(seats = DEFAULT_SEATS) {
+  const specs = seatSpecs(seats);
   return {
-    defaultAgent: seats[0],
+    defaultAgent: specs[0].id,
     mode: "talk",     // "talk" (chat, conservative permissions) | "work" (agents may write/run in the workspace)
     hopBudget: -1,    // agent-to-agent follow-ups per user message (-1 = until settled, 0 = none)
     pairRounds: 0,    // review rounds per message in pair mode (0 = until the reviewer approves)
     projectDir: null, // absolute path of a real project to work in (null = room's own sandbox workspace)
     roomNote: null,   // standing instruction prepended to every prompt (set via Settings or /note)
     timeoutMs: 900000,
-    agents: Object.fromEntries(seats.map((s) => [s, { ...providerOf(s).defaults }])),
+    // `provider` is written first so it reads first in room.json, and it is a
+    // real persisted key rather than something derived on read — otherwise the
+    // migration would not be idempotent.
+    agents: Object.fromEntries(specs.map((s) => [s.id, { provider: s.provider, ...providerById(s.provider).defaults }])),
   };
 }
 
@@ -293,7 +491,8 @@ function requireMessageHopBudget(value, label = "message hopBudget") {
   }
   return n;
 }
-function defaultState(seats = DEFAULT_SEATS) {
+function defaultState(agentsCfg) {
+  const seats = Object.keys(agentsCfg || {});
   return {
     lastAddressed: null,
     nextTurn: 1,
@@ -335,7 +534,10 @@ function defaultState(seats = DEFAULT_SEATS) {
       // merged into legacy state and claim a live session heard instructions
       // it never received. They are written together only after a successful
       // turn leaves a concrete, durable native session identity.
-      ...(s === "claude" ? { permissionScope: null } : {}),
+      // Declared by the provider rather than branched on by seat name: only a
+      // provider whose sessions carry permission provenance gets the field,
+      // and it is never leaked onto one that does not.
+      ...(sessionScopeField(agentsCfg[s], s) ? { [sessionScopeField(agentsCfg[s], s)]: null } : {}),
     }])),
   };
 }
@@ -422,9 +624,13 @@ function effectiveClaudePermissionMode(cfg, roomMode) {
   return configured === "auto" ? (roomMode === "work" ? "acceptEdits" : "default") : configured;
 }
 
-function isolatedClaudeProtectedTurn(room, agent, { discussion, readOnly } = {}) {
-  return agent === "claude" && !!(discussion || readOnly) &&
-    effectiveClaudePermissionMode(room.cfg.agents.claude, room.cfg.mode) === "bypassPermissions";
+// Some providers cannot make a read-only turn safe inside a session that was
+// created with broader powers, so that turn has to run outside the session
+// entirely. Which providers those are is declared, not assumed.
+function isolatedProtectedTurn(room, agent, { discussion, readOnly } = {}) {
+  if (!(discussion || readOnly)) return false;
+  const isolate = capsOf(room, agent).isolateProtectedTurn;
+  return typeof isolate === "function" && !!isolate(room.cfg.agents[agent], room.cfg.mode);
 }
 
 // A native session is created under one set of settings and cannot be changed
@@ -451,9 +657,12 @@ function applyAdapterSession(room, agent, res, epoch) {
   if (res.resetSession) room.state.agents[agent].sessionRef = null;
   else if (res.sessionRef) {
     room.state.agents[agent].sessionRef = res.sessionRef;
-    if (agent === "claude") {
-      room.state.agents.claude.permissionScope = effectiveClaudePermissionMode(
-        room.cfg.agents.claude, room.cfg.mode);
+    // Provenance, where the provider says its sessions carry it: a session
+    // created under looser rules must never be silently resumed under
+    // stricter ones, and the check on load is what enforces that.
+    const scope = capsOf(room, agent).sessionScope;
+    if (scope) {
+      room.state.agents[agent][scope.field] = scope.of(room.cfg.agents[agent], room.cfg.mode);
     }
   }
 }
@@ -485,35 +694,23 @@ function stampPromptDelivery(room, agent, res, epoch, delivery) {
 // Claude bypass arguments are rejected here as well as in the config endpoint
 // because room.json is intentionally hand-editable. Provider/user settings and
 // custom command wrappers remain part of the trusted local CLI boundary.
-function extraArgsViolation(agent, value) {
+function extraArgsViolation(room, agent, value) {
   if (!Array.isArray(value)) return "Extra CLI args must be a list";
   const args = value.map((v) => String(v));
-  let claudePermissionFlags = 0;
-  for (let i = 0; i < args.length; i++) {
-    const raw = args[i];
+  for (const raw of args) {
     const flag = raw.split("=", 1)[0].toLowerCase();
+    // The one rule that holds for every provider.
     if (flag.startsWith("--dangerously-") || flag.startsWith("--allow-dangerously-")) {
       return `${raw} is intentionally blocked by Parley`;
     }
-    if (agent === "claude" && flag === "--permission-mode") {
-      claudePermissionFlags++;
-      if (claudePermissionFlags > 1) {
-        return "Only one Claude --permission-mode override is allowed";
-      }
-      const mode = raw.includes("=") ? raw.slice(raw.indexOf("=") + 1) : args[i + 1];
-      if (!String(mode || "").trim() || String(mode).startsWith("-")) {
-        return "Claude --permission-mode requires a value";
-      }
-      if (String(mode || "").trim().toLowerCase() === "bypasspermissions") {
-        return "Use Claude's warned Full access setting instead of bypassPermissions in Extra CLI args";
-      }
-    }
   }
-  return null;
+  // Anything else is the provider's own vocabulary, so the provider owns it.
+  const issue = (room ? capsOf(room, agent) : (PROVIDERS[agent] || {}).capabilities || {}).extraArgsIssue;
+  return typeof issue === "function" ? (issue(args) || null) : null;
 }
 
-function checkedExtraArgs(agent, value) {
-  const issue = extraArgsViolation(agent, value || []);
+function checkedExtraArgs(room, agent, value) {
+  const issue = extraArgsViolation(room, agent, value || []);
   if (issue) throw new AdapterError(`unsafe Extra CLI args: ${issue}`);
   return (value || []).map((v) => String(v));
 }
@@ -536,18 +733,11 @@ function withoutArgWithValue(args, option) {
 // says the native conversation no longer exists. Authentication, rate limits,
 // transport errors and tool failures must surface without an automatic second
 // paid invocation (which could also duplicate side effects).
-function missingNativeSession(agent, r) {
-  const src = `${r.stderr || ""}\n${r.stdout || ""}`;
-  if (agent === "claude") {
-    return /\bno conversation found with session id\b/i.test(src) ||
-      /\bconversation(?:\s+with)?(?:\s+session)?(?:\s+id)?[^\r\n]{0,80}\b(?:not found|does not exist)\b/i.test(src);
-  }
-  if (agent === "codex") {
-    return /\bno rollout found for (?:thread|conversation) id\b/i.test(src) ||
-      /\bsession not found for (?:thread|request)_id\b/i.test(src) ||
-      /\bthread not found\b/i.test(src);
-  }
-  return false;
+function missingNativeSession(room, agent, r) {
+  const src = `${r.stderr || ""}
+${r.stdout || ""}`;
+  const patterns = capsOf(room, agent).resumeLostPatterns || [];
+  return patterns.some((re) => re.test(src));
 }
 
 class AdapterError extends Error {
@@ -789,7 +979,7 @@ function composeStandingContract(agent, room) {
   const values = {
     "{{AGENT}}": agent,
     "{{OTHER}}": other,
-    "{{OTHER_DESC}}": providerOf(other).desc,
+    "{{OTHER_DESC}}": providerOf(room, other).desc,
     "{{TRANSCRIPT_FILE}}": room.transcriptFile,
     "{{WORKDIR_KIND}}": room.cfg.projectDir ? "the user's project folder" : "a shared scratch workspace",
     "{{WORKDIR}}": workDir(room),
@@ -1084,12 +1274,12 @@ function codexItemLabel(item) {
 }
 
 /** Claude Code CLI: print mode + stream-json for live partial text. */
-async function claudeSend(room, { prompt, briefing, onStream, onActivity, discussion, readOnly, images = [], inputDir = null, allowEmpty = false }) {
-  const cfg = room.cfg.agents.claude;
+async function claudeSend(room, { seat = "claude", prompt, briefing, onStream, onActivity, discussion, readOnly, images = [], inputDir = null, allowEmpty = false }) {
+  const cfg = room.cfg.agents[seat];
   const protectedTurn = !!(discussion || readOnly);
-  const isolatedProtected = isolatedClaudeProtectedTurn(room, "claude", { discussion, readOnly });
-  const sess = isolatedProtected ? null : room.state.agents.claude.sessionRef;
-  const checked = checkedExtraArgs("claude", cfg.extraArgs);
+  const isolatedProtected = isolatedProtectedTurn(room, seat, { discussion, readOnly });
+  const sess = isolatedProtected ? null : room.state.agents[seat].sessionRef;
+  const checked = checkedExtraArgs(room, seat, cfg.extraArgs);
   // A protected discussion/review turn must not be reopened by an advanced
   // per-room permission override. Provider/user-level CLI settings remain part
   // of the local trust boundary, so the prompt still carries the same rule.
@@ -1182,7 +1372,7 @@ async function claudeSend(room, { prompt, briefing, onStream, onActivity, discus
   if (r.spawnError) throw new AdapterError(`could not launch claude (command: "${cfg.command}") — ${r.stderr}`);
   if (r.code !== 0) {
     throw new AdapterError(`claude (command: "${cfg.command}") exited with code ${r.code}${stderrTail(r)}`, {
-      resumeFailed: !!sess && missingNativeSession("claude", r),
+      resumeFailed: !!sess && missingNativeSession(room, seat, r),
     });
   }
   let text = resultText ?? assistantText ?? (acc || null);
@@ -1199,10 +1389,10 @@ async function claudeSend(room, { prompt, briefing, onStream, onActivity, discus
 }
 
 /** Codex CLI: exec mode + JSONL events; final text via --output-last-message. */
-async function codexSend(room, { prompt, briefing, onStream, onActivity, images = [], inputDir = null, allowEmpty = false }) {
-  const cfg = room.cfg.agents.codex;
-  const sess = room.state.agents.codex.sessionRef;
-  const extraArgs = checkedExtraArgs("codex", cfg.extraArgs);
+async function codexSend(room, { seat = "codex", prompt, briefing, onStream, onActivity, images = [], inputDir = null, allowEmpty = false }) {
+  const cfg = room.cfg.agents[seat];
+  const sess = room.state.agents[seat].sessionRef;
+  const extraArgs = checkedExtraArgs(room, seat, cfg.extraArgs);
   const tmp = path.join(os.tmpdir(), `parley-codex-${crypto.randomUUID()}.txt`);
 
   // Work rooms upgrade the default read-only sandbox; explicit settings win.
@@ -1275,12 +1465,109 @@ async function codexSend(room, { prompt, briefing, onStream, onActivity, images 
   if (r.spawnError) throw new AdapterError(`could not launch codex (command: "${cfg.command}") — ${r.stderr}`);
   if (r.code !== 0) {
     throw new AdapterError(`codex (command: "${cfg.command}") exited with code ${r.code}${stderrTail(r)}`, {
-      resumeFailed: !!sess && missingNativeSession("codex", r),
+      resumeFailed: !!sess && missingNativeSession(room, seat, r),
     });
   }
   const text = fileText ?? lastMsg ?? (acc || null);
   if (!text && !allowEmpty) throw new AdapterError("codex returned an empty reply");
   return { text: text || "", emptyReply: !text, sessionRef: threadRef || "--last", sentinelThread: !threadRef || threadRef === "--last", usage };
+}
+
+// `auto` is Parley's "follow the room", matching Claude's field, rather than one
+// of Gemini's own values. An explicit Extra CLI arg still wins.
+function effectiveGeminiApprovalMode(cfg, roomMode) {
+  const override = cliArgValue(cfg.extraArgs || [], "--approval-mode");
+  if (override !== null) return override || "invalid";
+  const configured = GEMINI_APPROVAL_MODES.has(cfg.approvalMode) ? cfg.approvalMode : "auto";
+  return configured === "auto" ? (roomMode === "work" ? "auto_edit" : "default") : configured;
+}
+
+/**
+ * Google Gemini CLI: headless mode with JSON output.
+ *
+ * Verified against gemini 0.53.0 rather than assumed:
+ *  - Headless mode triggers on a non-TTY stdin, which is how Parley spawns it,
+ *    so the whole prompt goes on stdin and never near a command line — Windows
+ *    would otherwise truncate a normal delta somewhere past 32 KB.
+ *  - `--output-format json` returns one object: { response, stats, error? }.
+ *  - `--session-id <uuid>` starts a session with an id we choose, and
+ *    `--resume <uuid>` reattaches to it. That is what makes Gemini a full
+ *    delta-protocol seat rather than a stateless one that re-reads history
+ *    every turn: Parley mints the id, so it knows the session's name before the
+ *    process has said anything.
+ *  - `--approval-mode` takes default | auto_edit | yolo | plan. `plan` is a
+ *    real read-only mode, which is what protected discussion, reviewer and
+ *    listener turns need — the same role Claude's Plan mode plays.
+ */
+async function geminiSend(room, { seat = "gemini", prompt, briefing, onStream, onActivity, discussion, readOnly, images = [], inputDir = null, allowEmpty = false }) {
+  const cfg = room.cfg.agents[seat];
+  const protectedTurn = !!(discussion || readOnly);
+  const sess = room.state.agents[seat].sessionRef;
+  const extraArgs = checkedExtraArgs(room, seat, cfg.extraArgs);
+  const args = ["--output-format", "json"];
+  // Reattach to the session Parley named, or name the next one. Either way the
+  // id is ours, so a reply never has to tell us what it just created.
+  const sessionRef = sess || crypto.randomUUID();
+  if (sess) args.push("--resume", sess);
+  else args.push("--session-id", sessionRef);
+  if (cfg.model) args.push("--model", cfg.model);
+  // Disposable copies of attachments, never the room's canonical store.
+  if (inputDir) args.push("--include-directories", inputDir);
+  const approval = protectedTurn ? "plan" : effectiveGeminiApprovalMode(cfg, room.cfg.mode);
+  args.push("--approval-mode", approval);
+  // A protected turn must not be reopened by an advanced per-room override.
+  args.push(...(protectedTurn ? withoutArgWithValue(extraArgs, "--approval-mode") : extraArgs));
+
+  // The briefing is a system-level instruction for the other two providers, but
+  // Gemini's headless mode has no equivalent flag, so it leads the prompt. The
+  // fresh-session case is the only one that has a briefing at all.
+  const input = briefing ? `${briefing}\n\n${prompt}` : prompt;
+
+  let usage = null;
+  let responseText = null;
+  let errorText = null;
+  // json mode emits one object at the end rather than a stream, so there is
+  // nothing to feed onStream — the live bubble simply stays on "thinking" until
+  // the reply lands, which is honest rather than fake.
+  const onLine = (line) => {
+    if (!line.startsWith("{")) return;
+    let obj; try { obj = JSON.parse(line); } catch { return; }
+    if (typeof obj.response === "string") responseText = obj.response;
+    if (obj.error) errorText = obj.error.message || String(obj.error);
+    const stats = obj.stats && (obj.stats.tokens || obj.stats);
+    if (stats && typeof stats.output === "number") {
+      usage = { out: stats.output, ...(typeof stats.thoughts === "number" ? { reasoning: stats.thoughts } : {}) };
+    }
+  };
+
+  const r = await runCli(resolveCommand(cfg.command), args, {
+    cwd: workDir(room), timeoutMs: seatTimeout(room, seat), input, onLine, room, agent: seat,
+  });
+
+  // json mode can also emit the object as one multi-line blob rather than a
+  // single line, so parse the whole of stdout if the line reader found nothing.
+  if (responseText === null && r.stdout) {
+    try {
+      const obj = JSON.parse(r.stdout.trim());
+      if (typeof obj.response === "string") responseText = obj.response;
+      if (obj.error) errorText = obj.error.message || String(obj.error);
+    } catch { /* not a single JSON document; fall through to the raw text */ }
+  }
+
+  if (r.stopped) throw new AdapterError(`${seat} was stopped by you`, { stopped: true });
+  if (r.timedOut) throw new AdapterError(`${seat} timed out after ${Math.round(seatTimeout(room, seat) / 1000)}s — raise "Timeout" in Settings if it needs longer`);
+  if (r.spawnError) throw new AdapterError(`could not launch ${seat} (command: "${cfg.command}") — ${r.stderr}`);
+  if (r.code !== 0) {
+    throw new AdapterError(`${seat} (command: "${cfg.command}") exited with code ${r.code}${stderrTail(r)}`, {
+      // Exit 42 is the CLI's "input error", which is what a resume against a
+      // session it no longer has looks like.
+      resumeFailed: !!sess && (r.code === 42 || missingNativeSession(room, seat, r)),
+    });
+  }
+  if (errorText) throw new AdapterError(`${seat}: ${truncate(errorText, 300)}`);
+  const text = responseText ?? (r.stdout || "").trim() ?? null;
+  if (!text && !allowEmpty) throw new AdapterError(`${seat} returned an empty reply`);
+  return { text: text || "", emptyReply: !text, sessionRef, ...(usage ? { usage } : {}) };
 }
 
 // A briefing is a string (fresh session) or null (resumed session). Anything
@@ -1297,7 +1584,13 @@ function briefedAdapter(send) {
     return send(room, opts);
   };
 }
-const adapters = { claude: briefedAdapter(claudeSend), codex: briefedAdapter(codexSend) };
+// Keyed by provider, not by seat name — which is what lets a seat be called
+// anything and still be driven by the right CLI.
+const adapters = {
+  claude: briefedAdapter(claudeSend),
+  codex: briefedAdapter(codexSend),
+  gemini: briefedAdapter(geminiSend),
+};
 
 // ---------------------------------------------------------------- rooms
 
@@ -1350,13 +1643,24 @@ function loadRoom(name, seatChoice, create = false) {
       delete raw.maxHops;
       cfgMigrated = true;
     }
-    const seats = Object.keys(raw.agents || {}).filter((k) => PROVIDERS[k]).slice(0, 2);
+    // A seat is described by its id and its provider. A room written before the
+    // two were separate names no provider, and its id is the provider — which
+    // is why this migration adds one field and renames nothing.
+    const seats = Object.entries(raw.agents || {})
+      .filter(([k, v]) => providerIdFor(v, k))
+      .slice(0, 2)
+      .map(([k, v]) => ({ id: k, provider: providerIdFor(v, k) }));
+    if (seats.some(({ id, provider }) => (raw.agents[id] || {}).provider !== provider)) cfgMigrated = true;
     cfg = pruneSeats(deepMerge(defaultConfig(seats.length === 2 ? seats : DEFAULT_SEATS), raw));
     cfg.hopBudget = normalizeHopBudget(cfg.hopBudget, -1);
     // A hand-edited unknown value must fail closed to Parley's room default,
-    // rather than becoming an ambiguous permission state in the UI.
-    if (cfg.agents.claude && !CLAUDE_PERMISSION_MODES.has(cfg.agents.claude.permissionMode)) {
-      cfg.agents.claude.permissionMode = "auto";
+    // rather than becoming an ambiguous permission state in the UI. Which
+    // fields are enumerated, and what they fall back to, is the provider's.
+    for (const id of Object.keys(cfg.agents)) {
+      const enums = (PROVIDERS[providerIdFor(cfg.agents[id], id)].capabilities || {}).enums || {};
+      for (const [field, rule] of Object.entries(enums)) {
+        if (!rule.values().has(cfg.agents[id][field])) cfg.agents[id][field] = rule.fallback;
+      }
     }
     // Rooms created before deep reasoning levels existed carry the old
     // five-minute cap, which now kills healthy turns; lift only that value.
@@ -1374,7 +1678,7 @@ function loadRoom(name, seatChoice, create = false) {
   if (fs.existsSync(stateFile)) {
     try {
       rawState = readJSON(stateFile);
-      state = deepMerge(defaultState(seats), rawState);
+      state = deepMerge(defaultState(cfg.agents), rawState);
     } catch {
       // Runtime state is reconstructible — events.jsonl is the authoritative
       // record and is append-only, so it survives whatever truncated this file.
@@ -1383,12 +1687,12 @@ function loadRoom(name, seatChoice, create = false) {
       // damaged copy for inspection and carry on from defaults.
       try { fs.renameSync(stateFile, `${stateFile}.corrupt`); } catch { /* best effort */ }
       rawState = null;
-      state = defaultState(seats);
+      state = defaultState(cfg.agents);
       console.error(`parley: ${name}/state.json was unreadable; kept it as state.json.corrupt and reset runtime state (the transcript is intact).`);
       writeJSON(stateFile, state);
     }
   }
-  else { state = defaultState(seats); writeJSON(stateFile, state); }
+  else { state = defaultState(cfg.agents); writeJSON(stateFile, state); }
 
   // A native Claude session was created under one effective permission mode.
   // Persist that provenance so an offline room.json edit (or an upgrade from a
@@ -1428,11 +1732,18 @@ function loadRoom(name, seatChoice, create = false) {
       stateMigrated = true;
     }
   }
-  if (state.agents.claude) {
-    const expectedScope = effectiveClaudePermissionMode(cfg.agents.claude, cfg.mode);
-    if (state.agents.claude.permissionScope !== expectedScope) {
-      state.agents.claude.sessionRef = null;
-      state.agents.claude.permissionScope = expectedScope;
+  // A saved session was created under one set of permissions. Where the provider
+  // says its sessions carry that provenance, a mismatch means the file was
+  // edited (or predates the field), and resuming would silently reattach a
+  // more-privileged session under a newly conservative configuration.
+  for (const id of seats) {
+    const pid = providerIdFor(cfg.agents[id], id);
+    const scope = pid && (PROVIDERS[pid].capabilities || {}).sessionScope;
+    if (!scope || !state.agents[id]) continue;
+    const expected = scope.of(cfg.agents[id], cfg.mode);
+    if (state.agents[id][scope.field] !== expected) {
+      state.agents[id].sessionRef = null;
+      state.agents[id][scope.field] = expected;
       stateMigrated = true;
     }
   }
@@ -1893,8 +2204,9 @@ function stageProviderInputs(room, agent, entries, imageBudget) {
   };
 }
 
-function nativeImageBudget(agent) {
-  return agent === "claude" ? CLAUDE_NATIVE_IMAGE_BYTES : Infinity;
+function nativeImageBudget(room, agent) {
+  const cap = capsOf(room, agent).nativeImageBytes;
+  return cap === undefined ? Infinity : cap;
 }
 
 function transcriptAttachmentMarkdown(entry) {
@@ -1963,6 +2275,10 @@ function roomSummary(room) {
     lastAddressed: room.state.lastAddressed,
     seats,
     providers: providerCatalog(),
+    // Per seat, because a seat's id no longer has to be its provider's. Purely
+    // additive: an older page still keys off `providers` and, for a room whose
+    // ids are provider names, gets the same answer.
+    seatInfo: seatCatalog(room),
     agents: Object.fromEntries(seats.map((a) => [a, {
       linked: !!room.state.agents[a].sessionRef,
       sessionRef: room.state.agents[a].sessionRef ? String(room.state.agents[a].sessionRef).slice(0, 8) : null,
@@ -2519,7 +2835,7 @@ async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) 
       ? room.entries.find((e) => e.n === Number(askFrom.sourceN)) || null : null;
     providerInputs = stageProviderInputs(room, agent,
       [userTurn, ...(askSource ? [askSource] : []), ...unseen.slice().reverse()],
-      nativeImageBudget(agent));
+      nativeImageBudget(room, agent));
     const delta = buildDelta(room, agent, userTurn.n, unseen, providerInputs);
     const images = providerInputs.images;
     const askBlock = askSource
@@ -2541,7 +2857,7 @@ async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) 
     let turnScope = scopeNow();
     let prompt = noted(turnScope.discussion ? `${basePrompt}\n\n${DISCUSSION_NOTE}` : basePrompt);
     retireOutdatedSession(room, agent);
-    const isolated = isolatedClaudeProtectedTurn(room, agent, turnScope);
+    const isolated = isolatedProtectedTurn(room, agent, turnScope);
     const fresh = !room.state.agents[agent].sessionRef || isolated;
     let delivery = composePromptDelivery(room, agent, fresh, isolated);
     const briefing = delivery.briefing;
@@ -2552,7 +2868,8 @@ async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) 
     // change begins under the new configuration and may keep what it creates.
     let epoch = seatEpoch(room, agent);
     try {
-      res = await adapters[agent](room, {
+      res = await adapters[providerIdOf(room, agent)](room, {
+        seat: agent,
         prompt, briefing, onStream, onActivity, images, inputDir: providerInputs.dir,
         allowEmpty: !!opts.allowEmpty, ...turnScope,
       });
@@ -2567,7 +2884,8 @@ async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) 
         const b2 = resetRecoveryBriefing(room, agent);
         delivery = { ...delivery, contractDelivered: true, expectedSessionRef: null };
         epoch = seatEpoch(room, agent);
-        res = await adapters[agent](room, {
+        res = await adapters[providerIdOf(room, agent)](room, {
+        seat: agent,
           prompt, briefing: b2, onStream, onActivity, images, inputDir: providerInputs.dir,
           allowEmpty: !!opts.allowEmpty, ...turnScope,
         });
@@ -2614,12 +2932,15 @@ async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) 
       turn: userTurn.n, mode: "turn",
     });
 
-    if (agent === "codex" && res.sentinelThread && !room.state.codexLastWarned) {
-      room.state.codexLastWarned = true;
+    // Some providers can fall back to a session ref that is not a durable
+    // identity. Warn once per room, in the provider's own words.
+    const sentinelNote = capsOf(room, agent).sentinelNote;
+    if (sentinelNote && res.sentinelThread && !room.state.codexLastWarned) {
+      room.state.codexLastWarned = true; // legacy key name; one note per room
       saveState(room);
       appendEntry(room, {
         kind: "system", author: "system",
-        text: "Note: codex did not report a thread id, so Parley will resume its most recent session (--last). Using codex outside Parley at the same time could cross threads.",
+        text: sentinelNote.replaceAll("{seat}", agent),
       });
     }
     return replyEntry;
@@ -2717,7 +3038,7 @@ async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE, opts = 
   let providerInputs = null;
   try {
     providerInputs = stageProviderInputs(room, agent,
-      [...catchUpRootEntries.slice().reverse(), ...unseen.slice().reverse()], nativeImageBudget(agent));
+      [...catchUpRootEntries.slice().reverse(), ...unseen.slice().reverse()], nativeImageBudget(room, agent));
     const delta = buildDelta(room, agent, -1, unseen, providerInputs,
       opts.catchUp ? { catchUpRoots: catchUpRootSet } : {});
     const images = providerInputs.images;
@@ -2748,7 +3069,7 @@ async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE, opts = 
     let turnScope = scopeNow();
     let prompt = head + (turnScope.discussion ? `\n${DISCUSSION_NOTE}` : "");
     retireOutdatedSession(room, agent);
-    const isolated = isolatedClaudeProtectedTurn(room, agent, turnScope);
+    const isolated = isolatedProtectedTurn(room, agent, turnScope);
     const fresh = !room.state.agents[agent].sessionRef || isolated;
     let delivery = composePromptDelivery(room, agent, fresh, isolated);
     const briefing = delivery.briefing;
@@ -2757,7 +3078,8 @@ async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE, opts = 
     let res;
     let epoch = seatEpoch(room, agent); // per attempt — see applyAdapterSession
     try {
-      res = await adapters[agent](room, {
+      res = await adapters[providerIdOf(room, agent)](room, {
+        seat: agent,
         prompt, briefing, onStream, onActivity, images, inputDir: providerInputs.dir, ...turnScope,
       });
     } catch (e) {
@@ -2769,7 +3091,8 @@ async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE, opts = 
         turnScope = scopeNow();
         prompt = head + (turnScope.discussion ? `\n${DISCUSSION_NOTE}` : "");
         epoch = seatEpoch(room, agent);
-        res = await adapters[agent](room, {
+        res = await adapters[providerIdOf(room, agent)](room, {
+        seat: agent,
           prompt, briefing: b2, onStream, onActivity, images, inputDir: providerInputs.dir, ...turnScope,
         });
       } else throw e;
@@ -3045,7 +3368,7 @@ async function runHopTurn(room, agent, triggerEntry, rootN, scope = NO_SCOPE, op
     const rootEntry = room.entries.find((entry) => entry.n === rootN && entry.kind === "user") || null;
     providerInputs = stageProviderInputs(room, agent,
       [...(rootEntry ? [rootEntry] : []), triggerEntry, ...unseen.slice().reverse()],
-      nativeImageBudget(agent));
+      nativeImageBudget(room, agent));
     const delta = buildDelta(room, agent, triggerEntry.n, unseen, providerInputs);
     // The first reviewer often receives the root in its ordinary delta. Add
     // the root attachment block separately only after that cursor has moved
@@ -3071,7 +3394,7 @@ async function runHopTurn(room, agent, triggerEntry, rootN, scope = NO_SCOPE, op
     let turnScope = scopeNow();
     let prompt = body + (turnScope.discussion ? `\n${DISCUSSION_NOTE}` : "");
     retireOutdatedSession(room, agent);
-    const isolated = isolatedClaudeProtectedTurn(room, agent, turnScope);
+    const isolated = isolatedProtectedTurn(room, agent, turnScope);
     const fresh = !room.state.agents[agent].sessionRef || isolated;
     let delivery = composePromptDelivery(room, agent, fresh, isolated);
     const briefing = delivery.briefing;
@@ -3084,7 +3407,8 @@ async function runHopTurn(room, agent, triggerEntry, rootN, scope = NO_SCOPE, op
       // the logical hop at the adapter boundary; a native resume-recovery retry
       // remains part of this same delivered turn and does not charge twice.
       if (opts.onLaunch) opts.onLaunch();
-      res = await adapters[agent](room, {
+      res = await adapters[providerIdOf(room, agent)](room, {
+        seat: agent,
         prompt, briefing, onStream, onActivity, images, inputDir: providerInputs.dir,
         allowEmpty: !!opts.allowEmpty, ...turnScope,
       });
@@ -3097,7 +3421,8 @@ async function runHopTurn(room, agent, triggerEntry, rootN, scope = NO_SCOPE, op
         turnScope = scopeNow();
         prompt = body + (turnScope.discussion ? `\n${DISCUSSION_NOTE}` : "");
         epoch = seatEpoch(room, agent);
-        res = await adapters[agent](room, {
+        res = await adapters[providerIdOf(room, agent)](room, {
+        seat: agent,
           prompt, briefing: b2, onStream, onActivity, images, inputDir: providerInputs.dir,
           allowEmpty: !!opts.allowEmpty, ...turnScope,
         });
@@ -6092,13 +6417,15 @@ function handleNewConversation(room) {
   // conversation, so archiving does not quietly make a rate-limited seat
   // invocable again. Everything else — cursors, sessions, pair — starts fresh.
   const stillAsleep = Object.fromEntries(seatIds(room).map((a) => [a, sleepState(room, a)]));
-  room.state = defaultState(seatIds(room));
+  room.state = defaultState(room.cfg.agents);
   for (const a of seatIds(room)) room.state.agents[a].asleep = stillAsleep[a];
   room.state.roomNoteValue = normalizeRoomNote(room.cfg.roomNote);
   room.state.roomNoteRevision = room.state.roomNoteValue === null ? 0 : 1;
-  if (room.state.agents.claude) {
-    room.state.agents.claude.permissionScope = effectiveClaudePermissionMode(
-      room.cfg.agents.claude, room.cfg.mode);
+  // The fresh state starts with no session, so the provenance it records must
+  // be the one the next session will be created under.
+  for (const a of seatIds(room)) {
+    const scope = capsOf(room, a).sessionScope;
+    if (scope) room.state.agents[a][scope.field] = scope.of(room.cfg.agents[a], room.cfg.mode);
   }
   room.entries = [];
   room.receipts = [];
@@ -6264,9 +6591,25 @@ const server = http.createServer(async (req, res) => {
       }
       let picked;
       if (Array.isArray(seats)) {
-        picked = seats.map((s) => String(s).toLowerCase()).filter((s) => PROVIDERS[s]);
-        if (picked.length !== 2 || picked[0] === picked[1]) {
-          return json(res, 400, { error: "Pick two different seats from the available providers." });
+        // A seat is either a bare provider name (its id is that name, which is
+        // every room ever created before ids and providers were separate) or
+        // { id, provider } — which is what makes two seats of one provider
+        // possible, since only the ids have to differ.
+        picked = [];
+        for (const raw of seats) {
+          const spec = typeof raw === "string"
+            ? { id: String(raw).toLowerCase(), provider: String(raw).toLowerCase() }
+            : { id: String((raw && raw.id) || "").toLowerCase(), provider: String((raw && raw.provider) || (raw && raw.id) || "").toLowerCase() };
+          if (!PROVIDERS[spec.provider]) {
+            return json(res, 400, { error: `Unknown provider: ${spec.provider || "(none)"}` });
+          }
+          if (!validSeatId(spec.id)) {
+            return json(res, 400, { error: `Seat names: lowercase letters, numbers, dashes (max 20), and not ${[...RESERVED_SEAT_IDS].join(", ")}.` });
+          }
+          picked.push(spec);
+        }
+        if (picked.length !== 2 || picked[0].id === picked[1].id) {
+          return json(res, 400, { error: "Pick two seats with different names." });
         }
       }
       const created = loadRoom(roomName, picked, true);
@@ -6515,12 +6858,18 @@ const server = http.createServer(async (req, res) => {
       const prevProjectDir = room.cfg.projectDir || null;
       const prevRoomNote = normalizeRoomNote(room.cfg.roomNote);
       const prevLurk = Object.fromEntries(seatIds(room).map((id) => [id, !!room.cfg.agents[id].lurk]));
-      const prevClaudePermission = room.cfg.agents.claude
-        ? effectiveClaudePermissionMode(room.cfg.agents.claude, prevMode)
-        : null;
-      // Sandboxed seats (codex-style) fix their sandbox at session creation —
-      // track it per seat so a change can trigger a clean relink.
-      const sandboxSeats = seatIds(room).filter((id) => "sandbox" in providerOf(id).defaults);
+      // The permission provenance each seat's session was created under, for
+      // every provider whose sessions carry one — a change means that seat has
+      // to start a fresh session rather than reattach under new rules.
+      const scopeSeats = seatIds(room).filter((id) => capsOf(room, id).sessionScope);
+      const prevScopes = Object.fromEntries(scopeSeats.map((id) =>
+        [id, capsOf(room, id).sessionScope.of(room.cfg.agents[id], prevMode)]));
+      // Fields a provider bakes into a session at creation. Changing one has to
+      // start a fresh session, so track the previous values per seat.
+      const sandboxSeats = seatIds(room).filter((id) => (capsOf(room, id).sessionFixedFields || []).includes("sandbox"));
+      // Whether a Talk/Work flip alone invalidates a seat's session is the
+      // provider's call, not something to infer from having a sandbox.
+      const modeSensitiveSeats = seatIds(room).filter((id) => capsOf(room, id).resetOnRoomModeChange);
       const prevSandboxes = Object.fromEntries(sandboxSeats.map((id) => [id, room.cfg.agents[id].sandbox || "read-only"]));
       // Validate into a candidate first — a rejected patch must leave the
       // live room untouched.
@@ -6543,22 +6892,24 @@ const server = http.createServer(async (req, res) => {
       delete next.maxHops;
       next.pairRounds = Math.min(99, Math.max(0, Number(next.pairRounds) || 0));
       for (const [id, agentCfg] of Object.entries(next.agents)) {
-        const issue = extraArgsViolation(id, agentCfg.extraArgs || []);
+        const pid = providerIdFor(agentCfg, id);
+        const caps = pid ? (PROVIDERS[pid].capabilities || {}) : {};
+        const issue = extraArgsViolation(room, id, agentCfg.extraArgs || []);
         if (issue) return json(res, 400, { error: `Unsafe Extra CLI args for ${id}: ${issue}` });
-        if (id === "claude") {
-          const permissionMode = agentCfg.permissionMode ?? "auto";
-          if (!CLAUDE_PERMISSION_MODES.has(permissionMode)) {
-            return json(res, 400, {
-              error: `Unknown Claude permission mode: ${permissionMode}. Choose room default, plan, acceptEdits, or full access.`,
-            });
-          }
-          agentCfg.permissionMode = permissionMode;
+        // Which fields are enumerated, and what a bad value says, belongs to
+        // the provider — the API refuses it outright, while a hand-edited
+        // room.json falls back on load.
+        for (const [field, rule] of Object.entries(caps.enums || {})) {
+          const value = agentCfg[field] ?? rule.fallback;
+          if (!rule.values().has(value)) return json(res, 400, { error: rule.error(value) });
+          agentCfg[field] = value;
         }
       }
-      const nextClaudePermission = next.agents.claude
-        ? effectiveClaudePermissionMode(next.agents.claude, next.mode)
-        : null;
-      const claudePermissionChanged = prevClaudePermission !== nextClaudePermission;
+      const nextScopes = Object.fromEntries(scopeSeats
+        .filter((id) => next.agents[id])
+        .map((id) => [id, capsOf(room, id).sessionScope.of(next.agents[id], next.mode)]));
+      const scopeChangedSeats = scopeSeats.filter((id) => prevScopes[id] !== nextScopes[id]);
+      const claudePermissionChanged = scopeChangedSeats.length > 0;
       if (next.projectDir) {
         const pd = path.resolve(String(next.projectDir).trim());
         let isDir = false;
@@ -6574,8 +6925,8 @@ const server = http.createServer(async (req, res) => {
       // session. The same rule covers gaps inside an active pair cycle.
       const modeResetSeats = new Set();
       if (prevMode !== next.mode) {
-        for (const id of sandboxSeats) modeResetSeats.add(id);
-        if (claudePermissionChanged) modeResetSeats.add("claude");
+        for (const id of modeSensitiveSeats) modeResetSeats.add(id);
+        for (const id of scopeChangedSeats) modeResetSeats.add(id);
       }
       const sandboxChangedSeats = new Set(sandboxSeats.filter((id) =>
         prevSandboxes[id] !== (next.agents[id].sandbox || "read-only")));
@@ -6585,7 +6936,7 @@ const server = http.createServer(async (req, res) => {
       }
       for (const id of modeResetSeats) resetRequiredSeats.add(id);
       for (const id of sandboxChangedSeats) resetRequiredSeats.add(id);
-      if (claudePermissionChanged) resetRequiredSeats.add("claude");
+      for (const id of scopeChangedSeats) resetRequiredSeats.add(id);
 
       // Applying immediately is safe for permissions and sandboxes. The running
       // process keeps the flags it launched with (nothing can change those once
@@ -6644,10 +6995,10 @@ const server = http.createServer(async (req, res) => {
         // are bumped — an unaffected agent keeps its session.
         room.cfgEpoch[id] = seatEpoch(room, id) + 1;
       }
-      if (room.state.agents.claude) {
-        room.state.agents.claude.permissionScope = nextClaudePermission;
+      for (const id of scopeSeats) {
+        if (room.state.agents[id]) room.state.agents[id][capsOf(room, id).sessionScope.field] = nextScopes[id];
       }
-      if (resetRequiredSeats.size || room.state.agents.claude || roomNoteChanged) saveState(room);
+      if (resetRequiredSeats.size || scopeSeats.length || roomNoteChanged) saveState(room);
       // A room-sourced mode follows Settings for its next cycle. An in-flight
       // cycle keeps the snapshot exposed as `workingPair`; explicit
       // `/pair start 2 ...` overrides remain pinned to their command value.
@@ -6702,18 +7053,20 @@ const server = http.createServer(async (req, res) => {
           }
         }
       }
-      if (claudePermissionChanged) {
+      for (const id of scopeChangedSeats) {
+        const was = prevScopes[id], now = nextScopes[id];
+        // Which value counts as host-level trust is the provider's to name.
+        const full = capsOf(room, id).fullAccessScope || "bypassPermissions";
         // Mode flips already carry a general permission note. Full-access
         // transitions always get their own durable audit line as well.
-        if (prevMode === room.cfg.mode ||
-            prevClaudePermission === "bypassPermissions" || nextClaudePermission === "bypassPermissions") {
-          const text = nextClaudePermission === "bypassPermissions"
-            ? "⚠ Claude Full access enabled — ordinary Claude turns bypass ordinary permission prompts and checks. Claude starts a fresh session; Parley requests isolated Plan invocations for protected discussion, review and listener turns."
-            : prevClaudePermission === "bypassPermissions"
-              ? `🔒 Claude Full access disabled — Claude starts a fresh session in ${nextClaudePermission} mode.`
-              : `Claude permission mode changed to ${nextClaudePermission} — Claude starts a fresh session so it applies cleanly.`;
-          appendEntry(room, { kind: "system", author: "system", text });
-        }
+        if (prevMode !== room.cfg.mode && was !== full && now !== full) continue;
+        const label = titleCase(id);
+        const text = now === full
+          ? `⚠ ${label} Full access enabled — ordinary ${id} turns bypass ordinary permission prompts and checks. ${label} starts a fresh session; Parley requests isolated read-only invocations for protected discussion, review and listener turns.`
+          : was === full
+            ? `🔒 ${label} Full access disabled — ${label} starts a fresh session in ${now} mode.`
+            : `${label} permission mode changed to ${now} — ${label} starts a fresh session so it applies cleanly.`;
+        appendEntry(room, { kind: "system", author: "system", text });
       }
       // Settings show the new permission the moment it is saved, while the live
       // process is still running under the old one. Saying so is not a nicety:

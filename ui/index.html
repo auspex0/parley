@@ -1507,7 +1507,7 @@ function entryEl(e) {
   const label = e.kind === "user"
     ? `You <span style="opacity:.65">→ @${esc(e.target)}${e.meta && e.meta.discussion ? " · 💬 discussion" : ""}${userPair}</span>${askTag}`
     : e.author.charAt(0).toUpperCase() + e.author.slice(1) + lurkTag;
-  const av = e.kind === "user" ? "" : `<span class="avatar">${esc((state.providers[e.author] && state.providers[e.author].avatar) || e.author[0].toUpperCase())}</span>`;
+  const av = e.kind === "user" ? "" : `<span class="avatar">${esc(seatAvatar(e.author))}</span>`;
   div.innerHTML = `<div class="meta">${av}<span class="who">${label}</span><span>${hhmm(e.ts)}${dur}${tok}</span>` +
     `<button class="ask" title="Ask about this message">↪</button>` +
     `<button class="cpy" title="Copy message">📋</button></div>` +
@@ -1951,7 +1951,7 @@ function ensureLive(agent, startedAt, label) {
   const div = document.createElement("div");
   div.className = "msg agent " + agent;
   div.dataset.liveAgent = agent;
-  div.innerHTML = `<div class="meta"><span class="avatar">${esc((state.providers[agent] && state.providers[agent].avatar) || agent[0].toUpperCase())}</span>` +
+  div.innerHTML = `<div class="meta"><span class="avatar">${esc(seatAvatar(agent))}</span>` +
     `<span class="who">${agent.charAt(0).toUpperCase() + agent.slice(1)}</span>` +
     `<span class="live-label">${label || "is thinking"} <span class="elapsed"></span></span></div>` +
     `<div class="quote-slot"></div>` +
@@ -2166,11 +2166,23 @@ setInterval(() => {
 // ------------------------------------------------------------ header / pills / busy
 // Seats are data: colors, avatars and controls all render from the summary's
 // seat list + provider catalog, so any provider pair just works.
+// A seat's look and settings come from its provider, which its id no longer has
+// to match. `seatInfo` carries that per seat; a summary from before it existed
+// (or a seat missing from it) falls back to the provider-keyed catalog, which
+// is correct whenever the id is the provider name.
+function seatMeta(a) {
+  const info = state.summary && state.summary.seatInfo && state.summary.seatInfo[a];
+  return info || (state.providers && state.providers[a]) || {};
+}
+const titleCaseSeat = (a) => String(a).charAt(0).toUpperCase() + String(a).slice(1);
+function seatAvatar(a) {
+  return seatMeta(a).avatar || String(a)[0].toUpperCase();
+}
 function seatColor(a) {
-  return (state.providers[a] && state.providers[a].color) || "#7aa2f7";
+  return (seatMeta(a).color) || "#7aa2f7";
 }
 function seatLabel(a) {
-  return (state.providers[a] && state.providers[a].label) || a;
+  return (seatMeta(a).label) || titleCaseSeat(a);
 }
 function injectSeatStyles() {
   let css = "";
@@ -3265,7 +3277,7 @@ async function refreshRooms() {
     const seats = (typeof r === "string" ? null : r.seats) || [];
     const nonDefault = seats.length && seats.join(",") !== "claude,codex";
     const seatTag = nonDefault
-      ? `<span style="font-size:10px;opacity:.7">${seats.map((s) => (state.providers[s] && state.providers[s].avatar) || s[0].toUpperCase()).join("+")}</span>`
+      ? `<span style="font-size:10px;opacity:.7">${seats.map(seatAvatar).join("+")}</span>`
       : "";
     const b = document.createElement("button");
     b.className = "room-item" + (name === state.room ? " active" : "");
@@ -3893,6 +3905,13 @@ function seatFieldHTML(a, field, p) {
     `<option value="bypassPermissions">full access — bypass ordinary Claude permission checks</option></select>` +
     `<div class="note">An effective mode change starts a fresh Claude session; the transcript keeps the room history.</div>` +
     `<div class="note danger">With Claude Code 2.1.126+, Full access includes protected paths such as .git and can reach outside this project. Explicit policy and OS limits may still apply. Claude recommends an isolated container or VM; using it directly on a trusted host grants host-level access.</div></div>`;
+  if (field === "approvalMode") return `<div class="fld"><label>Approval mode</label><select ${d(a, "approvalMode")}>` +
+    `<option value="auto">room default — Gemini's default in Talk, auto-approve edits in Work</option>` +
+    `<option value="plan">plan — read &amp; propose only, even in work rooms</option>` +
+    `<option value="auto_edit">auto edit — edits auto-approved; other tools still prompt</option>` +
+    `<option value="yolo">full access — auto-approve every tool</option></select>` +
+    `<div class="note">An effective mode change starts a fresh Gemini session; the transcript keeps the room history.</div>` +
+    `<div class="note danger">Full access auto-approves every tool call, including commands and writes outside this project. An isolated container or VM is the recommended place for it.</div></div>`;
   if (field === "sandbox") return `<div class="fld"><label>Sandbox</label><select ${d(a, "sandbox")}>` +
     `<option value="read-only">read-only (default)</option><option value="workspace-write">workspace-write</option>` +
     `<option value="danger-full-access">danger-full-access</option></select>` +
@@ -3985,7 +4004,7 @@ document.addEventListener("click", (e) => {
 });
 function renderSeatCards(s) {
   $("seatCards").innerHTML = s.seats.map((a) => {
-    const p = s.providers[a] || {};
+    const p = (s.seatInfo && s.seatInfo[a]) || s.providers[a] || {};
     const ag = s.agents[a];
     let f = (p.fields || []).map((field) => seatFieldHTML(a, field, p)).join("");
     f += `<div class="fld"><label>Lurk assertiveness (when 👂 is on)</label><select data-seat="${esc(a)}" data-f="lurkStyle">` +
@@ -4055,21 +4074,25 @@ $("mSave").onclick = async () => {
       if (v !== undefined) agents[a][f] = v;
     }
   }
-  if (agents.claude && s.cfg.agents.claude) {
-    const before = effectiveSeatPermission("claude", s.cfg.agents.claude, s.cfg.mode || "talk");
-    const afterCfg = { ...s.cfg.agents.claude, ...agents.claude };
-    const after = effectiveSeatPermission("claude", afterCfg, s.cfg.mode || "talk");
-    if (!isFullAccess(before) && isFullAccess(after)) {
-      const scope = $("s_projdir").value.trim() || "the room workspace";
-      const accepted = confirm(
-        `⚠ Give Claude Full access in this room?\n\n` +
-        `Claude will bypass its ordinary permission prompts and checks. With Claude Code 2.1.126+, it can modify protected paths such as .git; it can also run commands, use inherited credentials and network access, and change files outside:\n${scope}\n\n` +
-        `Explicit ask/deny rules, managed policy, OS permissions, and Claude's hard safety limits may still restrict actions.\n\n` +
-        `Parley requests separate Plan invocations for protected @both discussions, pair reviews, and lurk turns. They discard Claude's ordinary native session; the next ordinary turn is re-briefed from room history. Ordinary handoffs and pair-worker turns still receive Full access. Trusted external Claude settings or wrappers remain outside this boundary.\n\n` +
-        `Claude will start a fresh session. Claude recommends an isolated container or VM; continuing directly on this trusted host grants host-level access.`
-      );
-      if (!accepted) return;
-    }
+  // Every seat, not the one that happens to be called "claude": a seat can be
+  // named anything, and the warned escalation has to follow the seat actually
+  // being elevated.
+  for (const a of s.seats) {
+    if (!agents[a] || !s.cfg.agents[a]) continue;
+    const roomMode = s.cfg.mode || "talk";
+    const before = effectiveSeatPermission(a, s.cfg.agents[a], roomMode);
+    const after = effectiveSeatPermission(a, { ...s.cfg.agents[a], ...agents[a] }, roomMode);
+    if (isFullAccess(before) || !isFullAccess(after)) continue;
+    const who = seatLabel(a);
+    const scope = $("s_projdir").value.trim() || "the room workspace";
+    const accepted = confirm(
+      `⚠ Give ${who} Full access in this room?\n\n` +
+      `${who} will bypass its ordinary permission prompts and checks. It can modify protected paths such as .git; it can also run commands, use inherited credentials and network access, and change files outside:\n${scope}\n\n` +
+      `Explicit ask/deny rules, managed policy, OS permissions, and the CLI's own hard safety limits may still restrict actions.\n\n` +
+      `Parley requests separate read-only invocations for protected @both discussions, pair reviews, and lurk turns. They discard the seat's ordinary native session; the next ordinary turn is re-briefed from room history. Ordinary handoffs and pair-worker turns still receive Full access. Trusted external CLI settings or wrappers remain outside this boundary.\n\n` +
+      `${who} will start a fresh session. Running an agent with full access directly on a trusted host grants host-level access; an isolated container or VM is the recommended place for it.`
+    );
+    if (!accepted) return;
   }
   // Build the request from what is on screen now, then retire the picker: a
   // dialog that resolves while the save is in flight would otherwise fill the

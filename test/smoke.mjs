@@ -1679,7 +1679,7 @@ async function main() {
     page.includes('setFreeComboOpen(combo, opening, "")'));
   ok("Claude Full access is a warned structured setting",
     page.includes('<option value="bypassPermissions">full access') &&
-    page.includes("Give Claude Full access in this room?") &&
+    page.includes("Give ${who} Full access in this room?") &&
     page.includes("Full access includes protected paths such as .git"));
   const stopChoiceSource = (page.match(/const stopIsChoice = [\s\S]*?;\r?\n/) || [])[0];
   let stopChoice = null;
@@ -6524,8 +6524,93 @@ async function main() {
   d = await room("swapped");
   ok("seat order is preserved", JSON.stringify(d.room.seats) === '["codex","claude"]', JSON.stringify(d.room.seats));
   ok("default agent follows seat 1", d.room.cfg.defaultAgent === "codex");
+  // Two bare provider names are two seats with the same id, which is still
+  // ambiguous — the id is the @mention, the config key and the lane name.
   const dup = await api("POST", "/api/rooms", { name: "dupe", seats: ["claude", "claude"] });
-  ok("same-provider pairs rejected", dup.status === 400);
+  ok("two seats with the same name are rejected", dup.status === 400);
+  // …but two seats of the same provider, named apart, are a real room now.
+  const twins = await api("POST", "/api/rooms", {
+    name: "twins", seats: [{ id: "alpha", provider: "claude" }, { id: "beta", provider: "claude" }],
+  });
+  ok("two seats can share a provider when their names differ", twins.status === 200,
+    JSON.stringify(twins.data));
+  const twinRoom = await room("twins");
+  ok("…and each is its own seat, driven by the same provider",
+    JSON.stringify(twinRoom.room.seats) === JSON.stringify(["alpha", "beta"]) &&
+    twinRoom.room.cfg.agents.alpha.provider === "claude" &&
+    twinRoom.room.cfg.agents.beta.provider === "claude",
+    JSON.stringify(twinRoom.room.cfg.agents));
+  ok("…with the provider's own look and settings resolved per seat",
+    twinRoom.room.seatInfo.alpha.provider === "claude" &&
+    twinRoom.room.seatInfo.alpha.label === "Claude" &&
+    twinRoom.room.seatInfo.beta.avatar === "C",
+    JSON.stringify(twinRoom.room.seatInfo));
+  ok("a seat name that would collide with routing or Parley's own voices is refused",
+    (await api("POST", "/api/rooms", { name: "bad1", seats: [{ id: "both", provider: "claude" }, "codex"] })).status === 400 &&
+    (await api("POST", "/api/rooms", { name: "bad2", seats: [{ id: "system", provider: "claude" }, "codex"] })).status === 400 &&
+    (await api("POST", "/api/rooms", { name: "bad3", seats: [{ id: "has space", provider: "claude" }, "codex"] })).status === 400);
+  // Case is normalised rather than refused: @Alpha and @alpha are one seat.
+  const cased = await api("POST", "/api/rooms", { name: "cased", seats: [{ id: "Alpha", provider: "claude" }, "codex"] });
+  ok("a seat name is lowercased rather than rejected",
+    cased.status === 200 && (await room("cased")).room.seats.includes("alpha"),
+    JSON.stringify(cased.data));
+  ok("an unknown provider is refused rather than silently defaulted",
+    (await api("POST", "/api/rooms", { name: "bad4", seats: [{ id: "x", provider: "nosuch" }, "codex"] })).status === 400);
+  // Routing, sessions and receipts all key on the seat id, so two seats of one
+  // provider must stay completely independent.
+  await cfg("twins", { agents: { alpha: { command: FAKE }, beta: { command: FAKE } } });
+  await say("twins", "@alpha SAY:FROM_ALPHA");
+  await idle("twins");
+  await say("twins", "@beta SAY:FROM_BETA");
+  const twinD = await idle("twins");
+  ok("…each seat answers only when it is the one addressed",
+    (twinD.entries.find((e) => e.text === "FROM_ALPHA") || {}).author === "alpha" &&
+    (twinD.entries.find((e) => e.text === "FROM_BETA") || {}).author === "beta",
+    JSON.stringify(twinD.entries.filter((e) => e.kind === "agent").map((e) => [e.author, e.text])));
+  const twinState = JSON.parse(fs.readFileSync(path.join(ROOT, "twins", "state.json"), "utf8"));
+  ok("…and they hold separate sessions",
+    !!twinState.agents.alpha.sessionRef && !!twinState.agents.beta.sessionRef &&
+    twinState.agents.alpha.sessionRef !== twinState.agents.beta.sessionRef,
+    JSON.stringify([twinState.agents.alpha.sessionRef, twinState.agents.beta.sessionRef]));
+
+  // Migration: a room written before seats and providers were separate must
+  // gain one field and rename nothing — its sessions, cursors and receipts are
+  // all keyed by seat id, so a rename would orphan every one of them.
+  const legacyDir = path.join(ROOT, "legacyseats");
+  fs.mkdirSync(legacyDir, { recursive: true });
+  fs.writeFileSync(path.join(legacyDir, "room.json"), JSON.stringify({
+    defaultAgent: "claude", mode: "talk", hopBudget: -1, pairRounds: 0,
+    projectDir: null, roomNote: null, timeoutMs: 900000,
+    agents: { claude: { command: FAKE, permissionMode: "auto" }, codex: { command: FAKE, sandbox: "read-only" } },
+  }, null, 2), "utf8");
+  fs.writeFileSync(path.join(legacyDir, "state.json"), JSON.stringify({
+    nextTurn: 3, lastAddressed: "claude",
+    agents: {
+      claude: { sessionRef: "legacy-session-abc", cursor: 2, asleep: null, permissionScope: "default" },
+      codex: { sessionRef: "legacy-thread-xyz", cursor: 2, asleep: null },
+    },
+  }, null, 2), "utf8");
+  // Real history to match, or the cursor clamp correctly rewinds a cursor that
+  // points past the end of the log.
+  fs.writeFileSync(path.join(legacyDir, "events.jsonl"),
+    [{ n: 1, kind: "user", author: "user", target: "claude", ts: "2026-08-05T01:00:00", text: "hello" },
+      { n: 2, kind: "agent", author: "claude", ts: "2026-08-05T01:00:05", text: "hi" }]
+      .map((e) => JSON.stringify(e)).join("\n") + "\n", "utf8");
+  const migrated = await room("legacyseats");
+  ok("a pre-decoupling room gains an explicit provider per seat",
+    migrated.room.cfg.agents.claude.provider === "claude" &&
+    migrated.room.cfg.agents.codex.provider === "codex",
+    JSON.stringify(migrated.room.cfg.agents));
+  const legacySeatState = JSON.parse(fs.readFileSync(path.join(legacyDir, "state.json"), "utf8"));
+  ok("…while its seat ids, sessions and cursors are untouched",
+    JSON.stringify(migrated.room.seats) === JSON.stringify(["claude", "codex"]) &&
+    legacySeatState.agents.claude.sessionRef === "legacy-session-abc" &&
+    legacySeatState.agents.codex.sessionRef === "legacy-thread-xyz" &&
+    legacySeatState.agents.codex.cursor === 2 && migrated.room.nextTurn !== 0,
+    JSON.stringify(legacySeatState.agents));
+  const migratedOnDisk = JSON.parse(fs.readFileSync(path.join(legacyDir, "room.json"), "utf8"));
+  ok("…and the migration is written once, not re-derived on every load",
+    migratedOnDisk.agents.claude.provider === "claude", JSON.stringify(migratedOnDisk.agents.claude));
 
   await useFakes("swapped");
   await cfg("swapped", { roomNote: "The room codeword is TANGERINE." });
