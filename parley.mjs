@@ -63,6 +63,11 @@ const CLAUDE_NATIVE_IMAGE_BYTES = MAX_IMAGE_TOTAL_BYTES;
 const CLAUDE_STDIN_SAFE_BYTES = 9_500_000;
 const MAX_MESSAGE_TEXT = 200_000;
 const MAX_MESSAGE_BODY_BYTES = 18 * 1024 * 1024;
+// Line assembly for CLI stdout. stdout itself is capped below, but the
+// accumulator waiting for a newline was not: a CLI emitting a huge newline-free
+// run (one giant stream-json event, or binary) grew it until the heap died,
+// which is an abort rather than a catchable error.
+const MAX_CLI_LINE_BYTES = 20_000_000;
 
 // ---------------------------------------------------------------- CLI args
 
@@ -101,6 +106,13 @@ const NO_OPEN = argv.includes("--no-open");
 // boundary against another process running as the same user: GET / is public.
 // The token lives in memory, so restarting the server invalidates it.
 const SESSION_TOKEN = crypto.randomBytes(24).toString("base64url");
+
+// Hash both sides so the comparison is over fixed-length buffers regardless of
+// what a caller sent, then compare without leaking position through timing.
+function sameSecret(given, expected) {
+  const h = (v) => crypto.createHash("sha256").update(String(v || ""), "utf8").digest();
+  return crypto.timingSafeEqual(h(given), h(expected));
+}
 
 // ---------------------------------------------------------------- constants
 
@@ -301,8 +313,23 @@ function readJSON(file) {
   // tolerate a UTF-8 BOM — hand-edited configs often have one on Windows
   return JSON.parse(fs.readFileSync(file, "utf8").replace(/^﻿/, ""));
 }
+// A torn write is the difference between a room that reopens and a room that
+// answers 500 forever: state.json is rewritten on every entry, so the
+// truncate-then-fill window recurs dozens of times per turn. Fill a sibling
+// file and rename over the target instead — the rename is atomic on the same
+// volume, the property the conversation archive already depends on.
 function writeJSON(file, obj) {
-  fs.writeFileSync(file, JSON.stringify(obj, null, 2) + "\n", "utf8");
+  const data = JSON.stringify(obj, null, 2) + "\n";
+  const tmp = `${file}.tmp`;
+  try {
+    fs.writeFileSync(tmp, data, "utf8");
+    fs.renameSync(tmp, file);
+  } catch {
+    // A briefly locked sibling (antivirus, backup software) must not cost the
+    // save itself. Fall back to writing in place: no worse than before.
+    try { fs.rmSync(tmp, { force: true }); } catch { /* best effort */ }
+    fs.writeFileSync(file, data, "utf8");
+  }
 }
 function deepMerge(base, extra) {
   if (extra === undefined) return base; // absent field: keep
@@ -311,7 +338,14 @@ function deepMerge(base, extra) {
   if (Array.isArray(base) || Array.isArray(extra)) return extra;
   if (typeof base === "object" && typeof extra === "object") {
     const out = { ...base };
-    for (const k of Object.keys(extra)) out[k] = k in base ? deepMerge(base[k], extra[k]) : extra[k];
+    for (const k of Object.keys(extra)) {
+      // JSON.parse makes "__proto__" an own property, but assigning it here
+      // would run the prototype setter instead of storing a key — a hand-edited
+      // room.json could hand the config object a prototype full of phantom
+      // inherited settings that survive no round-trip.
+      if (k === "__proto__" || k === "constructor" || k === "prototype") continue;
+      out[k] = k in base ? deepMerge(base[k], extra[k]) : extra[k];
+    }
     return out;
   }
   return extra;
@@ -627,7 +661,7 @@ function runCli(spec, args, { cwd, timeoutMs, input, onLine, room, agent }) {
       if (run.stopRequested) { child.rtStopped = true; killTree(child); }
     }
 
-    let stdout = "", stderr = "", buf = "", timedOut = false, spawnErr = null;
+    let stdout = "", stderr = "", buf = "", bufOverflow = false, timedOut = false, spawnErr = null;
     const timer = setTimeout(() => { timedOut = true; killTree(child); }, timeoutMs || 300000);
 
     child.on("error", (e) => { spawnErr = e; });
@@ -638,15 +672,19 @@ function runCli(spec, args, { cwd, timeoutMs, input, onLine, room, agent }) {
       let i;
       while ((i = buf.indexOf("\n")) >= 0) {
         const line = buf.slice(0, i); buf = buf.slice(i + 1);
+        // The tail of a line we already gave up on: resynchronise here rather
+        // than handing a consumer half a JSON object.
+        if (bufOverflow) { bufOverflow = false; continue; }
         if (onLine) { try { onLine(line.trim()); } catch { /* tolerate bad line */ } }
       }
+      if (buf.length > MAX_CLI_LINE_BYTES) { buf = ""; bufOverflow = true; }
     });
     child.stderr.on("data", (d) => { if (stderr.length < 2_000_000) stderr += d.toString("utf8"); });
     child.on("close", (code) => {
       clearTimeout(timer);
       if (room && agent && room.procs.get(agent) === child) room.procs.delete(agent);
       if (run && run.child === child) run.child = null;
-      if (buf.trim() && onLine) { try { onLine(buf.trim()); } catch { /* ignore */ } }
+      if (!bufOverflow && buf.trim() && onLine) { try { onLine(buf.trim()); } catch { /* ignore */ } }
       resolve({
         code: spawnErr ? -1 : code,
         stdout, stderr: spawnErr ? String(spawnErr.message) : stderr,
@@ -655,6 +693,12 @@ function runCli(spec, args, { cwd, timeoutMs, input, onLine, room, agent }) {
         spawnError: !!spawnErr,
       });
     });
+    // A prompt too large for the OS pipe buffer stays pending in libuv. If the
+    // child exits first — a logged-out CLI, a rejected flag, or the Stop above
+    // killing it — the failed write surfaces asynchronously as a stream 'error',
+    // and an unhandled one is a fatal uncaught exception, not a rejected write.
+    // The try/catch only ever covered the synchronous case.
+    child.stdin.on("error", () => { /* child gone; 'close' reports the outcome */ });
     try { child.stdin.write(input || ""); child.stdin.end(); } catch { /* proc died early */ }
   });
 }
@@ -1241,7 +1285,8 @@ function cleanRoomName(name) {
 // how a deleted room could otherwise resurrect itself.
 function loadRoom(name, seatChoice, create = false) {
   if (rooms.has(name)) return rooms.get(name);
-  if (!validRoomName(name)) throw new Error(`invalid room name: ${name}`);
+  // Client input, not a server fault — report it like the 404 two lines below.
+  if (!validRoomName(name)) throw Object.assign(new Error(`invalid room name: ${name}`), { status: 400 });
   const dir = path.join(ROOT, name);
   if (!create && !fs.existsSync(dir)) {
     throw Object.assign(new Error(`no such room: ${name}`), { status: 404 });
@@ -1289,8 +1334,21 @@ function loadRoom(name, seatChoice, create = false) {
   let state;
   let rawState = null;
   if (fs.existsSync(stateFile)) {
-    rawState = readJSON(stateFile);
-    state = deepMerge(defaultState(seats), rawState);
+    try {
+      rawState = readJSON(stateFile);
+      state = deepMerge(defaultState(seats), rawState);
+    } catch {
+      // Runtime state is reconstructible — events.jsonl is the authoritative
+      // record and is append-only, so it survives whatever truncated this file.
+      // Refusing to load would strand the whole room (and, for the default
+      // room, the whole process) behind a file the user cannot see. Keep the
+      // damaged copy for inspection and carry on from defaults.
+      try { fs.renameSync(stateFile, `${stateFile}.corrupt`); } catch { /* best effort */ }
+      rawState = null;
+      state = defaultState(seats);
+      console.error(`parley: ${name}/state.json was unreadable; kept it as state.json.corrupt and reset runtime state (the transcript is intact).`);
+      writeJSON(stateFile, state);
+    }
   }
   else { state = defaultState(seats); writeJSON(stateFile, state); }
 
@@ -1378,6 +1436,30 @@ function loadRoom(name, seatChoice, create = false) {
       } catch { /* skip corrupt line */ }
     }
   }
+
+  // appendEntry hands out `n` and only then persists the counter, so a crash in
+  // that window — or a state.json restored from backup, or the reset above —
+  // comes back with a counter that reissues turn numbers already on disk.
+  // Everything keyed on `n` (cursors, receipts, reply chains, cancelled
+  // deliveries, and every entries.find) assumes they are unique and ascending,
+  // so reconcile against the log, which is the record that cannot lose writes.
+  let counterMigrated = false;
+  const maxEntryN = entries.reduce((m, e) => (Number.isSafeInteger(e.n) && e.n > m ? e.n : m), 0);
+  if (!Number.isSafeInteger(state.nextTurn) || state.nextTurn <= maxEntryN) {
+    state.nextTurn = maxEntryN + 1;
+    counterMigrated = true;
+  }
+  // A cursor past the end of history would silently swallow the entries a seat
+  // has genuinely not seen yet.
+  for (const id of seats) {
+    const seat = state.agents[id];
+    if (!seat) continue;
+    if (Number.isSafeInteger(seat.cursor) && seat.cursor > maxEntryN) {
+      seat.cursor = maxEntryN;
+      counterMigrated = true;
+    }
+  }
+  if (counterMigrated) writeJSON(stateFile, state);
 
   const room = {
     name, dir, workspace, cfgFile, stateFile, eventsFile, transcriptFile,
@@ -1748,6 +1830,22 @@ function appendReceipt(room, { agent, from, upTo, turn, mode, spoke }) {
   room.receipts.push(rec);
   fs.appendFileSync(room.eventsFile, JSON.stringify(rec) + "\n", "utf8");
   broadcast(room, { type: "receipt", receipt: rec });
+}
+
+// The exchange coordinators run detached: nobody awaits them, so there is
+// nobody to hand a rejection to. Node treats an unhandled one as fatal, which
+// turns a transient disk error during one room's cleanup into the loss of every
+// room's in-flight turn. Catch it, leave a trace the user can actually see, and
+// keep the server up. The chains' own try/finally blocks still unwind state.
+function noteChainFailure(room, label, err) {
+  console.error(`parley: ${label} failed in room ${room && room.name}:`, (err && err.stack) || err);
+  try {
+    appendEntry(room, {
+      kind: "system", author: "system",
+      text: `⚠️ Parley hit an error while finishing this exchange (${label}): ${truncate(String((err && err.message) || err), 200)}\n\nThe transcript above is intact and the room is still usable. If this repeats, check free disk space and whether another program is locking the room folder.`,
+      meta: { chainFailure: { label } },
+    });
+  } catch { /* the append is what failed — the console line is the record */ }
 }
 
 function roomSummary(room) {
@@ -3330,7 +3428,7 @@ async function continuePair(room, requestedCapN = null) {
     } finally {
       finishPairWork(room, active, gen);
     }
-  })();
+  })().catch((e) => noteChainFailure(room, "pair cycle", e));
 }
 
 // Work out how a message will run before running it, so the queue and the
@@ -3794,7 +3892,7 @@ function startRecoveredDelivery(room, userTurn, targets, scope, turnOptions = nu
       broadcast(room, { type: "room", room: roomSummary(room) });
       scheduleCatchUps(room);
     }
-  })();
+  })().catch((e) => noteChainFailure(room, "recovered delivery", e));
   broadcast(room, { type: "room", room: roomSummary(room) });
 }
 
@@ -4012,7 +4110,8 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles, rawRel
     // Read the epoch when the cycle actually starts, not when it was accepted:
     // a queued cycle that survives a "keep queued work" stop runs under the
     // line drawn behind it.
-    const start = () => runPairCycle(room, userTurn, snap, gen, chain);
+    const start = () => runPairCycle(room, userTurn, snap, gen, chain)
+      .catch((e) => noteChainFailure(room, "pair cycle", e));
     if (room.pairActive || allSeats.some((a) => seatOccupied(room, a))) {
       enqueue(room, {
         kind: "cycle", agents: [...allSeats], pairTurn: true, gen,
@@ -4141,7 +4240,7 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles, rawRel
      broadcast(room, { type: "room", room: roomSummary(room) });
      scheduleCatchUps(room);
    }
-  })();
+  })().catch((e) => noteChainFailure(room, "exchange", e));
   // after kickoff, so the summary includes the now-busy agents
   broadcast(room, { type: "room", room: roomSummary(room) });
   return { target: effectiveTarget, explicit: plan.explicit, deferred: [...deferred] };
@@ -4629,7 +4728,10 @@ function maybeRunCatchUp(room, agent) {
       }
       broadcast(room, { type: "room", room: roomSummary(room) });
       scheduleCatchUps(room);
-    });
+    })
+    // The .catch above only guards the turn; this block does its own state
+    // writes, so it needs the same net as the other detached chains.
+    .catch((e) => noteChainFailure(room, "catch-up", e));
 }
 
 // ---- per-seat lanes ----
@@ -5089,7 +5191,8 @@ function handleRetry(room) {
     // can still be carrying "this was withheld from you" for that message.
     clearWithdrawals(room, lu.n, seatIds(room));
     const gen = room.generation;
-    runPairCycle(room, userTurn, pair, gen, newChain(room));
+    runPairCycle(room, userTurn, pair, gen, newChain(room))
+      .catch((e) => noteChainFailure(room, "pair cycle", e));
     return;
   }
   const targets = retryTargets(room);
@@ -5502,7 +5605,7 @@ function authorized(req, url, route) {
     : req.headers["x-parley-runtime-protocol"];
   if (protocol !== RUNTIME_PROTOCOL) return false;
   const given = req.headers["x-parley-token"] || queryToken || "";
-  if (given !== SESSION_TOKEN) return false;
+  if (!sameSecret(given, SESSION_TOKEN)) return false;
   const origin = req.headers.origin;
   if (origin) {
     const actualPort = server.address() && server.address().port;
@@ -5682,7 +5785,15 @@ const server = http.createServer(async (req, res) => {
       };
       if (fileAttachment(ref)) headers["Content-Disposition"] = attachmentDisposition(ref.name);
       res.writeHead(200, headers);
-      return fs.createReadStream(file).pipe(res);
+      // pipe() does not forward read errors, and an unhandled stream 'error' is
+      // fatal to the process. The existsSync above cannot cover the file going
+      // away between the check and the open, nor a mid-stream read failure
+      // (antivirus locking a freshly written attachment is the common one). The
+      // headers are already sent, so all that is left is to end the response.
+      const body = fs.createReadStream(file);
+      body.on("error", () => { res.destroy(); });
+      res.on("close", () => body.destroy());
+      return body.pipe(res);
     }
 
     if (route === "GET /api/events") {
@@ -6081,12 +6192,35 @@ function openBrowser(u) {
   launched.catch(() => { /* user can open manually */ });
 }
 
+function killAllChildren() {
+  for (const room of rooms.values()) {
+    for (const [, child] of room.procs) { try { killTree(child); } catch { /* best effort */ } }
+  }
+}
+
 function shutdown() {
-  for (const room of rooms.values()) for (const [, child] of room.procs) killTree(child);
+  killAllChildren();
   process.exit(0);
 }
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
+// Cleanup used to run only for a polite Ctrl+C. Every other way out — a fatal
+// error, a closed console window — left the agent CLIs running unsupervised,
+// still spending the user's subscription quota and, in a work room, still
+// writing into the linked project with nobody able to stop them. killTree is
+// synchronous on both platforms, so it is safe from here.
+process.on("exit", killAllChildren);
+
+// Last line of defence. The detached exchange chains each carry their own
+// catch, so anything arriving here is genuinely unexpected — and the server is
+// far more useful alive (rooms reachable, transcripts intact, agents killable)
+// than dead. Node's default would take down every room over one bad stream.
+process.on("unhandledRejection", (reason) => {
+  console.error("parley: unhandled rejection —", (reason && reason.stack) || reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("parley: uncaught exception —", (err && err.stack) || err);
+});
 
 let port = PORT_WANTED;
 function listen(attempt = 0) {
