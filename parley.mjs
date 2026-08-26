@@ -51,7 +51,11 @@ const UI_HTML = fs.readFileSync(UI_FILE, "utf8");
 //    Finally, the queue can be deliberately held: summaries and the queue event
 //    carry `queuePaused`, and a discarded message carries its own per-seat
 //    Retry. A cached older page would render held work as ordinary waiting on a
-//    seat that is visibly idle, with no control to release it.
+//    seat that is visibly idle, with no control to release it. Finally, a user
+//    entry may carry `meta.askFrom`, whose quote header is the only thing
+//    separating an auto-composed "Continue responding to this message" bubble
+//    from something the user typed, and queue rows carry `head` — the one place
+//    lane order is not arrival order.
 const RUNTIME_PROTOCOL = "10";
 const IS_WIN = process.platform === "win32";
 
@@ -2316,7 +2320,7 @@ function notePrefix(room) {
 // delta at its real position. Said for a single held message too — staleness
 // comes from the elapsed gap, not the count, and sleep here is quota-shaped, so
 // it is measured in hours.
-function buildPrompt(room, deltaLines, userTurn, attachmentContext = null, heldCount = 0) {
+function buildPrompt(room, deltaLines, userTurn, attachmentContext = null, heldCount = 0, askBlock = "") {
   const head = notePrefix(room);
   const many = heldCount > 1;
   const held = heldCount >= 1
@@ -2327,8 +2331,39 @@ function buildPrompt(room, deltaLines, userTurn, attachmentContext = null, heldC
     : "";
   const current = relayMessage("user (to you)", userTurn.text,
     attachmentPromptLines(room, [userTurn], attachmentContext));
-  if (!deltaLines.length) return `${head}${held}${current}`;
-  return `${head}[Room activity since your last turn]\n${deltaLines.join("\n")}\n[End of room activity]\n\n${held}${current}`;
+  // The ask block sits after the delta and before the current message: every
+  // downstream framing assumption — including the fake CLI's — is that the last
+  // relay label in the prompt is the live instruction.
+  if (!deltaLines.length) return `${head}${held}${askBlock}${current}`;
+  return `${head}[Room activity since your last turn]\n${deltaLines.join("\n")}\n[End of room activity]\n\n${held}${askBlock}${current}`;
+}
+
+// The message a Redirect is about, restaged into that turn's prompt. The agent
+// may have it far back in context or, after a session reset, not at all — and
+// the instruction ("Continue responding to this message") is meaningless without
+// it. Framed through relayMessage like every other participant's words, so a
+// body containing `user (to you):` cannot manufacture user authority, and
+// deliberately NOT labelled "(to you)" so the notion of "the current
+// instruction" stays the actual current message.
+function askSourceBlock(room, agent, source, attachmentContext, inDelta) {
+  if (!source) return "";
+  // Withdrawal is a standing promise: Parley stops putting a withheld message in
+  // front of that seat, "not in that turn's prompt, not in any later one". A
+  // redirect must not be the loophole. The seat still sees the instruction and
+  // the reference; it just gets no body and no attachments.
+  if (withdrawnFrom(room, agent, source)) {
+    return `[The user is redirecting you to message #${source.n}, whose contents were withheld from you.]\n\n`;
+  }
+  // Already in this turn's delta: point at it instead of printing a second copy.
+  if (inDelta) {
+    return `[The user is asking you about message #${source.n} from ` +
+      `${source.kind === "user" ? "the user" : source.author}, shown above in the room activity.]\n\n`;
+  }
+  const label = source.kind === "user" ? `user (quoted message #${source.n})`
+    : `${source.author} (quoted message #${source.n})`;
+  return `[The user is asking you about this earlier message]\n` +
+    `${relayMessage(label, source.text, attachmentPromptLines(room, [source], attachmentContext))}\n` +
+    `[End quoted message]\n\n`;
 }
 
 // @both in a work room is a table discussion: reads allowed, mutations not.
@@ -2473,11 +2508,25 @@ async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) 
     // The current root wins the native-input budget. Older unseen attachments
     // follow newest-first. Canonical files never enter the provider sandbox;
     // only this invocation's disposable copies do.
+    // Derived from the entry, never passed in as an option: Retry and Wake &
+    // deliver both re-launch the stored user entry, and a redirect that lost its
+    // quoted source on retry would become an instruction with no referent.
+    // Restaging is prompt-only — the seat's cursor is a high-water mark and
+    // rewinding it to reach an old source would re-send context the seat already
+    // heard on every later turn.
+    const askFrom = userTurn.meta && userTurn.meta.askFrom;
+    const askSource = askFrom && Number.isSafeInteger(Number(askFrom.sourceN))
+      ? room.entries.find((e) => e.n === Number(askFrom.sourceN)) || null : null;
     providerInputs = stageProviderInputs(room, agent,
-      [userTurn, ...unseen.slice().reverse()], nativeImageBudget(agent));
+      [userTurn, ...(askSource ? [askSource] : []), ...unseen.slice().reverse()],
+      nativeImageBudget(agent));
     const delta = buildDelta(room, agent, userTurn.n, unseen, providerInputs);
     const images = providerInputs.images;
-    const basePrompt = buildPrompt(room, delta, userTurn, providerInputs, opts.heldCount || 0);
+    const askBlock = askSource
+      ? askSourceBlock(room, agent, askSource, providerInputs,
+        unseen.some((e) => e.n === askSource.n))
+      : "";
+    const basePrompt = buildPrompt(room, delta, userTurn, providerInputs, opts.heldCount || 0, askBlock);
     // Scope, prompt note and Claude isolation are all derived together, per
     // attempt: the recovery retry below launches a second process that may
     // start under a mode the first one never saw.
@@ -3623,6 +3672,16 @@ async function continuePair(room, requestedCapN = null) {
 // Work out how a message will run before running it, so the queue and the
 // handler always agree about which seats it actually needs. A pair cycle
 // needs both; an explicitly tagged aside needs only the seat it names.
+// Ask again is Redirect with a default instruction, not a third code path. A
+// literally empty user bubble would leave the chronological cause unauditable,
+// so the default text is real text: it is what appendEntry writes to
+// transcript.md, what buildDelta relays, and what the agent is actually told.
+const ASK_AGAIN_TEXT = "Continue responding to this message.";
+// "now"   — the seat looked idle; dispatch, or fall to the ordinary tail
+// "queue" — identical to sending an ordinary message
+// "stop"  — the only producer of head-of-lane placement in the whole system
+const ASK_MODES = new Set(["now", "queue", "stop"]);
+
 function planMessage(room, raw, targetSel) {
   const pairCmd = parsePair(raw);
   if (pairCmd && pairCmd.action === "end") {
@@ -4103,6 +4162,136 @@ function startRecoveredDelivery(room, userTurn, targets, scope, turnOptions = nu
 // Synchronous validation + kickoff; agent turns continue in the background
 // and surface over SSE. Throws (with .status) on invalid input so the HTTP
 // route can report it.
+// The dispatch tail every accepted ordinary user turn runs: one coordinator, one
+// delivery per addressed seat, then the causal scheduler and the lurk pass.
+// Shared by handleUserMessage and handleAsk so the two can never drift into
+// different conversation contracts — the same reason planMessage is shared.
+// `head` is the single head-of-lane producer in the system; see enqueueAhead.
+function launchUserDispatch(room, userTurn, {
+  agents, deferred, listeners, scope, relayPolicy, head = false,
+}) {
+  // One id per accepted dispatch, not per message. The queue view groups rows by
+  // it and hangs the ✕ off it.
+  const queueGroupId = `d${room.dispatchSeq++}`;
+  // One chain object per dispatch, shared by its runs and its queued items, so a
+  // scoped Stop can end exactly this exchange.
+  const chain = newChain(room);
+  const dispatch = { queueGroupId, chain };
+  const gen = room.generation;
+  // An exchange is in flight from here until the chain closes, including the
+  // gaps between its turns where no seat is busy. A hop launches a new process
+  // in one of those gaps, so anything that must not change underneath a single
+  // exchange — the project folder — asks about this, not about `busy`.
+  room.exchanges++;
+  const hopRun = {
+    id: queueGroupId, rootN: userTurn.n, used: relayUsed(room, userTurn.n),
+    budget: relayPolicy.hopBudget, phase: "running",
+  };
+  room.hopRuns.set(queueGroupId, hopRun);
+  (async () => {
+   try {
+    // One entry, one coordinator, one delivery per addressed seat. A free seat
+    // starts now; an occupied one starts the moment its lane reaches it. Both
+    // kinds are awaited here, so the hop and lurk chain below still runs
+    // exactly once, after every addressed seat has had its say — or failed, or
+    // been stopped.
+    const results = await Promise.allSettled(agents.map((a) => {
+      if (deferred.has(a)) return deferDelivery(room, a, userTurn, scope, dispatch, { head });
+      chain.delivered++;
+      return runAgentTurn(room, a, userTurn, scope, { queueGroupId, chain });
+    }));
+    if (gen !== room.generation) return;
+    await withRootRelay(room, userTurn.n, async () => {
+    if (gen !== room.generation) return;
+    // Every delivery this message owed was cancelled before it ran, so there is
+    // no exchange to continue: no hops, and no lurk check either — a lurker
+    // chiming in about a message the user cancelled is the whole bug. A split
+    // @both whose other half already ran keeps its chain.
+    if (chain.cancelled && !chain.delivered) {
+      for (const a of listeners) noteLurkOutcome(room, a, userTurn.n, "cancelled");
+      return;
+    }
+    if (chainHalted(room, chain)) {
+      for (const a of listeners) noteLurkOutcome(room, a, userTurn.n, "stopped");
+      return;
+    }
+    const localInitialReplies = results
+      .filter((r) => r.status === "fulfilled" && isEntryResult(r.value))
+      .map((r) => r.value)
+      .sort((a, b) => a.n - b.n);
+    // A same-root Retry/Wake may have produced the missing @both half while
+    // this coordinator was still awaiting its original provider. Reconcile
+    // exact direct-root entries at the serialized boundary; never infer a
+    // successful half from a high cursor or unrelated later traffic.
+    const initialReplies = userTurn.target === "both"
+      ? directRootReplies(room, userTurn) : localInitialReplies;
+    const successfulInitialAuthors = new Set(initialReplies.map((entry) => entry.author));
+    const coordinator = createCausalCoordinator(room, {
+      userTurn, scope, chain, gen, relayPolicy, hopRun,
+      invoked: new Set(agents),
+    });
+    coordinator.enqueueInitial(initialReplies, successfulInitialAuthors);
+    await coordinator.settle();
+    if (gen !== room.generation) return;
+    if (chainHalted(room, chain)) {
+      // A listener already invoked by causal routing has handled this root;
+      // don't also persist a contradictory "lurk stopped" outcome for it.
+      for (const a of listeners) {
+        if (!coordinator.invoked.has(a)) noteLurkOutcome(room, a, userTurn.n, "stopped");
+      }
+      return;
+    }
+
+    const lurkers = listeners.filter((a) => !coordinator.invoked.has(a)).filter((a) => {
+      // Asked before busy: a sleeping seat is not busy, and the busy path's
+      // "the delta catches it up later" is exactly what does not hold here.
+      if (isAsleep(room, a)) {
+        noteSleepSkip(room, a, "lurk", { sourceN: userTurn.n });
+        return false;
+      }
+      if (!room.cfg.agents[a].lurk) {
+        noteLurkOutcome(room, a, userTurn.n, "disabled");
+        return false;
+      }
+      if (seatOccupied(room, a)) {
+        const throughN = room.entries.length ? room.entries[room.entries.length - 1].n : userTurn.n;
+        queueLurkCatchUp(room, a, userTurn.n, throughN);
+        return false;
+      }
+      return true;
+    });
+    const chimeResults = lurkers.length
+      ? await Promise.allSettled(lurkers.map((a) => runListenerTurn(room, a, userTurn.n, scope, {
+        chain,
+        onTerminal: (reason, range) => persistLurkOutcome(room, a, range, reason),
+      })))
+      : [];
+    if (gen !== room.generation || chainHalted(room, chain)) return;
+
+    const chimes = chimeResults
+      .filter((r) => r.status === "fulfilled" && isEntryResult(r.value))
+      .map((r) => r.value);
+    if (chimes.length) {
+      coordinator.enqueueLurks(chimes);
+      await coordinator.settle();
+      if (gen !== room.generation) return;
+    }
+
+    coordinator.finishCaps();
+    drainLanes(room); // messages the user queued while the table was busy
+    });
+   } finally {
+     room.exchanges = Math.max(0, room.exchanges - 1);
+     room.hopRuns.delete(queueGroupId);
+     broadcast(room, { type: "room", room: roomSummary(room) });
+     scheduleCatchUps(room);
+   }
+  })().catch((e) => noteChainFailure(room, "exchange", e));
+  // after kickoff, so the summary includes the now-busy agents
+  broadcast(room, { type: "room", room: roomSummary(room) });
+  return { queueGroupId, deferred: [...deferred] };
+}
+
 function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles, rawRelay = {}) {
   const raw0 = String(rawText || "").trim();
   if (raw0.length > MAX_MESSAGE_TEXT) {
@@ -4297,18 +4486,17 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles, rawRel
     return { target: effectiveTarget, explicit: plan.explicit, held: sleeping };
   }
   const scope = makeScope(room, userTurn.n, effectiveTarget, discussion);
-  // One id per accepted dispatch, not per message: a message that produces a
-  // second batch later gets a second id, so cancelling one never reaches the
-  // other. The queue view groups rows by it and hangs the ✕ off it.
-  const queueGroupId = `d${room.dispatchSeq++}`;
-  // One chain object per dispatch, shared by its runs and its queued items, so
-  // a scoped Stop can end exactly this exchange. `delivered`/`cancelled` count
-  // what the dispatch actually got to do, which is how a cancelled queue entry
-  // ends its own chain without ending one a sibling seat is already running.
-  const chain = newChain(room);
-  const dispatch = { queueGroupId, chain };
 
   if (asPairTurn) {
+    // One id per accepted dispatch, not per message: a message that produces a
+    // second batch later gets a second id, so cancelling one never reaches the
+    // other. The queue view groups rows by it and hangs the ✕ off it.
+    const queueGroupId = `d${room.dispatchSeq++}`;
+    // One chain object per dispatch, shared by its runs and its queued items, so
+    // a scoped Stop can end exactly this exchange. `delivered`/`cancelled` count
+    // what the dispatch actually got to do, which is how a cancelled queue entry
+    // ends its own chain without ending one a sibling seat is already running.
+    const chain = newChain(room);
     const gen = room.generation;
     // The roles and round cap are snapshotted here, at acceptance, so a queued
     // cycle runs the pairing the user actually asked for even if /pair start
@@ -4338,119 +4526,10 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles, rawRel
     return { target: effectiveTarget, explicit: plan.explicit };
   }
 
-  const gen = room.generation;
-  // An exchange is in flight from here until the chain closes, including the
-  // gaps between its turns where no seat is busy. A hop launches a new process
-  // in one of those gaps, so anything that must not change underneath a single
-  // exchange — the project folder — asks about this, not about `busy`.
-  room.exchanges++;
-  const hopRun = {
-    id: queueGroupId, rootN: userTurn.n, used: relayUsed(room, userTurn.n),
-    budget: relayPolicy.hopBudget, phase: "running",
-  };
-  room.hopRuns.set(queueGroupId, hopRun);
-  (async () => {
-   try {
-    // One entry, one coordinator, one delivery per addressed seat. A free seat
-    // starts now; an occupied one starts the moment its lane reaches it. Both
-    // kinds are awaited here, so the hop and lurk chain below still runs
-    // exactly once, after every addressed seat has had its say — or failed, or
-    // been stopped.
-    const results = await Promise.allSettled(agents.map((a) => {
-      if (deferred.has(a)) return deferDelivery(room, a, userTurn, scope, dispatch);
-      chain.delivered++;
-      return runAgentTurn(room, a, userTurn, scope, { queueGroupId, chain });
-    }));
-    if (gen !== room.generation) return;
-    await withRootRelay(room, userTurn.n, async () => {
-    if (gen !== room.generation) return;
-    // Every delivery this message owed was cancelled before it ran, so there is
-    // no exchange to continue: no hops, and no lurk check either — a lurker
-    // chiming in about a message the user cancelled is the whole bug. A split
-    // @both whose other half already ran keeps its chain.
-    if (chain.cancelled && !chain.delivered) {
-      for (const a of listeners) noteLurkOutcome(room, a, userTurn.n, "cancelled");
-      return;
-    }
-    if (chainHalted(room, chain)) {
-      for (const a of listeners) noteLurkOutcome(room, a, userTurn.n, "stopped");
-      return;
-    }
-    const localInitialReplies = results
-      .filter((r) => r.status === "fulfilled" && isEntryResult(r.value))
-      .map((r) => r.value)
-      .sort((a, b) => a.n - b.n);
-    // A same-root Retry/Wake may have produced the missing @both half while
-    // this coordinator was still awaiting its original provider. Reconcile
-    // exact direct-root entries at the serialized boundary; never infer a
-    // successful half from a high cursor or unrelated later traffic.
-    const initialReplies = userTurn.target === "both"
-      ? directRootReplies(room, userTurn) : localInitialReplies;
-    const successfulInitialAuthors = new Set(initialReplies.map((entry) => entry.author));
-    const coordinator = createCausalCoordinator(room, {
-      userTurn, scope, chain, gen, relayPolicy, hopRun,
-      invoked: new Set(agents),
-    });
-    coordinator.enqueueInitial(initialReplies, successfulInitialAuthors);
-    await coordinator.settle();
-    if (gen !== room.generation) return;
-    if (chainHalted(room, chain)) {
-      // A listener already invoked by causal routing has handled this root;
-      // don't also persist a contradictory "lurk stopped" outcome for it.
-      for (const a of listeners) {
-        if (!coordinator.invoked.has(a)) noteLurkOutcome(room, a, userTurn.n, "stopped");
-      }
-      return;
-    }
-
-    const lurkers = listeners.filter((a) => !coordinator.invoked.has(a)).filter((a) => {
-      // Asked before busy: a sleeping seat is not busy, and the busy path's
-      // "the delta catches it up later" is exactly what does not hold here.
-      if (isAsleep(room, a)) {
-        noteSleepSkip(room, a, "lurk", { sourceN: userTurn.n });
-        return false;
-      }
-      if (!room.cfg.agents[a].lurk) {
-        noteLurkOutcome(room, a, userTurn.n, "disabled");
-        return false;
-      }
-      if (seatOccupied(room, a)) {
-        const throughN = room.entries.length ? room.entries[room.entries.length - 1].n : userTurn.n;
-        queueLurkCatchUp(room, a, userTurn.n, throughN);
-        return false;
-      }
-      return true;
-    });
-    const chimeResults = lurkers.length
-      ? await Promise.allSettled(lurkers.map((a) => runListenerTurn(room, a, userTurn.n, scope, {
-        chain,
-        onTerminal: (reason, range) => persistLurkOutcome(room, a, range, reason),
-      })))
-      : [];
-    if (gen !== room.generation || chainHalted(room, chain)) return;
-
-    const chimes = chimeResults
-      .filter((r) => r.status === "fulfilled" && isEntryResult(r.value))
-      .map((r) => r.value);
-    if (chimes.length) {
-      coordinator.enqueueLurks(chimes);
-      await coordinator.settle();
-      if (gen !== room.generation) return;
-    }
-
-    coordinator.finishCaps();
-    drainLanes(room); // messages the user queued while the table was busy
-    });
-   } finally {
-     room.exchanges = Math.max(0, room.exchanges - 1);
-     room.hopRuns.delete(queueGroupId);
-     broadcast(room, { type: "room", room: roomSummary(room) });
-     scheduleCatchUps(room);
-   }
-  })().catch((e) => noteChainFailure(room, "exchange", e));
-  // after kickoff, so the summary includes the now-busy agents
-  broadcast(room, { type: "room", room: roomSummary(room) });
-  return { target: effectiveTarget, explicit: plan.explicit, deferred: [...deferred] };
+  const { deferred: heldFor } = launchUserDispatch(room, userTurn, {
+    agents, deferred, listeners, scope, relayPolicy,
+  });
+  return { target: effectiveTarget, explicit: plan.explicit, deferred: heldFor };
 }
 
 // ---- guaranteed lurk catch-up ----
@@ -4977,6 +5056,8 @@ function queueSnapshot(room) {
       target: item.target || null,
       text: item.snippet || "",
       ts: item.ts || null,
+      // The one place lane order is not arrival order, so the card can say so.
+      head: !!item.head,
     };
   });
 }
@@ -5027,6 +5108,19 @@ function enqueue(room, item) {
   broadcastQueue(room);
 }
 
+// Head-of-lane. `priority` is deliberately not a free parameter: the ONLY caller
+// allowed to reach this is the stop-and-ask variant of handleAsk, which has
+// already stopped the run the user was looking at. Retry is always tail and an
+// idle-seat ask is immediate anyway, so queue reasoning stays honest.
+// Two redirects in a row keep their own arrival order: insert after the last
+// item already marked head, never in front of it.
+function enqueueAhead(room, item) {
+  let at = 0;
+  while (at < room.pending.length && room.pending[at].head) at++;
+  room.pending.splice(at, 0, { seq: room.pendingSeq++, head: true, ...item });
+  broadcastQueue(room);
+}
+
 // Hold one seat's share of an already-appended user turn until that seat frees.
 // The entry is never appended twice; only its delivery is split. Resolves with
 // the reply entry, or null if the turn failed, was stopped or was abandoned —
@@ -5034,13 +5128,16 @@ function enqueue(room, item) {
 function deferDelivery(room, agent, userTurn, scope, dispatch = {}, opts = {}) {
   let settle;
   const done = new Promise((resolve) => { settle = resolve; });
-  enqueue(room, {
+  const item = {
     kind: "delivery", agents: [agent], gen: room.generation,
     stopAt: dispatch.chain ? dispatch.chain.stopAt : room.stopEpoch,
     chain: dispatch.chain || null,
     queueGroupId: dispatch.queueGroupId || null,
     sourceN: userTurn.n, target: userTurn.target || null,
     snippet: entrySnippet(userTurn), ts: userTurn.ts || null,
+    // A stop-and-ask redirect is the user's most immediate intent, so it is the
+    // one dispatch a hold does not apply to — they just asked for it, now.
+    ...(opts.head ? { bypassPause: true } : {}),
     run() {
       // The badge means "the other seat answered this before me", so it belongs
       // to a split @both. A single-seat message simply waiting its turn in its
@@ -5062,7 +5159,8 @@ function deferDelivery(room, agent, userTurn, scope, dispatch = {}, opts = {}) {
     // check, so cancelling a queued message could still make the *other* agent
     // chime in about it. The count is what lets the chain tell the difference.
     abandon() { if (dispatch.chain) dispatch.chain.cancelled++; settle(null); },
-  });
+  };
+  if (opts.head) enqueueAhead(room, item); else enqueue(room, item);
   // Normally the seat's own release drains this. If it is somehow already free,
   // drain anyway — a delivery nobody ever wakes would hang the chain.
   if (!room.busy.has(agent)) setImmediate(() => drainLanes(room));
@@ -5077,16 +5175,26 @@ function drainLanes(room) {
     scheduleCatchUps(room);
     return;
   }
-  // Pause is a hold, not a stop: checked here, before the claim loop, so nothing
-  // is started, dropped, reordered or abandoned while held. The queue the user
-  // sees is byte-for-byte the queue that was there when they pressed ⏸. The two
+  // Pause is a hold, not a stop: checked before the claim loop, so nothing is
+  // started, dropped, reordered or abandoned while held. The queue the user sees
+  // is byte-for-byte the queue that was there when they pressed ⏸. The two
   // things that can make a pending item stale — a generation bump (/new) and a
   // stop-epoch bump (Stop everything) — both empty `pending` themselves, so
   // skipping the drop pass here cannot leak a stale item.
-  if (room.queuePaused) return;
+  // A stop-and-ask redirect is the single exception: the user just asked for
+  // that one, now. It is let through without releasing anything behind it.
+  const held = !!room.queuePaused;
+  if (held && !room.pending.some((p) => p.bypassPause)) return;
   const claimed = new Set([...room.busy.keys()]);
   const still = [], go = [], drop = [];
   for (const item of room.pending) {
+    // While held, everything except that one redirect keeps its exact place —
+    // including its claim on the seat, so nothing behind it can overtake it.
+    if (held && !item.bypassPause) {
+      item.agents.forEach((a) => claimed.add(a));
+      still.push(item);
+      continue;
+    }
     // A delivery belongs to one user turn in one generation; once that turn is
     // gone (reset, stop) there is nothing left to deliver.
     if (item.gen !== room.generation || chainStopped(room, item.stopAt)) {
@@ -5497,6 +5605,140 @@ function handleRetry(room) {
   const scope = makeScope(room, lu.n, lu.target, lu.discussion);
   clearWithdrawals(room, lu.n, targets); // it is being delivered after all
   startRecoveredDelivery(room, userTurn, targets, scope);
+}
+
+// Ask again / Redirect. One primitive, three user-facing modes, and one
+// atomicity guarantee: stopping the visible run and asking again is a single
+// server request pinned to the runId the browser was showing — never a
+// client-side Stop followed by a Send, which leaves a window where the old run
+// finishes and the queue starts the next one before the ask arrives.
+//
+// Why the stop variant is atomic, since it is the crux of the feature:
+//   - Everything from the stop onward is one synchronous block inside one HTTP
+//     handler. Node does not yield inside it, so no drainLanes, no releaseSeat
+//     and no arriving message can interleave.
+//   - handleStop's `active` branch marks the run and killTrees synchronously;
+//     the stopped run's own ⏹ entry and releaseSeat can only run on a later
+//     tick. The seat is therefore still in room.busy when the redirect is
+//     placed, so seatOccupied is true and the redirect goes into the lane
+//     rather than launching. The stopped run's late output is ordered before
+//     the redirect by construction, not by timing.
+//   - run.chain.halted fences the stopped exchange's downstream, so no hop,
+//     sibling attention or lurk chime from it can land after the redirect.
+//   - room.stopEpoch is deliberately NOT bumped. drainLanes abandons every
+//     pending item whose stopAt no longer matches, so a bump would flush the
+//     whole queue and record withdrawals for it — the opposite of "existing
+//     queued work stays behind the redirect" — and would halt every unrelated
+//     chain in the room, including a concurrent exchange the user did not aim at.
+//   - A stale pin degrades, never escalates: handleStop returns
+//     { stale: true } having touched nothing, and the ask proceeds.
+function handleAsk(room, opts = {}) {
+  // ---- 1. validate everything before mutating anything ----
+  // Same discipline as wakeAndDeliver: a refusal must leave the run the user was
+  // looking at provably still running.
+  const mode = String(opts.mode || "now");
+  if (!ASK_MODES.has(mode)) throw Object.assign(new Error(`unknown ask mode: ${mode}`), { status: 400 });
+  const sourceN = Number(opts.sourceN);
+  const source = Number.isSafeInteger(sourceN)
+    ? room.entries.find((e) => e.n === sourceN) : null;
+  if (!source || (source.kind !== "user" && source.kind !== "agent")) {
+    throw Object.assign(new Error("that message can't be asked about"), { status: 400 });
+  }
+  const raw = String(opts.text || "").trim();
+  if (raw.length > MAX_MESSAGE_TEXT) {
+    throw Object.assign(new Error(`message text must be ${MAX_MESSAGE_TEXT.toLocaleString()} characters or shorter`), { status: 413 });
+  }
+  // Slash commands are composer-only. Letting one through here would route a
+  // redirect into parsePair and arm or end pair mode from a message button.
+  if (raw.startsWith("/")) {
+    throw Object.assign(new Error("slash commands go in the composer, not an ask"), { status: 400 });
+  }
+  const text = raw || ASK_AGAIN_TEXT;
+  const prepared = prepareAttachments(opts.images, opts.files);
+  // Routing comes from the button, never from the text. An @tag typed into an
+  // instruction about a quoted message must not re-route away from the seat the
+  // user pointed at, so resolveTarget/planMessage are deliberately not called.
+  const explicit = opts.target !== undefined && opts.target !== null && opts.target !== "";
+  const target = explicit ? String(opts.target).toLowerCase()
+    : source.kind === "agent" ? source.author
+      : (source.target === "both" ? "both" : source.target);
+  if (target !== "both" && !room.cfg.agents[target]) {
+    throw Object.assign(new Error(`unknown target: ${target}`), { status: 400 });
+  }
+  const hasHopOverride = Object.prototype.hasOwnProperty.call(opts, "hopBudget");
+  const solo = opts.solo === true;
+  if (solo && target === "both") {
+    throw Object.assign(new Error("Solo needs one ordinary addressee; it cannot be used with @both or a pair turn"), { status: 400 });
+  }
+  const relayPolicy = {
+    hopBudget: solo ? 0 : (hasHopOverride ? requireMessageHopBudget(opts.hopBudget) : normalizeHopBudget(room.cfg.hopBudget, -1)),
+    source: solo ? "solo" : (hasHopOverride ? "message" : "room"),
+    solo,
+  };
+  const allSeats = seatIds(room);
+  const requested = target === "both" ? [...allSeats] : [target];
+  const sleeping = requested.filter((a) => isAsleep(room, a));
+  const agents = requested.filter((a) => !sleeping.includes(a));
+  // Stopping a run and then holding the ask for a sleeping seat would leave the
+  // user with a killed response and nothing asked. Refuse before the stop.
+  if (mode === "stop" && !agents.length) {
+    throw asleepRefusal(room, sleeping, (them) => `wake ${them} before redirecting to ${them}.`);
+  }
+  const pins = Array.isArray(opts.runs) ? opts.runs : null;
+  if (mode === "stop" && !(pins && pins.length)) {
+    // An unpinned stop would kill whatever happens to be running when the
+    // request lands, which may be a response the user never saw.
+    throw Object.assign(new Error("stop-and-ask must name the responses it meant"), { status: 400 });
+  }
+
+  // ---- 2. the atomic half: stop, then append, then place, in ONE tick ----
+  const stop = mode === "stop" ? handleStop(room, { scope: "active", runs: pins }) : null;
+
+  const listeners = solo || !agents.length ? []
+    : allSeats.filter((a) => !agents.includes(a) && !sleeping.includes(a) && room.cfg.agents[a].lurk);
+  const attachments = persistAttachments(room, prepared);
+  let userTurn;
+  try {
+    userTurn = appendEntry(room, {
+      kind: "user", author: "user", target, text,
+      meta: {
+        audience: { addressed: agents, lurking: listeners, ...(sleeping.length ? { asleep: sleeping } : {}) },
+        relay: relayPolicy,
+        ...(attachments.length ? { attachments } : {}),
+        // The only thing distinguishing this bubble from something the user
+        // typed, and the join key the quote header renders from.
+        askFrom: {
+          sourceN: source.n,
+          kind: raw ? "redirect" : "ask-again",
+          ...(mode === "stop" ? { redirect: true } : {}),
+          ...(stop && stop.stopped ? { stoppedCount: stop.count } : {}),
+        },
+      },
+    });
+  } catch (e) { removeAttachments(room, attachments); throw e; }
+  // Only when the user picked a seat in the dialog. A target derived from the
+  // source message is not a fresh act of addressing someone, and rewriting
+  // lastAddressed would re-route their next untagged composer message.
+  if (explicit) room.state.lastAddressed = target;
+  room.state.lastUser = {
+    n: userTurn.n, text, target, done: {}, pair: false, discussion: false,
+    ...(attachments.length ? { attachments } : {}),
+  };
+  saveState(room);
+  for (const a of sleeping) noteSleepSkip(room, a, "turn", { sourceN: userTurn.n, held: true });
+  if (!agents.length) {
+    broadcast(room, { type: "room", room: roomSummary(room) });
+    return { n: userTurn.n, target, explicit, mode, held: sleeping, deferred: [], stop };
+  }
+  const scope = makeScope(room, userTurn.n, target, false);
+  const deferred = new Set(agents.filter((a) => seatOccupied(room, a)));
+  // Head-of-lane only for the stop variant. "now" on a seat that turned busy
+  // between the click and this request goes to the tail like any other message:
+  // the user chose it because the seat looked idle, not to jump the queue.
+  const { deferred: heldFor } = launchUserDispatch(room, userTurn, {
+    agents, deferred, listeners, scope, relayPolicy, head: mode === "stop",
+  });
+  return { n: userTurn.n, target, explicit, mode, held: sleeping, deferred: heldFor, stop };
 }
 
 // Stop is four different intentions, not one button with a guess attached:
@@ -6161,6 +6403,26 @@ const server = http.createServer(async (req, res) => {
       const room = loadRoom((await readBody(req)).room || "default");
       handleRetry(room); // replies arrive over SSE
       return json(res, 200, { ok: true });
+    }
+
+    if (route === "POST /api/ask") {
+      // Attachments are accepted here as they are on /api/message, so the same
+      // body cap applies.
+      const body = await readBody(req, MAX_MESSAGE_BODY_BYTES);
+      const room = loadRoom(body.room || "default");
+      if (Object.prototype.hasOwnProperty.call(body, "solo") && typeof body.solo !== "boolean") {
+        return json(res, 400, { error: "solo must be true or false" });
+      }
+      // One request, not two. A client-side Stop followed by a Send leaves a
+      // window where the old run finishes and the queue starts the next one.
+      const outcome = handleAsk(room, {
+        sourceN: body.sourceN, text: body.text, target: body.target,
+        mode: body.mode, runs: Array.isArray(body.runs) ? body.runs : null,
+        images: body.images, files: body.files,
+        ...(Object.prototype.hasOwnProperty.call(body, "hopBudget") ? { hopBudget: body.hopBudget } : {}),
+        ...(Object.prototype.hasOwnProperty.call(body, "solo") ? { solo: body.solo } : {}),
+      });
+      return json(res, 200, { ok: true, ...outcome });
     }
 
     if (route === "POST /api/stop") {

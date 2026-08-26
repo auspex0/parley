@@ -45,6 +45,16 @@ Discarding withdraws the *delivery*, not the durable room record: the message wa
 
 This is about what Parley sends, not a secrecy guarantee. The message is still in `transcript.md`, and every agent is told where that file is — a work-mode agent that goes looking can read it, exactly as it can read anything else in the room. Per-seat transcript privacy would be a different feature; if you need a message to be unreadable rather than undelivered, start a fresh conversation.
 
+### Ask again and Redirect ↪
+
+Every message carries a **↪** that asks about *that* message. Pick a seat, optionally type an instruction, and choose what to do with it. With the seat free there is one action, **Ask now**. With it busy there are two that genuinely differ: **Queue after current**, which waits its ordinary turn and leaves everything already queued in place, and **Stop current & ask now**, which ends the response on screen and puts your message next.
+
+Leaving the instruction empty is **Ask again** — the message reads "Continue responding to this message." rather than being blank, so a transcript read months later still shows what happened. Either way the result is a real user message with a **↪ asking about** header pointing at the message it came from; nothing is silently attributed to you that you did not cause.
+
+The quoted message is restaged into that turn's prompt, so the seat can answer even if the message is far back in its context — or gone entirely after a session reset. A message that was discarded for that seat stays discarded: it sees the reference and your instruction, never the withheld body.
+
+**Stop current & ask now is one request, not two.** A Stop click followed by a Send leaves a gap in which the killed response finishes and the queue starts something else. Here the stop is pinned to the response you were actually looking at, and the redirect is placed in the same tick — so the stopped reply's last words are always ordered before your redirect, and the follow-ups it would have triggered are cancelled with it. Work you queued earlier is not flushed; it simply waits behind the redirect, and its card says **↪ next** so the reordering is visible rather than mysterious. If the response finished between your click and the request landing, nothing is killed and your message is next in line.
+
 ### Stop is four intentions, not one button
 
 **Stop** is four separate intentions rather than one button and a guess: stop a named agent's current response, stop the current responses but keep queued work, cancel the queue but let the running responses finish, or stop everything — responses, pair cycle, hops, lurkers and queue. Each click names the response it meant, so a click that lands after that response has already ended does nothing rather than killing the next one, and it never reports an error you would answer by clicking again.

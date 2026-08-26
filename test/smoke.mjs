@@ -1743,8 +1743,14 @@ async function main() {
     page.includes('for (const el of frag.children) el.classList.add("norise")') &&
     page.includes("@media (prefers-reduced-motion: reduce)"));
   ok("both surfaces render the same provenance rather than duplicating state",
-    page.includes("function quoteRefHTML(src)") && page.includes("busyInfoFor(agent)") &&
-    page.includes("entryQuoteHTML(e)"));
+    page.includes('function quoteRefHTML(src, label = "↩ replying to")') &&
+    page.includes("busyInfoFor(agent)") && page.includes("entryQuoteHTML(e)"));
+  // An auto-composed "Continue responding to this message." must be visibly an
+  // ask, not something the user appears to have typed — the quote header and
+  // the badge are the whole of that evidence.
+  ok("an ask bubble is marked as one, and says which message it is about",
+    page.includes('quoteRefHTML(refFromN(e.meta.askFrom.sourceN), "↪ asking about")') &&
+    page.includes("· ↪ redirect") && page.includes("· ↪ ask again"));
   // Agreed explicitly: a finished reply keeps the reference in scrollback.
   ok("a finished reply keeps its quote unconditionally",
     !page.includes("answersPrecedingEntry"));
@@ -5008,6 +5014,74 @@ async function main() {
     JSON.stringify(d.room.cancelledDeliveries));
   ok("retrying the same message twice is refused once nothing is discarded",
     (await api("POST", "/api/queue/retry", { room: "queueretry", n: discardN })).status === 400);
+
+  // Ask again / Redirect. The new turn is a real user entry that says what it is
+  // about, the quoted message is restaged into the prompt so the seat can answer
+  // even after a session reset, and stop-and-ask is one request.
+  await api("POST", "/api/rooms", { name: "askroom" });
+  await useFakes("askroom");
+  await say("askroom", "@claude SAY:ORIGINAL_ANSWER");
+  let askD = await idle("askroom");
+  const askSourceN = askD.entries.find((e) => e.kind === "user").n;
+  const askBad = await api("POST", "/api/ask", { room: "askroom", sourceN: 99999, mode: "now" });
+  ok("asking about a message that isn't there is refused", askBad.status === 400);
+  ok("a slash command cannot ride in through an ask",
+    (await api("POST", "/api/ask", { room: "askroom", sourceN: askSourceN, mode: "now", text: "/pair end" })).status === 400);
+  ok("stop-and-ask must name the runs it meant",
+    (await api("POST", "/api/ask", { room: "askroom", sourceN: askSourceN, mode: "stop" })).status === 400);
+  const askAgain = await api("POST", "/api/ask", { room: "askroom", sourceN: askSourceN, mode: "now", text: "SAWWHAT" });
+  ok("ask again is accepted and reports the turn it created",
+    askAgain.status === 200 && Number.isSafeInteger(askAgain.data.n) && askAgain.data.mode === "now",
+    JSON.stringify(askAgain.data));
+  askD = await idle("askroom");
+  const askEntry = askD.entries.find((e) => e.n === askAgain.data.n);
+  ok("…as a real user entry marked with the message it is about",
+    askEntry && askEntry.kind === "user" && askEntry.meta.askFrom &&
+    askEntry.meta.askFrom.sourceN === askSourceN && askEntry.meta.askFrom.kind === "redirect",
+    JSON.stringify(askEntry && askEntry.meta));
+  const askSaw = askD.entries.filter((e) => e.kind === "agent").pop();
+  ok("…and the quoted message is restaged into that turn's prompt",
+    /quoted message #/.test(askSaw.text) && /ORIGINAL_ANSWER/.test(askSaw.text),
+    (askSaw.text || "").slice(0, 400));
+  // An empty instruction becomes real text, so the transcript never carries an
+  // empty user bubble whose cause cannot be audited.
+  const askEmpty = await api("POST", "/api/ask", { room: "askroom", sourceN: askSourceN, mode: "now" });
+  askD = await idle("askroom");
+  const emptyEntry = askD.entries.find((e) => e.n === askEmpty.data.n);
+  ok("an ask with no instruction gets real text and is marked ask-again",
+    emptyEntry && emptyEntry.text === "Continue responding to this message." &&
+    emptyEntry.meta.askFrom.kind === "ask-again",
+    JSON.stringify(emptyEntry && { text: emptyEntry.text, meta: emptyEntry.meta.askFrom }));
+
+  // Stop-and-ask: one request that ends the visible run and places the redirect
+  // at the head of the lane, ahead of work queued earlier but behind nothing.
+  await api("POST", "/api/rooms", { name: "askstop" });
+  await useFakes("askstop");
+  await say("askstop", "@claude SAY:ASK_ROOT");
+  await idle("askstop");
+  await say("askstop", "@claude SLEEP:2500 SAY:LONG_RUN");
+  const running = await waitRoom("askstop", (d) => (d.room.busyInfo || []).some((b) => b.runId), "claude running");
+  await say("askstop", "@claude SAY:QUEUED_EARLIER");
+  await waitRoom("askstop", (d) => d.room.queued === 1, "one queued behind the run");
+  const pins = (running.room.busyInfo || []).filter((b) => b.runId).map((b) => ({ agent: b.agent, runId: b.runId }));
+  const rootN = (await room("askstop")).entries.find((e) => e.kind === "user").n;
+  const redirect = await api("POST", "/api/ask", {
+    room: "askstop", sourceN: rootN, mode: "stop", runs: pins, text: "SAY:REDIRECTED",
+  });
+  ok("stop-and-ask is accepted as one request", redirect.status === 200 && redirect.data.mode === "stop",
+    JSON.stringify(redirect.data));
+  ok("…and it does not flush the queue behind it",
+    (await room("askstop")).room.queued >= 1, JSON.stringify((await room("askstop")).room.queued));
+  d = await idle("askstop");
+  const stopTexts = texts(d);
+  ok("…the redirect runs before the message queued earlier",
+    stopTexts.includes("REDIRECTED") && stopTexts.includes("QUEUED_EARLIER") &&
+    stopTexts.indexOf("REDIRECTED") < stopTexts.indexOf("QUEUED_EARLIER"),
+    JSON.stringify(stopTexts));
+  ok("…and the response it stopped never finished",
+    !stopTexts.includes("LONG_RUN"), JSON.stringify(stopTexts));
+  ok("…while the work queued earlier still ran, rather than being discarded",
+    stopTexts.includes("QUEUED_EARLIER"));
 
   // The contract behind "Stop everything": one press, and nothing this exchange
   // would still have spawned — the hop the reply earns, the lurk check after it

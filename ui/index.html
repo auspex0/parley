@@ -287,9 +287,9 @@
   /* Readable, not struck through: the text is still the record. */
   .bubble.dimmed { opacity: .62; }
 
-  .meta .cpy { opacity: 0; font-size: 11px; padding: 0 4px; transition: opacity .15s; }
-  .msg:hover .meta .cpy { opacity: .6; }
-  .meta .cpy:hover { opacity: 1 !important; }
+  .meta .cpy, .meta .ask { opacity: 0; font-size: 11px; padding: 0 4px; transition: opacity .15s; }
+  .msg:hover .meta .cpy, .msg:hover .meta .ask { opacity: .6; }
+  .meta .cpy:hover, .meta .ask:hover { opacity: 1 !important; }
   .bubble.collapsed { max-height: 300px; overflow: hidden;
     -webkit-mask-image: linear-gradient(#000 75%, transparent); mask-image: linear-gradient(#000 75%, transparent); }
   .showmore { align-self: flex-start; font-size: 12px; color: var(--user); margin: 4px 6px 0; }
@@ -446,6 +446,25 @@
   #wakeMenu button { width: 100%; padding: 8px 10px; border-radius: 7px; text-align: left; color: var(--text-dim); }
   #wakeMenu button:hover { background: var(--panel); color: var(--text); }
   #wakeMenu button .sm-sub { display: block; font-size: 10.5px; opacity: .62; margin-top: 1px; }
+
+  /* Ask menu. Fixed like the wake menu and for the same reason: the message row
+     it would otherwise anchor into is rebuilt on every render, and an anchored
+     child would be thrown away mid-choice. */
+  #askMenu {
+    position: fixed; display: none; min-width: 260px; max-width: 320px;
+    padding: 7px; background: var(--panel2); border: 1px solid var(--border2); border-radius: 11px;
+    box-shadow: 0 8px 30px rgba(0,0,0,.5); z-index: 40;
+  }
+  #askMenu.open { display: block; }
+  #askMenu button { width: 100%; padding: 8px 10px; border-radius: 7px; text-align: left; color: var(--text-dim); }
+  #askMenu button:hover { background: var(--panel); color: var(--text); }
+  #askMenu button .sm-sub { display: block; font-size: 10.5px; opacity: .62; margin-top: 1px; }
+  #askMenu input { width: 100%; margin: 2px 0 6px; padding: 6px 8px; border-radius: 7px;
+    background: var(--panel); border: 1px solid var(--border); color: var(--text); font: inherit; }
+  #askMenu .ask-seats { display: flex; gap: 4px; margin-bottom: 6px; }
+  #askMenu .ask-seats button { width: auto; flex: 1; text-align: center; padding: 5px 8px;
+    font-size: 12px; border: 1px solid var(--border); }
+  #askMenu .ask-seats button.active { color: var(--text); border-color: var(--user); }
 
   /* quote header: what a reply is answering. Lives between .meta and .bubble
      so copying a message never picks up the quoted text. */
@@ -745,6 +764,7 @@
 </div>
 
 <div id="wakeMenu" role="menu"></div>
+<div id="askMenu" role="menu"></div>
 
 <div id="overlay">
   <div class="modal">
@@ -1172,6 +1192,13 @@ document.addEventListener("click", (e) => {
       cpy.textContent = "✓"; setTimeout(() => (cpy.textContent = "📋"), 1200);
     });
   }
+  // Delegated, not a per-node onclick: any arriving activity entry re-renders
+  // the transcript and would take a bound handler with it.
+  const ask = e.target.closest(".ask");
+  if (ask) {
+    const host = ask.closest("[data-n]");
+    if (host) { e.stopPropagation(); openAskMenu(ask, Number(host.dataset.n)); }
+  }
   if (!e.target.closest("#stopWrap")) closeStopMenu();
   if (!e.target.closest("#hopWrap")) closeHopMenu();
   if (!e.target.closest("#queueWrap")) closeQueuePop();
@@ -1469,11 +1496,20 @@ function entryEl(e) {
     : e.meta && e.meta.hop && !(e.meta && e.meta.pair) ? ' <span style="opacity:.6">· ⛓ follow-up</span>' : deferTag);
   const userPair = e.meta && e.meta.pair && typeof e.meta.pair === "object"
     ? ` · 🔁 pair ×${e.meta.pair.rounds} (${e.meta.pair.worker} works, ${e.meta.pair.reviewer} reviews)` : "";
+  // An auto-composed "Continue responding to this message." must never read as
+  // something the user typed; the quote header above says what it is about, and
+  // this says how it got here.
+  const askTag = e.kind === "user" && e.meta && e.meta.askFrom
+    ? (e.meta.askFrom.redirect
+      ? ' <span style="opacity:.6" title="Sent with Stop current &amp; ask now">· ↪ redirect</span>'
+      : ' <span style="opacity:.6" title="Asked again about an earlier message">· ↪ ask again</span>')
+    : "";
   const label = e.kind === "user"
-    ? `You <span style="opacity:.65">→ @${esc(e.target)}${e.meta && e.meta.discussion ? " · 💬 discussion" : ""}${userPair}</span>`
+    ? `You <span style="opacity:.65">→ @${esc(e.target)}${e.meta && e.meta.discussion ? " · 💬 discussion" : ""}${userPair}</span>${askTag}`
     : e.author.charAt(0).toUpperCase() + e.author.slice(1) + lurkTag;
   const av = e.kind === "user" ? "" : `<span class="avatar">${esc((state.providers[e.author] && state.providers[e.author].avatar) || e.author[0].toUpperCase())}</span>`;
   div.innerHTML = `<div class="meta">${av}<span class="who">${label}</span><span>${hhmm(e.ts)}${dur}${tok}</span>` +
+    `<button class="ask" title="Ask about this message">↪</button>` +
     `<button class="cpy" title="Copy message">📋</button></div>` +
     entryQuoteHTML(e) +
     `<div class="bubble${statusDimmed(e) ? " dimmed" : ""}">${renderMD(e.text)}</div>` +
@@ -1722,11 +1758,11 @@ function refWho(src) {
   return src.kind === "user" ? "you" : seatLabel(src.author);
 }
 
-function quoteRefHTML(src) {
+function quoteRefHTML(src, label = "↩ replying to") {
   if (!src || src.n === undefined || src.n === null) return "";
   return `<button class="quote-ref" data-jump-n="${esc(String(src.n))}" title="Jump to this message">` +
     `<span class="qr-bar"></span><span class="qr-body">` +
-    `<span class="qr-head"><span>↩ replying to ${esc(refWho(src))}</span><span>${esc(hhmm(src.ts))}</span></span>` +
+    `<span class="qr-head"><span>${esc(label)} ${esc(refWho(src))}</span><span>${esc(hhmm(src.ts))}</span></span>` +
     `<span class="qr-text">${esc(src.text || "")}</span>` +
     `</span></button>`;
 }
@@ -1735,6 +1771,12 @@ function quoteRefHTML(src) {
 // is the whole point of putting the quote in the bubble rather than in a
 // transient strip, and it is what makes an old exchange readable months later.
 function entryQuoteHTML(e) {
+  // What makes an ask bubble auditable rather than looking like something the
+  // user typed — especially "Continue responding to this message."
+  if (e.kind === "user" && e.meta && e.meta.askFrom &&
+      e.meta.askFrom.sourceN !== undefined && e.meta.askFrom.sourceN !== null) {
+    return quoteRefHTML(refFromN(e.meta.askFrom.sourceN), "↪ asking about");
+  }
   if (e.kind !== "agent" || !e.meta || e.meta.replyTo === undefined || e.meta.replyTo === null) return "";
   return quoteRefHTML(refFromN(e.meta.replyTo));
 }
@@ -2407,6 +2449,100 @@ document.addEventListener("click", (e) => {
 });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeWakeMenu(); });
 
+// ↪ Ask on any user or agent message. Idle target: one action. Busy target: the
+// two that are genuinely different — queue behind the current response, or stop
+// it and ask now. The stop-and-ask is ONE server request pinned to the runId the
+// browser is showing; never a Stop click followed by a Send, which leaves a
+// window for the old run to finish and the queue to start something else.
+let askDraft = null; // { sourceN, target } while the menu is open
+function closeAskMenu() {
+  $("askMenu").classList.remove("open");
+  $("askMenu").innerHTML = "";
+  askDraft = null;
+}
+function askDefaultTarget(src) {
+  if (!src) return null;
+  return src.kind === "agent" ? src.author
+    : (src.target === "both" ? "both" : src.target);
+}
+function askPins(seats) {
+  const s = state.summary || {};
+  const info = (s.busyInfo || []).filter((b) => b.runId);
+  // A pair cycle is one unit: redirecting during one ends it, so its runs all
+  // go. Otherwise pin only the seats this ask is aimed at — killing an unrelated
+  // seat's response is not what "stop the current response" means.
+  const wanted = s.workingPair ? info : info.filter((b) => seats.includes(b.agent));
+  return wanted.map((b) => ({ agent: b.agent, runId: b.runId }));
+}
+function askSeatsFor(target) {
+  return target === "both" ? ((state.summary && state.summary.seats) || []) : [target];
+}
+function renderAskMenu(btn) {
+  if (!askDraft || !state.summary) return;
+  const menu = $("askMenu");
+  const seats = (state.summary.seats || []);
+  const busy = state.summary.busy || [];
+  const aimed = askSeatsFor(askDraft.target);
+  const contested = state.summary.workingPair || aimed.some((a) => busy.includes(a));
+  const chips = [...seats, ...(seats.length > 1 ? ["both"] : [])].map((t) =>
+    `<button data-ask-seat="${esc(t)}" class="${t === askDraft.target ? "active" : ""}">` +
+    `${esc(t === "both" ? "Both" : seatLabel(t))}</button>`).join("");
+  const draft = ($("askText") || {}).value || "";
+  const actions = !contested
+    ? `<button role="menuitem" data-ask-mode="now">↪ Ask now<span class="sm-sub">the seat is free</span></button>`
+    : `<button role="menuitem" data-ask-mode="queue">⏳ Queue after current` +
+      `<span class="sm-sub">everything already queued keeps its place</span></button>` +
+      `<button role="menuitem" data-ask-mode="stop">■ Stop current &amp; ask now` +
+      `<span class="sm-sub">stops the response on screen; queued work stays behind this</span></button>`;
+  menu.innerHTML = `<div class="ask-seats">${chips}</div>` +
+    `<input id="askText" placeholder="Add an instruction (optional)" value="${esc(draft)}">` + actions;
+  menu.classList.add("open");
+  // Only measure against the button on first open; a seat-chip re-render must
+  // not make the menu jump out from under the cursor.
+  if (btn) {
+    const r = btn.getBoundingClientRect();
+    const w = menu.offsetWidth;
+    menu.style.left = `${Math.max(8, Math.min(r.right - w, window.innerWidth - w - 8))}px`;
+    menu.style.top = `${r.bottom + 7}px`;
+  }
+}
+function openAskMenu(btn, sourceN) {
+  const src = entryByN(sourceN);
+  if (!src || !state.summary) return;
+  askDraft = { sourceN, target: askDefaultTarget(src) || (state.summary.seats || [])[0] };
+  if (!askDraft.target) { askDraft = null; return; }
+  renderAskMenu(btn);
+}
+async function askFromMenu(mode) {
+  if (!askDraft) return;
+  const seats = askSeatsFor(askDraft.target);
+  const body = {
+    room: state.room, sourceN: askDraft.sourceN, mode,
+    target: askDraft.target, text: ($("askText") || {}).value || "",
+    ...(mode === "stop" ? { runs: askPins(seats) } : {}),
+  };
+  // Nothing on screen to stop: asking for a pinned stop with no pins would be
+  // refused, and downgrading is what the user meant anyway.
+  if (mode === "stop" && !body.runs.length) { body.mode = "queue"; delete body.runs; }
+  closeAskMenu();
+  try {
+    const r = await api("/api/ask", body);
+    if (r.held && r.held.length) toast(`😴 held for ${r.held.join(" and ")} until wake`);
+    else if (r.stop && r.stop.stale) toast("That response had already finished — your message is next in line.");
+    else if (r.deferred && r.deferred.length) toast(`⏳ next in ${r.deferred.join(" and ")}'s lane`);
+  } catch (err) { toast(err.message, true); }
+}
+$("askMenu").addEventListener("click", (e) => {
+  const seat = e.target.closest("[data-ask-seat]");
+  if (seat && askDraft) { askDraft.target = seat.dataset.askSeat; renderAskMenu(null); return; }
+  const choice = e.target.closest("[data-ask-mode]");
+  if (choice) askFromMenu(choice.dataset.askMode);
+});
+document.addEventListener("click", (e) => {
+  if (!e.target.closest("#askMenu") && !e.target.closest(".ask")) closeAskMenu();
+});
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeAskMenu(); });
+
 $("pills").addEventListener("click", async (e) => {
   const moon = e.target.closest(".moon");
   if (moon && state.summary) {
@@ -2626,11 +2762,14 @@ function queueGroups() {
     if (!g) {
       g = {
         key, groupId: item.queueGroupId, sourceN: item.sourceN,
-        text: item.text, ts: item.ts, target: item.target, rows: [],
+        text: item.text, ts: item.ts, target: item.target, head: false, rows: [],
       };
       byKey.set(key, g);
       groups.push(g);
     }
+    // Otherwise a redirect appears above work the user sent earlier with
+    // nothing on the card explaining why.
+    g.head = g.head || !!item.head;
     for (const a of item.agents) {
       g.rows.push({ agent: a, pos: (item.positions || {})[a] || 0, kind: item.kind });
     }
@@ -2657,7 +2796,8 @@ function queueCardHTML(g) {
       ? (held ? "pair cycle held" : "pair cycle queued")
       : (held ? "held" : "queued")}` +
     `${r.pos ? ` #${r.pos}` : ""}</span>`);
-  const meta = [hhmm(g.ts), g.target ? `@${g.target}` : ""].filter(Boolean).join(" · ");
+  const meta = [g.head ? "↪ next" : "", hhmm(g.ts), g.target ? `@${g.target}` : ""]
+    .filter(Boolean).join(" · ");
   return `<div class="qp-card${held ? " paused" : ""}">` +
     `<div class="qp-top">` +
     `<button class="qp-src"${g.sourceN === null || g.sourceN === undefined ? "" : ` data-jump-n="${esc(String(g.sourceN))}"`} title="Jump to this message">` +
