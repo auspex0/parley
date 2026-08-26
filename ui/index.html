@@ -661,6 +661,10 @@
       <button type="button" id="newRoomProj" class="ract"
         style="display:block;width:100%;text-align:left;margin-top:6px;padding:4px 2px;font-size:11.5px;color:var(--text-faint)"
         title="Point this room at an existing project folder"><span data-picker-label>📁 Link a project folder…</span> <span id="newRoomProjVal"></span></button>
+      <label id="newRoomReview" style="display:flex;gap:6px;align-items:flex-start;margin-top:6px;font-size:11.5px;color:var(--text-faint);cursor:pointer">
+        <input type="checkbox" id="newRoomReviewChk" style="margin-top:2px">
+        <span>Pair review room — seat 1 codes, seat 2 lurks and reviews every change</span>
+      </label>
     </form>
     <nav id="roomList"></nav>
     <div class="side-foot">
@@ -669,6 +673,7 @@
       <a id="dlTranscript" href="#"><span class="ico">📄</span> Download transcript</a>
       <button id="openRoomDir"><span class="ico">🗂️</span> Room folder</button>
       <button id="settingsBtn2"><span class="ico">⚙️</span> Settings</button>
+      <a href="https://github.com/auspex0/parley#readme" target="_blank" rel="noreferrer noopener"><span class="ico">?</span> Docs</a>
     </div>
   </aside>
 
@@ -689,6 +694,7 @@
       <button id="pairEndBtn" style="margin-left:10px;color:#c9b3f5;text-decoration:underline;font-size:12.5px">End pair mode</button>
     </div>
     <div id="runtimeBanner" role="alert" style="display:none;padding:8px 20px;font-size:12.5px;color:#ffb4b4;background:rgba(235,75,90,.14);border-bottom:1px solid rgba(235,75,90,.5)"></div>
+    <div id="setupBanner" role="status" style="display:none;padding:8px 20px;font-size:12.5px;color:#ffd479;background:rgba(255,212,121,.10);border-bottom:1px solid rgba(255,212,121,.35)"></div>
     <div id="workBanner">🔨 <b>Work room</b> — agents can write files in the shared workspace and run commands. Their actions show as inline activity lines.</div>
 
     <div id="chatWrap">
@@ -773,6 +779,12 @@
     <div class="mgrid" id="seatCards"></div>
     <div class="fld" style="margin-top:14px"><label>Room note (standing instruction both agents see on every turn — also /note)</label>
       <input id="s_roomnote" placeholder="e.g. We're building a YT-transcription app; keep answers short." spellcheck="false"></div>
+    <div class="fld"><label>Notifications</label>
+      <label style="display:flex;gap:8px;align-items:flex-start;font-size:12.5px;color:var(--text-dim);cursor:pointer">
+        <input type="checkbox" id="s_notify" style="margin-top:3px">
+        <span>Tell me when a reply lands, a pair cycle needs my decision, or a turn fails — only while this tab is in the background.</span>
+      </label>
+      <div class="note">Per browser, not per room. Your browser will ask for permission the first time.</div></div>
     <div class="fld" style="margin-top:14px"><label>Project folder (blank = room's own sandbox workspace)</label>
       <div style="display:flex;gap:8px">
         <input id="s_projdir" placeholder="e.g. D:\Projects\my-app" spellcheck="false" style="flex:1">
@@ -851,6 +863,7 @@ const state = {
   renderFromN: null, // first entry shown by the windowed transcript render
   expandedMessages: new Set(),
   expandedActivity: new Set(),
+  doctor: {},        // seat -> first-run health, from /api/doctor
   eventVersion: 0,   // any newer SSE event makes a reconnect snapshot stale for live UI state
   resyncVersion: 0,
 };
@@ -1926,7 +1939,7 @@ function addEntry(e) {
   // so the rebuild has to put them back where they were.
   if (!inOrder) {
     renderAll({ stickToBottom: wasAtBottom, anchor: true });
-    if (document.hidden && e.kind !== "activity") document.title = "● Parley";
+    if (document.hidden && e.kind !== "activity") { document.title = "● Parley"; notifyForEntry(e); }
     return;
   }
   if (state.renderFromN !== null && e.n < state.renderFromN) return;
@@ -1941,8 +1954,50 @@ function addEntry(e) {
   chat.appendChild(entryEl(e));
   // Keep any live bubbles after the durable transcript entry.
   for (const live of Object.values(state.live)) chat.appendChild(live.el);
-  if (document.hidden && e.kind !== "activity") document.title = "● Parley";
+  if (document.hidden && e.kind !== "activity") { document.title = "● Parley"; notifyForEntry(e); }
   scrollBottom(e.kind === "user" || wasAtBottom);
+}
+
+// ---- away-from-tab notifications ----
+// A work-mode turn can run for fifteen minutes and a pair cycle can pause
+// waiting for a decision, so the interesting moment usually arrives while the
+// user is in their editor. A dot on the tab title was the only signal. This is
+// opt-in, per browser, and never asks unprompted — the toggle lives in Settings.
+const NOTIFY_KEY = "parley.notify";
+function notifyEnabled() {
+  try { return localStorage.getItem(NOTIFY_KEY) === "1"; } catch { return false; }
+}
+function setNotifyEnabled(on) {
+  try { localStorage.setItem(NOTIFY_KEY, on ? "1" : "0"); } catch { /* private mode */ }
+}
+async function requestNotifyPermission() {
+  if (!("Notification" in window)) return false;
+  if (Notification.permission === "granted") return true;
+  if (Notification.permission === "denied") return false;
+  try { return (await Notification.requestPermission()) === "granted"; } catch { return false; }
+}
+// Only while the tab is hidden: a notification for something already on screen
+// is noise, and this feature exists for the moments the user is elsewhere.
+function notifyAway(title, body) {
+  if (!document.hidden || !notifyEnabled()) return;
+  if (!("Notification" in window) || Notification.permission !== "granted") return;
+  try {
+    const n = new Notification(title, { body: String(body || "").slice(0, 180), tag: "parley-" + state.room });
+    n.onclick = () => { window.focus(); n.close(); };
+  } catch { /* the browser refused; the tab title still carries the dot */ }
+}
+// The three moments worth interrupting someone for: an answer landed, the room
+// is waiting on a decision it cannot make, or something failed.
+function notifyForEntry(e) {
+  if (e.kind === "agent") {
+    notifyAway(`${seatLabel(e.author)} replied`, e.text);
+  } else if (e.kind === "system" && e.meta) {
+    if (e.meta.pairPause || /needs your decision|needs-user/i.test(e.text || "")) {
+      notifyAway("Parley is waiting on you", e.text);
+    } else if (e.meta.error) {
+      notifyAway("A turn failed", e.text);
+    }
+  }
 }
 
 // live (thinking / streaming) bubbles
@@ -2178,6 +2233,30 @@ const titleCaseSeat = (a) => String(a).charAt(0).toUpperCase() + String(a).slice
 function seatAvatar(a) {
   return seatMeta(a).avatar || String(a)[0].toUpperCase();
 }
+// What this room has actually spent, per seat. The numbers are already on every
+// reply (ground truth from the CLI, not model self-reporting); nothing summed
+// them, so the only cost signal was one bubble at a time — in an app whose Sleep
+// feature exists because people hit rate limits.
+function seatUsage(a) {
+  let out = 0, reasoning = 0, replies = 0;
+  for (const e of state.entries) {
+    if (e.kind !== "agent" || e.author !== a) continue;
+    const t = e.meta && e.meta.tokens;
+    if (!t) continue;
+    replies++;
+    if (typeof t.out === "number") out += t.out;
+    if (typeof t.reasoning === "number") reasoning += t.reasoning;
+  }
+  return { out, reasoning, replies };
+}
+function usageSummaryText(a) {
+  const u = seatUsage(a);
+  if (!u.replies) return "";
+  const parts = [`${u.out.toLocaleString()} output tokens`];
+  if (u.reasoning) parts.push(`${u.reasoning.toLocaleString()} reasoning`);
+  return `${parts.join(" · ")} over ${u.replies} repl${u.replies === 1 ? "y" : "ies"} in this conversation`;
+}
+
 function seatColor(a) {
   return (seatMeta(a).color) || "#7aa2f7";
 }
@@ -2318,8 +2397,18 @@ function applySummary(s) {
     pill.classList.toggle("busy", s.busy.includes(a));
     pill.classList.toggle("bad", !ag.command.ok);
     pill.classList.toggle("asleep", asleep);
+    // The pill's tooltip is where someone looks when they want to know what a
+    // seat has cost them so far.
+    const spent = usageSummaryText(a);
+    const health = (state.doctor && state.doctor[a]) || null;
+    pill.title = [
+      ag.command.ok ? `${seatLabel(a)} · ${ag.command.detail}` : `${seatLabel(a)}: ${ag.command.detail}`,
+      health && !health.ok && health.stage === "auth" ? `${health.detail} — ${health.how}` : "",
+      spent,
+    ].filter(Boolean).join("\n");
     let txt = "";
     if (!ag.command.ok) txt = "not found";
+    else if (health && !health.ok && health.stage === "auth") txt = "not signed in";
     else {
       // A seat can be both: sleep stops the *next* launch, so a response
       // already running still says so.
@@ -3190,6 +3279,24 @@ function connect(resyncOnOpen = false) {
 }
 
 // ------------------------------------------------------------ load room
+// What a first run needs to know before anything is spent. An unauthenticated
+// CLI used to surface as an opaque exit code on the first real message, which is
+// the worst possible moment to find out.
+async function refreshDoctor(roomName) {
+  try {
+    const d = await api("/api/doctor?room=" + encodeURIComponent(roomName));
+    if (state.room !== roomName) return;
+    state.doctor = d.seats || {};
+    const bad = Object.entries(state.doctor).filter(([, h]) => !h.ok);
+    const banner = $("setupBanner");
+    if (!bad.length) { banner.style.display = "none"; return; }
+    banner.innerHTML = bad.map(([seat, h]) =>
+      `<div><b>${esc(seatLabel(seat))} isn't ready</b> — ${esc(h.detail)}. ${esc(h.how)}</div>`).join("");
+    banner.style.display = "block";
+    if (state.summary) applySummary(state.summary); // repaint the pills
+  } catch { /* the room still works; the pills carry what they know */ }
+}
+
 async function loadRoom(name) {
   retireSettingsPick(); // a folder dialog open for the old room must not land here
   let data;
@@ -3216,6 +3323,7 @@ async function loadRoom(name) {
     state.hopChoice = storedHopChoice(roomName);
   }
   state.room = roomName;
+  refreshDoctor(roomName);
   history.replaceState(null, "", roomName === "default" ? location.pathname : "?room=" + encodeURIComponent(roomName));
   // Keep an explicit destination if it exists in the destination room. Only a
   // genuinely stale seat id falls back to automatic routing.
@@ -3822,9 +3930,23 @@ $("newRoomForm").onsubmit = async (e) => {
   // only cleared on success — a rejected name leaves the form up, and the user
   // shouldn't have to pick their project again to fix a typo.
   newRoomPick++;
+  const asReview = $("newRoomReviewChk").checked;
   try {
     await api("/api/rooms", body);
+    // The flagship workflow used to take four separate actions to assemble:
+    // create, flip to work, turn on the reviewer's ear, then find lurkStyle.
+    // As a preset it is one checkbox — configured after creation so the room
+    // exists to configure, and reported rather than silently half-applied.
+    if (asReview && seats.length === 2) {
+      try {
+        await api("/api/config", {
+          room: name,
+          config: { mode: "work", agents: { [seats[1]]: { lurk: true, lurkStyle: "balanced" } } },
+        });
+      } catch (err) { toast(`Room created, but the review preset didn't apply: ${err.message}`, true); }
+    }
     $("newRoomInput").value = "";
+    $("newRoomReviewChk").checked = false;
     $("newRoomForm").style.display = "none";
     clearNewRoomProject();
     await loadRoom(name);
@@ -4041,6 +4163,7 @@ function openSettings() {
   $("roomPath").textContent = s.dir;
   $("mDelete").hidden = s.name === "default"; // the fallback room can't be removed
   renderSeatCards(s);
+  $("s_notify").checked = notifyEnabled();
   $("s_projdir").value = s.cfg.projectDir || "";
   $("s_roomnote").value = s.cfg.roomNote || "";
   $("s_default").innerHTML = s.seats.map((x) => `<option>${esc(x)}</option>`).join("");
@@ -4106,6 +4229,16 @@ $("mSave").onclick = async () => {
     roomNote: $("s_roomnote").value.trim() || null,
     agents,
   };
+  // The notification preference is this browser's, not the room's, so it is
+  // applied here rather than sent to the server. Asking for permission only
+  // when it is switched on keeps the prompt tied to a deliberate action.
+  const wantNotify = $("s_notify").checked;
+  if (wantNotify && !notifyEnabled()) {
+    if (await requestNotifyPermission()) setNotifyEnabled(true);
+    else toast("Your browser blocked notifications for this page.", true);
+  } else if (!wantNotify) {
+    setNotifyEnabled(false);
+  }
   retireSettingsPick();
   try {
     const saved = await api("/api/config", { room: state.room, config });

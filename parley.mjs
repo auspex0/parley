@@ -449,7 +449,13 @@ function defaultConfig(seats = DEFAULT_SEATS) {
   return {
     defaultAgent: specs[0].id,
     mode: "talk",     // "talk" (chat, conservative permissions) | "work" (agents may write/run in the workspace)
-    hopBudget: -1,    // agent-to-agent follow-ups per user message (-1 = until settled, 0 = none)
+    // Agent-to-agent follow-ups per user message. A NEW room starts bounded:
+    // one charged hop can mean two provider calls, so an unlimited default
+    // let a first cross-tagged exchange spend a dozen calls before the user
+    // had any sense of what a hop costs. -1 (until settled) stays one click
+    // away in Settings and in the composer control, and every room created
+    // before this keeps whatever it already had.
+    hopBudget: 3,
     pairRounds: 0,    // review rounds per message in pair mode (0 = until the reviewer approves)
     projectDir: null, // absolute path of a real project to work in (null = room's own sandbox workspace)
     roomNote: null,   // standing instruction prepended to every prompt (set via Settings or /note)
@@ -2257,6 +2263,52 @@ function noteChainFailure(room, label, err) {
       meta: { chainFailure: { label } },
     });
   } catch { /* the append is what failed — the console line is the record */ }
+}
+
+// ---- first-run health ----
+// A missing CLI already shows on the seat pill. An unauthenticated one did not:
+// it surfaced as an opaque exit code on the user's first real message, which is
+// the worst possible moment to learn it. Each provider keeps its credentials in
+// a file it owns, so this reads that file's presence rather than spending a call
+// to find out — cheap enough to run on demand, and honest about only checking
+// that a login exists rather than that it is still valid.
+const AUTH_HINTS = {
+  claude: {
+    paths: [[".claude", ".credentials.json"], [".claude", "credentials.json"], [".config", "claude", ".credentials.json"]],
+    how: "Run `claude` once in a terminal and complete the login.",
+  },
+  codex: {
+    paths: [[".codex", "auth.json"]],
+    how: "Run `codex` once in a terminal and sign in.",
+  },
+  gemini: {
+    paths: [[".gemini", "oauth_creds.json"], [".gemini", "google_accounts.json"]],
+    how: "Run `gemini` once in a terminal and complete the login, or set GEMINI_API_KEY.",
+  },
+};
+const AUTH_ENV = { gemini: ["GEMINI_API_KEY", "GOOGLE_API_KEY"], claude: ["ANTHROPIC_API_KEY"], codex: ["OPENAI_API_KEY"] };
+
+function seatHealth(room, seat) {
+  const cfg = room.cfg.agents[seat];
+  const spec = resolveCommand(cfg.command);
+  if (spec.error) {
+    return {
+      ok: false, stage: "command", detail: spec.error,
+      how: `Install the CLI and restart Parley — PATH is read once at launch.`,
+    };
+  }
+  const pid = providerIdOf(room, seat);
+  const hint = AUTH_HINTS[pid];
+  if (hint) {
+    const envKey = (AUTH_ENV[pid] || []).find((k) => process.env[k]);
+    const signedIn = envKey || hint.paths.some((parts) => {
+      try { return fs.existsSync(path.join(os.homedir(), ...parts)); } catch { return false; }
+    });
+    if (!signedIn) {
+      return { ok: false, stage: "auth", detail: `${spec.via} is installed but no ${PROVIDERS[pid].label} login was found`, how: hint.how };
+    }
+  }
+  return { ok: true, stage: "ready", detail: spec.via };
 }
 
 function roomSummary(room) {
@@ -6657,6 +6709,22 @@ const server = http.createServer(async (req, res) => {
     // every window focus went through GET /api/room, which serialises the whole
     // of a room's history to deliver one label — megabytes of work per alt-tab
     // in a long-lived room.
+    // What a first run actually needs to know, per seat, before anything is
+    // spent: is the CLI there, is it signed in, and if not, what to do about it.
+    if (route === "GET /api/doctor") {
+      const room = loadRoom(url.searchParams.get("room") || "default", undefined, true);
+      return json(res, 200, {
+        node: process.version,
+        parley: packageVersion(),
+        seats: Object.fromEntries(seatIds(room).map((a) => [a, {
+          provider: providerIdOf(room, a),
+          label: providerOf(room, a).label,
+          command: room.cfg.agents[a].command,
+          ...seatHealth(room, a),
+        }])),
+      });
+    }
+
     if (route === "GET /api/room/summary") {
       const wanted = url.searchParams.get("name") || "default";
       const room = loadRoom(wanted, undefined, wanted === "default");

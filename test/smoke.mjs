@@ -2970,6 +2970,9 @@ async function main() {
   ok("an explicit call waits for a busy target instead of being dropped",
     waitedHop.entries.some((e) => e.author === "codex" && e.meta && e.meta.hop));
 
+  // New rooms are bounded by default now, so "until settled" is set explicitly
+  // here — this is a test about the emergency ceiling, not about the default.
+  await cfg("hoproom", { hopBudget: -1 });
   beforeHop = d.entries.length;
   await say("hoproom", "@claude PINGPONG");
   d = await idle("hoproom");
@@ -2995,8 +2998,8 @@ async function main() {
   // once so a genuine hopBudget:0 can survive every later reload.
   await api("POST", "/api/rooms", { name: "hop-default" });
   let hopPolicyRoom = await room("hop-default");
-  ok("new rooms default to hopBudget -1 (until settled)",
-    hopPolicyRoom.room.cfg.hopBudget === -1 && !("maxHops" in hopPolicyRoom.room.cfg),
+  ok("new rooms default to a bounded hop budget rather than until-settled",
+    hopPolicyRoom.room.cfg.hopBudget === 3 && !("maxHops" in hopPolicyRoom.room.cfg),
     JSON.stringify(hopPolicyRoom.room.cfg));
 
   const legacyHopDir = path.join(ROOT, "legacy-hop-budget");

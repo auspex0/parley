@@ -142,6 +142,8 @@ Mentions inside fenced code, inline code and blockquotes are examples, not routi
 The server, not the model, owns the counter. `hopBudget` is snapshotted when each user message is accepted, and charged usage is persisted against that user-message root. Wake & deliver and Retry therefore resume the root's already-spent count and remaining budget instead of minting a fresh allowance. The bounded execution-history map retains the newest 200 inactive roots with charged usage, plus any older root that is still active, held or retryable, so state stays bounded without erasing an unresolved exchange's cap:
 
 - **`-1` / `∞`** — follow up until the exchange settles, still fenced by the emergency safety stop.
+
+A new room starts at **3** rather than ∞. One charged hop can mean two provider calls, so an unlimited default let a first cross-tagged exchange spend a dozen before anyone had a feel for what a hop costs; ∞ is one click away in the composer control and in Settings, and rooms created before this keep whatever they had.
 - **`0`** — launch no charged requests; structural requests and answers already owed still run.
 - **positive integer** — launch at most that many charged requests. Settings accepts any safe whole number; the compact composer control offers quick values through `8`.
 
