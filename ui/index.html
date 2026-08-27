@@ -733,8 +733,15 @@
     <form id="newRoomForm">
       <input id="newRoomInput" placeholder="room name…" maxlength="40" spellcheck="false">
       <div style="display:flex;gap:6px;margin-top:6px">
-        <select id="seat1" title="Seat 1" style="flex:1"></select>
-        <select id="seat2" title="Seat 2" style="flex:1"></select>
+        <select id="seat1" title="Seat 1 provider" style="flex:1"></select>
+        <select id="seat2" title="Seat 2 provider" style="flex:1"></select>
+      </div>
+      <div id="seatNames" style="display:none;gap:6px;margin-top:6px">
+        <input id="seat1Name" maxlength="20" spellcheck="false" style="flex:1" aria-label="Seat 1 name">
+        <input id="seat2Name" maxlength="20" spellcheck="false" style="flex:1" aria-label="Seat 2 name">
+      </div>
+      <div id="seatNamesHint" class="hint" style="display:none;margin-top:4px">
+        Two seats on the same provider need different names — these become their @mentions.
       </div>
       <button type="button" id="newRoomProj" class="ract"
         style="display:block;width:100%;text-align:left;margin-top:6px;padding:4px 2px;font-size:11.5px;color:var(--text-faint)"
@@ -2463,7 +2470,12 @@ function seatColor(a) {
   return (seatMeta(a).color) || "#7aa2f7";
 }
 function seatLabel(a) {
-  return (seatMeta(a).label) || titleCaseSeat(a);
+  const meta = seatMeta(a);
+  // A seat's own name wins over its provider's label whenever they differ:
+  // that name is what you @mention, and in a room with two seats on one
+  // provider "Claude" and "Claude" would be indistinguishable.
+  if (meta.provider && meta.provider !== a) return titleCaseSeat(a);
+  return meta.label || titleCaseSeat(a);
 }
 function injectSeatStyles() {
   let css = "";
@@ -3654,8 +3666,15 @@ async function refreshRooms() {
     const linked = typeof r === "string" ? false : r.linked;
     const seats = (typeof r === "string" ? null : r.seats) || [];
     const nonDefault = seats.length && seats.join(",") !== "claude,codex";
+    // The listing carries each seat's provider, because a room in the sidebar
+    // is not the open room and seatMeta has no summary to resolve against.
+    const rowProviders = (typeof r === "string" ? null : r.providers) || {};
+    const rowAvatar = (a) => {
+      const p = state.providers[rowProviders[a] || a];
+      return (p && p.avatar) || String(a)[0].toUpperCase();
+    };
     const seatTag = nonDefault
-      ? `<span style="font-size:10px;opacity:.7">${seats.map(seatAvatar).join("+")}</span>`
+      ? `<span style="font-size:10px;opacity:.7">${seats.map(rowAvatar).join("+")}</span>`
       : "";
     // A row, not one big button: the rename and delete controls have to be real
     // buttons to be reachable by keyboard, and nesting a button inside a button
@@ -3688,7 +3707,36 @@ function fillSeatPickers() {
   for (const [sel, def] of [[$("seat1"), "claude"], [$("seat2"), "codex"]]) {
     sel.innerHTML = ids.map((p) => `<option value="${esc(p)}">${esc(state.providers[p].label)}</option>`).join("");
     sel.value = ids.includes(def) ? def : ids[sel === $("seat2") ? 1 : 0] || ids[0];
+    sel.onchange = syncSeatNames;
   }
+  syncSeatNames();
+}
+// Two seats may run the same provider — what has to differ is their names,
+// because a seat id is its @mention, its config key and the author on every
+// line it writes. The name fields only appear when they are actually needed;
+// picking two different providers keeps the form exactly as it was.
+function syncSeatNames() {
+  const p1 = $("seat1").value, p2 = $("seat2").value;
+  const same = !!p1 && p1 === p2;
+  $("seatNames").style.display = same ? "flex" : "none";
+  $("seatNamesHint").style.display = same ? "block" : "none";
+  if (!same) return;
+  // Prefill rather than demand: "claude" and "claude2" are a fine default, and
+  // anyone who wants "opus"/"sonnet" can just type over them.
+  if (!$("seat1Name").value.trim()) $("seat1Name").value = p1;
+  if (!$("seat2Name").value.trim()) $("seat2Name").value = p2 + "2";
+  $("seat1Name").placeholder = p1;
+  $("seat2Name").placeholder = p2 + "2";
+}
+// Mirrors the server's rule so the message names the problem instead of
+// bouncing back a 400. The server still validates; this is only the wording.
+const RESERVED_SEAT_NAMES = new Set(["both", "user", "system", "all", "none"]);
+function seatNameIssue(id) {
+  if (!/^[a-z][a-z0-9-]{0,19}$/.test(id)) {
+    return `"${id}" — seat names are lowercase letters, numbers and dashes, starting with a letter.`;
+  }
+  if (RESERVED_SEAT_NAMES.has(id)) return `"${id}" is reserved — it would collide with routing.`;
+  return null;
 }
 
 // ------------------------------------------------------------ composer
@@ -4169,6 +4217,8 @@ function mentionKeydown(e) {
 // ------------------------------------------------------------ rooms sidebar
 $("addRoomBtn").onclick = () => {
   clearNewRoomProject(); // a fresh form never inherits the last one's folder
+  $("seat1Name").value = ""; $("seat2Name").value = "";
+  syncSeatNames();
   $("newRoomForm").style.display = "block";
   $("newRoomInput").focus();
 };
@@ -4196,8 +4246,17 @@ $("newRoomForm").onsubmit = async (e) => {
   e.preventDefault();
   const name = $("newRoomInput").value.trim();
   if (!name) return;
-  const seats = [$("seat1").value, $("seat2").value].filter(Boolean);
-  if (seats.length === 2 && seats[0] === seats[1]) return toast("Pick two different seats.", true);
+  const providers = [$("seat1").value, $("seat2").value].filter(Boolean);
+  let seats = providers;
+  if (providers.length === 2 && providers[0] === providers[1]) {
+    // Same provider twice is a real room; the names are what distinguish them.
+    const ids = [$("seat1Name").value.trim().toLowerCase() || providers[0],
+      $("seat2Name").value.trim().toLowerCase() || providers[1] + "2"];
+    if (ids[0] === ids[1]) return toast("Give the two seats different names.", true);
+    const issue = ids.map(seatNameIssue).find(Boolean);
+    if (issue) return toast(issue, true);
+    seats = ids.map((id, i) => ({ id, provider: providers[i] }));
+  }
   const body = { name };
   if (seats.length === 2) body.seats = seats;
   if (newRoomProjectDir) body.projectDir = newRoomProjectDir;
@@ -4213,15 +4272,17 @@ $("newRoomForm").onsubmit = async (e) => {
     // create, flip to work, turn on the reviewer's ear, then find lurkStyle.
     // As a preset it is one checkbox — configured after creation so the room
     // exists to configure, and reported rather than silently half-applied.
-    if (asReview && seats.length === 2) {
+    const reviewerId = typeof seats[1] === "string" ? seats[1] : (seats[1] || {}).id;
+    if (asReview && seats.length === 2 && reviewerId) {
       try {
         await api("/api/config", {
           room: name,
-          config: { mode: "work", agents: { [seats[1]]: { lurk: true, lurkStyle: "balanced" } } },
+          config: { mode: "work", agents: { [reviewerId]: { lurk: true, lurkStyle: "balanced" } } },
         });
       } catch (err) { toast(`Room created, but the review preset didn't apply: ${err.message}`, true); }
     }
     $("newRoomInput").value = "";
+    $("seat1Name").value = ""; $("seat2Name").value = "";
     $("newRoomReviewChk").checked = false;
     $("newRoomForm").style.display = "none";
     clearNewRoomProject();

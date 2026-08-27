@@ -116,6 +116,8 @@ The id defaults to the provider name, which is why every room created before the
 
 Seat names are lowercase letters, numbers and dashes, up to 20 characters, and cannot be `both`, `user`, `system`, `all` or `none` — those would collide with routing or with Parley's own voices in the transcript.
 
+In the **+** form, picking the same provider in both dropdowns reveals a pair of name fields, prefilled `claude` / `claude2`; type over them to get `@opus` and `@sonnet`. A seat whose name differs from its provider labels itself by that name, and the second seat on a provider is given a shifted colour, so the two are told apart at a glance in pills, avatars and receipt dots.
+
 ```jsonc
 "agents": {
   "alpha": { "provider": "claude", "model": "opus", ... },

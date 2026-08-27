@@ -1804,6 +1804,10 @@ async function main() {
   // An auto-composed "Continue responding to this message." must be visibly an
   // ask, not something the user appears to have typed — the quote header and
   // the badge are the whole of that evidence.
+  // In a room with two Claude seats, labelling both "Claude" would make the
+  // pills, dots and quote headers indistinguishable.
+  ok("a seat whose name differs from its provider labels itself by name",
+    page.includes("if (meta.provider && meta.provider !== a) return titleCaseSeat(a);"));
   ok("an ask bubble is marked as one, and says which message it is about",
     page.includes('quoteRefHTML(refFromN(e.meta.askFrom.sourceN), "↪ asking about")') &&
     page.includes("· ↪ redirect") && page.includes("· ↪ ask again"));
@@ -6574,6 +6578,22 @@ async function main() {
     twinRoom.room.cfg.agents.alpha.provider === "claude" &&
     twinRoom.room.cfg.agents.beta.provider === "claude",
     JSON.stringify(twinRoom.room.cfg.agents));
+  // The sidebar reads the listing, not the open room's summary — it used to
+  // filter seat keys against the provider registry, so a renamed seat was
+  // dropped and every such room showed the default pair instead.
+  const listedTwins = (await api("GET", "/api/rooms")).data.rooms.find((r) => r.name === "twins");
+  ok("the room listing reports renamed seats rather than falling back to the defaults",
+    listedTwins && JSON.stringify(listedTwins.seats) === JSON.stringify(["alpha", "beta"]) &&
+    listedTwins.providers.alpha === "claude" && listedTwins.providers.beta === "claude",
+    JSON.stringify(listedTwins));
+  // Colour is what the receipt dots, avatars and busy pills are keyed on, so
+  // two seats sharing a provider must not share a colour.
+  ok("two seats on one provider are given different colours",
+    twinRoom.room.seatInfo.alpha.color !== twinRoom.room.seatInfo.beta.color,
+    JSON.stringify([twinRoom.room.seatInfo.alpha.color, twinRoom.room.seatInfo.beta.color]));
+  ok("…while an ordinary two-provider room keeps each provider's own colour",
+    (await room("default")).room.seatInfo.claude.color === "#e8845c" &&
+    (await room("default")).room.seatInfo.codex.color === "#2fd6a8");
   ok("…with the provider's own look and settings resolved per seat",
     twinRoom.room.seatInfo.alpha.provider === "claude" &&
     twinRoom.room.seatInfo.alpha.label === "Claude" &&

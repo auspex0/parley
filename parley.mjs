@@ -401,13 +401,41 @@ function providerCatalog() {
 // The same catalog, resolved per seat, so a seat can be called anything and the
 // UI still knows which CLI's label, colour, avatar and settings fields to draw.
 // Deliberately not memoized: it has to follow config edits.
+// Two seats on one provider would otherwise share a colour, and the colour is
+// what the receipt dots, avatars and busy pills are keyed on — so the second one
+// is shifted far enough around the wheel to read as a different seat at a
+// glance, while staying recognisably that provider's family.
+function shiftHue(hex, degrees) {
+  const m = /^#([0-9a-f]{6})$/i.exec(String(hex || ""));
+  if (!m) return hex;
+  const n = parseInt(m[1], 16);
+  let [r, g, b] = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map((v) => v / 255);
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+  const l = (max + min) / 2;
+  const sat = d === 0 ? 0 : d / (1 - Math.abs(2 * l - 1));
+  let h = 0;
+  if (d !== 0) {
+    h = max === r ? ((g - b) / d) % 6 : max === g ? (b - r) / d + 2 : (r - g) / d + 4;
+    h *= 60;
+  }
+  h = (h + degrees + 360) % 360;
+  const c = (1 - Math.abs(2 * l - 1)) * sat, x = c * (1 - Math.abs(((h / 60) % 2) - 1)), mm = l - c / 2;
+  const seg = Math.floor(h / 60) % 6;
+  const rgb = [[c, x, 0], [x, c, 0], [0, c, x], [0, x, c], [x, 0, c], [c, 0, x]][seg];
+  return "#" + rgb.map((v) => Math.round((v + mm) * 255).toString(16).padStart(2, "0")).join("");
+}
+
 function seatCatalog(room) {
   const cat = providerCatalog();
+  const seen = new Map();
   return Object.fromEntries(seatIds(room).map((id) => {
     const pid = providerIdOf(room, id);
     const caps = (PROVIDERS[pid] || {}).capabilities || {};
+    const nth = seen.get(pid) || 0;
+    seen.set(pid, nth + 1);
     return [id, {
       ...cat[pid],
+      color: nth === 0 ? cat[pid].color : shiftHue(cat[pid].color, 150),
       provider: pid,
       sessions: caps.sessions || "resume",
       // Which field, if any, holds this seat's permission choice, and which of
@@ -6584,12 +6612,19 @@ function roomsWithModes() {
     try {
       const open = rooms.get(n);
       const cfg = open ? open.cfg : readJSON(path.join(ROOT, n, "room.json"));
-      const seats = Object.keys(cfg.agents || {}).filter((k) => PROVIDERS[k]);
+      // Resolvability, not "the key is a provider name": a seat named `opus`
+      // running Claude is a real seat, and filtering on the key dropped it and
+      // fell back to the default pair — so the sidebar showed the wrong two
+      // avatars for every room whose seats had been named.
+      const seats = Object.keys(cfg.agents || {}).filter((k) => providerIdFor(cfg.agents[k], k));
       return {
         name: n,
         mode: cfg.mode || "talk",
         linked: !!cfg.projectDir,
         seats: seats.length ? seats : [...DEFAULT_SEATS],
+        // The sidebar draws a seat avatar per room, and it has no summary to
+        // resolve a renamed seat against.
+        providers: Object.fromEntries(seats.map((k) => [k, providerIdFor(cfg.agents[k], k)])),
       };
     } catch { return { name: n, mode: "talk", linked: false, seats: [...DEFAULT_SEATS] }; }
   });
