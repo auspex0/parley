@@ -750,6 +750,12 @@
         <input type="checkbox" id="newRoomReviewChk" style="margin-top:2px">
         <span>Pair review room — seat 1 codes, seat 2 lurks and reviews every change</span>
       </label>
+      <!-- A real submit button, not decoration. Without one the form relied on
+           implicit submission, which the HTML spec only performs when there is
+           exactly one text field — so adding the seat-name inputs silently
+           stopped Enter from creating anything at all. -->
+      <button type="submit" id="newRoomCreate" class="btn primary"
+        style="width:100%;margin-top:8px;padding:6px 10px;font-size:12px">Create room</button>
     </form>
     <nav id="roomList"></nav>
     <div class="side-foot">

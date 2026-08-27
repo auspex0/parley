@@ -1804,6 +1804,16 @@ async function main() {
   // An auto-composed "Continue responding to this message." must be visibly an
   // ask, not something the user appears to have typed — the quote header and
   // the badge are the whole of that evidence.
+  // The new-room form has no submit button by default and relied on implicit
+  // submission, which the HTML spec only performs when the form has exactly one
+  // field that blocks it. Adding the seat-name inputs made three, and Enter
+  // silently stopped creating rooms at all. The button is the fix, and this
+  // pins it: any future field added to that form is harmless with it there.
+  const newRoomForm = (page.match(/<form id="newRoomForm">[\s\S]*?<\/form>/) || [""])[0];
+  ok("the new-room form has a real submit button, so Enter still creates a room",
+    /type="submit"/.test(newRoomForm),
+    newRoomForm.slice(0, 200));
+
   // In a room with two Claude seats, labelling both "Claude" would make the
   // pills, dots and quote headers indistinguishable.
   ok("a seat whose name differs from its provider labels itself by name",
