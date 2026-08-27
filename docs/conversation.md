@@ -29,17 +29,37 @@ While anything is running you can always see **what each agent is answering**: a
 
 ### The queue
 
-The **⏳ queued** badge opens the queue itself. One card per *dispatch* — the batch of deliveries one send created — showing which agents are responding and which are waiting, with their positions; clicking a card jumps to the message that produced it. Its ✕ cancels everything that dispatch still has waiting without touching anything already running, and "Cancel all queued" is there for the blunt version.
+The **⏳ queued** badge opens the queue itself. One card per *dispatch* — the batch of deliveries one send created — showing which agents are responding and which are waiting, with their positions; clicking a card jumps to the message that produced it. Its ✕ discards everything that dispatch still has waiting without touching anything already running, and "Discard all queued" is there for the blunt version.
 
-### Cancelling — withdrawal, not deletion
+### Holding the queue ⏸
 
-Cancelling withdraws the *delivery*, not the durable room record: the message was accepted the moment you sent it and remains part of the room's history, but the withdrawn seat receives none of its content. From then on Parley stops putting it in front of the agent it was withdrawn from — not in that turn's prompt, not in any later one, not in the history replayed after a session reset, and not as a native image or staged file. That agent is told only that a message was sent and cancelled; an agent that *did* receive it keeps it in full and is told who missed it. Stop everything drops the queue on the same terms. If a later retry of that turn re-delivers the message, its withheld markers are cleared — the seat then receives it in full, and later deltas stop describing it as withheld.
+**Pause** holds the queue without dropping any of it. Nothing new starts, responses already running finish normally, and the queue keeps its exact contents and order — the badge switches to **⏸ held** and cards read "held #2" rather than "queued #2". Anything you send while it is held joins the queue too, so pause-then-compose works: line up three messages, read what came back, then release them. **Resume** starts everything whose seat is free, in order.
+
+The hold is about *your* work, not the agents'. Hops, a live lurker's right of reply and causal answers between the agents are unaffected — a paused delivery stops competing for the seat, so an agent follow-up is not left waiting on a seat nobody is going to claim. A lurk catch-up owed to a held seat becomes a persisted obligation that runs on resume, exactly as it would behind a busy seat.
+
+Pause is deliberately not saved across a restart: there would be no queue behind it, and it would silently swallow the first thing you sent. It is also armed rather than counted — pausing an empty queue is allowed and holds whatever you send next, which is why the badge stays visible saying so.
+
+### Discarding — withdrawal, not deletion
+
+Discarding withdraws the *delivery*, not the durable room record: the message was accepted the moment you sent it and remains part of the room's history, but the withdrawn seat receives none of its content. The message keeps its place in the thread, dims, and grows a **Discarded before delivery · Retry** line — that Retry re-delivers it to the seat that missed it, at the tail of that seat's lane, so it cannot overtake anything you sent since. From then on Parley stops putting it in front of the agent it was withdrawn from — not in that turn's prompt, not in any later one, not in the history replayed after a session reset, and not as a native image or staged file. That agent is told only that a message was sent and cancelled; an agent that *did* receive it keeps it in full and is told who missed it. Stop everything drops the queue on the same terms. If a later retry of that turn re-delivers the message, its withheld markers are cleared — the seat then receives it in full, and later deltas stop describing it as withheld.
 
 This is about what Parley sends, not a secrecy guarantee. The message is still in `transcript.md`, and every agent is told where that file is — a work-mode agent that goes looking can read it, exactly as it can read anything else in the room. Per-seat transcript privacy would be a different feature; if you need a message to be unreadable rather than undelivered, start a fresh conversation.
+
+### Ask again and Redirect ↪
+
+Every message carries a **↪** that asks about *that* message. Pick a seat, optionally type an instruction, and choose what to do with it. With the seat free there is one action, **Ask now**. With it busy there are two that genuinely differ: **Queue after current**, which waits its ordinary turn and leaves everything already queued in place, and **Stop current & ask now**, which ends the response on screen and puts your message next.
+
+Leaving the instruction empty is **Ask again** — the message reads "Continue responding to this message." rather than being blank, so a transcript read months later still shows what happened. Either way the result is a real user message with a **↪ asking about** header pointing at the message it came from; nothing is silently attributed to you that you did not cause.
+
+The quoted message is restaged into that turn's prompt, so the seat can answer even if the message is far back in its context — or gone entirely after a session reset. A message that was discarded for that seat stays discarded: it sees the reference and your instruction, never the withheld body.
+
+**Stop current & ask now is one request, not two.** A Stop click followed by a Send leaves a gap in which the killed response finishes and the queue starts something else. Here the stop is pinned to the response you were actually looking at, and the redirect is placed in the same tick — so the stopped reply's last words are always ordered before your redirect, and the follow-ups it would have triggered are cancelled with it. Work you queued earlier is not flushed; it simply waits behind the redirect, and its card says **↪ next** so the reordering is visible rather than mysterious. If the response finished between your click and the request landing, nothing is killed and your message is next in line.
 
 ### Stop is four intentions, not one button
 
 **Stop** is four separate intentions rather than one button and a guess: stop a named agent's current response, stop the current responses but keep queued work, cancel the queue but let the running responses finish, or stop everything — responses, pair cycle, hops, lurkers and queue. Each click names the response it meant, so a click that lands after that response has already ended does nothing rather than killing the next one, and it never reports an error you would answer by clicking again.
+
+**The ■ button acts; the ▾ beside it chooses.** When one seat is replying and nothing is queued — the ordinary case — ■ stops that response on the first click, and the follow-ups it would have triggered stop with it. It widens only when a single click genuinely cannot answer the question: two seats running, work still queued, or a pair cycle in flight all open the chooser instead. The ▾ opens that same chooser whenever you want it, which is where per-seat stops live. An open menu is a snapshot: rows never reorder under your cursor, and work that finishes while you are aiming goes grey in place rather than vanishing.
 
 Each reply shows its **output tokens** (and Codex's reasoning tokens) in the message meta — flip the reasoning-effort setting and watch the numbers move; that's ground truth from the CLI, not model self-reporting.
 
@@ -61,8 +81,15 @@ Under every message, one dot per other participant shows how they experienced it
 - **outlined** — caught up later via the delta (tooltip says at which turn)
 - **dim outline** — hasn't seen it yet
 - **red outline** — you cancelled that delivery before the agent saw it
+- **amber outline** — the agent *did* receive it and you stopped its response part-way
 
-Powered by an audience snapshot stamped on each user message, append-only delivery receipts in `events.jsonl`, and persisted per-seat withdrawal, catch-up, causal-answer and terminal-outcome state. The dot reflects the latest truth: a later successful delivery supersedes an earlier queued or failed lurk, while cap and terminal copy distinguish a deliberate stop from an answer still owed.
+Powered by an audience snapshot stamped on each user message, append-only delivery receipts in `events.jsonl`, and persisted per-seat withdrawal, interruption, catch-up, causal-answer and terminal-outcome state. The dot reflects the latest truth: a later successful delivery supersedes an earlier queued or failed lurk, while cap and terminal copy distinguish a deliberate stop from an answer still owed.
+
+Red and amber are the two halves of the same fact, and both outrank every receipt. Red says the agent never saw the message; amber says it saw it and you cut the answer short. Neither resolves on its own — every later turn carries the message in context, so nothing but that same seat completing a run rooted in that same message clears it. Retry, Wake & deliver and a fresh explicit ask all count; an unrelated later exchange does not.
+
+### A message says what happened to it
+
+A message whose delivery you cancelled, or whose response you stopped, keeps its place in the thread and stays the quote and jump target — the record does not move or disappear. It dims, and grows a small per-seat status line underneath: **Cancelled before delivery**, **Delivered to Claude · Cancelled for Codex**, **Response stopped before it finished**. The old floating cancellation pill is gone from the timeline; the record itself is unchanged and still reaches the agents and `transcript.md`, it just no longer explains itself from somewhere further down the page.
 
 ## Lurk mode 👂
 
@@ -115,6 +142,8 @@ Mentions inside fenced code, inline code and blockquotes are examples, not routi
 The server, not the model, owns the counter. `hopBudget` is snapshotted when each user message is accepted, and charged usage is persisted against that user-message root. Wake & deliver and Retry therefore resume the root's already-spent count and remaining budget instead of minting a fresh allowance. The bounded execution-history map retains the newest 200 inactive roots with charged usage, plus any older root that is still active, held or retryable, so state stays bounded without erasing an unresolved exchange's cap:
 
 - **`-1` / `∞`** — follow up until the exchange settles, still fenced by the emergency safety stop.
+
+A new room starts at **3** rather than ∞. One charged hop can mean two provider calls, so an unlimited default let a first cross-tagged exchange spend a dozen before anyone had a feel for what a hop costs; ∞ is one click away in the composer control and in Settings, and rooms created before this keep whatever they had.
 - **`0`** — launch no charged requests; structural requests and answers already owed still run.
 - **positive integer** — launch at most that many charged requests. Settings accepts any safe whole number; the compact composer control offers quick values through `8`.
 

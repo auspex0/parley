@@ -1,5 +1,13 @@
 # Planned work and implementation record
 
+> **Status, 2026-08-27.** Packages 2, 3, 4 and 5 shipped on the
+> `audit-remediation` branch, together with the crash-proofing, streaming and
+> release-hygiene work from the codebase audit, seat/provider decoupling plus a
+> Gemini adapter, and an accessibility pass. Package 7's image paste and
+> chip-follow items shipped earlier and the entries below are stale. Package 8's
+> module boundaries remain open; the only item from the audit's plan not built
+> is the just-in-time permission bridge (see the note at the end of Package 9).
+
 Everything here was settled or recorded in room conversation between 2026-08-06 and
 2026-08-10. It is written down because the design lives across hundreds of chat messages
 and a bounded recovery excerpt does not survive a session reset. Packages still carrying
@@ -133,7 +141,7 @@ room eats a 429.
 
 ---
 
-## Package 2 — Chronological message status (settled, 2026-08-06)
+## Package 2 — Chronological message status (SHIPPED 2026-08-27)
 
 Today a cancelled text message's bubble vanishes and is replaced by floating system
 pills; image messages keep their bubble, so the two behave differently. The record model
@@ -161,7 +169,7 @@ is: **the message is permanent; its delivery state is changeable.**
 
 ---
 
-## Package 3 — Queue pause / resume / discard / retry (settled, 2026-08-06)
+## Package 3 — Queue pause / resume / discard / retry (SHIPPED 2026-08-27)
 
 - **Global Pause/Resume for pending user deliveries only.** The drain loop checks a
   `queuePaused` flag; in-flight responses finish; nothing is lost. It does not freeze
@@ -192,7 +200,7 @@ received the message.
 
 ---
 
-## Package 4 — Ask again and Redirect (settled, 2026-08-06)
+## Package 4 — Ask again and Redirect (SHIPPED 2026-08-27)
 
 `↪ Ask…` on any user *or* agent message. If the target is idle it dispatches; if busy,
 offer **Queue after current** or **Stop current & ask now**.
@@ -230,7 +238,7 @@ Rules:
 
 ---
 
-## Package 5 — Stop-button semantics (settled, 2026-08-07)
+## Package 5 — Stop-button semantics (SHIPPED 2026-08-27)
 
 Not a correctness bug — the user's own verdict was *"un-granular behavior, not urgent"* —
 but it is decided and it is two clicks on the highest-frequency action in the app.
@@ -644,3 +652,26 @@ If stage 2 or the remaining stage-3 UI work grows, the completed built slices ca
 ship as `1.1.0` and the rest move to `1.2.0`. Nothing in Packages 3–5 or 7 needs to change
 for the shipped Packages 1, 6, 10 and 11 to stand on their own. Package 12 is a later
 relay/lurk extension and does not gate that shipped slice.
+
+
+## Package 13 — Just-in-time permission approval (agreed, unspecced)
+
+**Problem.** Work rooms force a standing grant: a seat runs under one permission
+mode chosen at launch, so an action outside it is auto-denied mid-turn with no
+way to approve it. The only lever is widening the standing grant, which
+permissions.md correctly calls host-level trust. Just-in-time approval would let
+the conservative default hold while still allowing the occasional write.
+
+**Why it is not built yet.** Each provider exposes a different mechanism —
+Claude Code wants an MCP tool named through `--permission-prompt-tool`, Gemini
+has policy files, Codex has an approval policy — so the honest version means
+Parley hosting an MCP server, which is real surface area for a zero-dependency
+two-file app. More decisively, none of it can be exercised by the fake CLI: the
+harness has no notion of a permission prompt, so the whole path would ship
+untested against a protocol only the real CLIs speak. That is the same class of
+risk the fake-CLI contract job in Package 8 exists to address, and this should
+wait for it.
+
+**Shape when picked up.** A `permissionRequests` capability per provider, an
+in-chat approve/deny entry kind that blocks the turn, and a fake-CLI directive
+that can request permission so the flow is testable before it is trusted.

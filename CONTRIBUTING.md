@@ -23,7 +23,7 @@ fake agent CLI ([test/fake-cli.mjs](test/fake-cli.mjs)) that speaks both wire
 protocols. So it exercises routing, the delta protocol, session resume, per-seat
 flags, lurk and right of reply, hops, pair sessions, per-agent lanes, queueing,
 work mode and activity lines — **without a provider login and without spending a
-token.** CI runs it on Linux and Windows.
+token.** CI runs it on Linux, Windows and macOS, across Node 20, 22 and 24.
 
 The fake is driven by directives in the prompt, which makes new tests short to
 write. Common directives include `SAY:`, `RECALL`, `ARGS`, `TAG:`, `WRITE:`,

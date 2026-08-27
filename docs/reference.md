@@ -5,14 +5,16 @@ Rooms, configuration, attachments, slash commands and housekeeping.
 ## CLI flags
 
 ```
-parley [--port N] [--root DIR] [--no-open]
+parley [--port N] [--root DIR] [--no-open] [--version] [--help]
 ```
 
-- `--port N` — default `4141`, auto-increments if taken.
+- `--port N` — default `4141`, auto-increments if taken (up to 20 tries). `--port 0` asks the OS for any free port.
 - `--root DIR` — where room folders live, default `~/.parley`.
 - `--no-open` — don't launch a browser.
+- `--version`, `-v` — print the version and exit.
+- `--help`, `-h` — print usage and exit.
 
-After updating, restart the running Parley process before reloading the page — builds pin the UI to the backend that served it, and an older server meeting a newer page blocks its controls and shows a persistent **Restart Parley** warning instead of silently mixing runtime versions. The current source uses internal runtime protocol **9**, covering generalized causal-attention and relay-cap state plus recovered Wake/Retry integration. That number is a stale-tab compatibility fence, not Parley's package version or a public API version.
+After updating, restart the running Parley process before reloading the page — builds pin the UI to the backend that served it, and an older server meeting a newer page blocks its controls and shows a persistent **Restart Parley** warning instead of silently mixing runtime versions. The current source uses internal runtime protocol **10**, covering generalized causal-attention and relay-cap state, recovered Wake/Retry integration, and incremental reply streaming. That number is a stale-tab compatibility fence, not Parley's package version or a public API version.
 
 ## The room folder
 
@@ -35,8 +37,8 @@ workspace/       shared folder; both agent CLIs run with this as cwd
   "pairRounds": 0,
   "timeoutMs": 900000,
   "agents": {
-    "claude": { "command": "claude", "model": null, "permissionMode": "auto", "extraArgs": [] },
-    "codex":  { "command": "codex",  "model": null, "sandbox": "read-only", "extraArgs": [] }
+    "claude": { "provider": "claude", "command": "claude", "model": null, "permissionMode": "auto", "extraArgs": [] },
+    "codex":  { "provider": "codex",  "command": "codex",  "model": null, "sandbox": "read-only", "extraArgs": [] }
   }
 }
 ```
@@ -46,11 +48,12 @@ workspace/       shared folder; both agent CLIs run with this as cwd
 - **`lurk`** / **`lurkStyle`** / **`lurkPrompt`** — see [conversation.md](conversation.md#lurk-mode-).
 - **`hopBudget`** controls **charged request launches** per user message: `-1` means until settled (with the emergency safety stop), `0` means no charged launches, and any positive integer is an exact limit. Explicit agent calls and continuations spoken from a returned answer are charged; safe-boundary `@both` sibling delivery and a live lurker's right of reply are structural and do not consume the counter. Every launched request that produces an answer also earns one free, read-only return to its immediate caller, so one counted hop can mean up to two provider invocations. Charged usage is durable per user-message root: Wake & deliver and Retry resume the already-spent count, while `state.json` keeps the newest 200 inactive charged roots plus any older root that is still active, held or retryable. Rooms written with the legacy `maxHops` key are migrated on load; its old `0 = until settled` becomes `hopBudget: -1`. Settings accepts any safe whole number; the sticky per-room composer shortcut deliberately offers only quick overrides through `8` without editing `room.json`. See [Agent-to-agent hops & right of reply](conversation.md#agent-to-agent-hops--right-of-reply) for the full scheduler.
 - **`pairRounds`** is separate from `hopBudget`: `0` means review until approved, while a positive value caps Pair fix/review rounds.
-- **`permissionMode`** (Claude) and **`sandbox`** (Codex) — see [permissions.md](permissions.md).
+- **`permissionMode`** (Claude), **`sandbox`** (Codex) and **`approvalMode`** (Gemini) — see [permissions.md](permissions.md).
+- **`provider`** names the CLI that drives the seat (`claude`, `codex`, `gemini`). It defaults to the seat's own name and is fixed once the room exists — changing it by hand orphans that seat's session.
 
 ## Rooms and seats
 
-A room seats **exactly two agents**, chosen when you create it (the "+" form is pre-filled with Claude + Codex — change either dropdown if you want a different pair). Seats are fixed for the room's lifetime; pills, chips, @mentions, colors and settings all follow the chosen pair. Existing rooms just work — no migration. A room's two seats must be different providers.
+A room seats **exactly two agents**, chosen when you create it (the "+" form is pre-filled with Claude + Codex — change either dropdown if you want a different pair). Seats are fixed for the room's lifetime; pills, chips, @mentions, colors and settings all follow the chosen pair. Existing rooms just work — no migration. The two seats need different *names*, but they may run the same provider: see [Seats and providers](#seats-and-providers).
 
 ### Linked project folders 📁
 
@@ -104,6 +107,23 @@ The hops control beside the composer is a sticky per-room browser-session shortc
 **Wake & deliver and Retry reuse the original user entry, its relay-policy snapshot and its durable charged-use count.** The recovery attempt rejoins the same protocol-9 causal scheduler as live work with the original root's remaining budget; it does not reset the cap. A successful recovered `@both` half structurally reaches only a sibling with a successful direct reply to that exact root; a cursor advanced by unrelated work cannot resurrect a failed or stopped half. A recovered single-seat attempt honors enabled lurk after it settles even if the addressed provider failed, passed or produced no bubble, and a busy listener receives a persisted catch-up obligation carrying that root explicitly. Explicit Stop ends the chain and records the terminal disposition instead of launching lurk. **Wake only** launches nothing and therefore creates none of these relay obligations.
 
 Causal settlement is serialized per original root, so overlapping live/recovered `@both` halves cannot miss one another or double-spend. Explicit recovered-root catch-up obligations are versioned, which prevents an older in-flight attempt from erasing a newer attempt for the same user message.
+
+## Seats and providers
+
+A room has two **seats**. A seat's **id** is its @mention name, its key in `room.json` and `state.json`, and the author on every transcript line and receipt — it is the primary key of everything durable in the room, so it is fixed for the room's life. Its **provider** (`agents.<id>.provider`) says which CLI drives it.
+
+The id defaults to the provider name, which is why every room created before the two were separate keeps working: it gains one field and renames nothing. Two seats may share a provider as long as their names differ, so a Claude-vs-Claude room (say `alpha` and `beta`, one on Opus and one on Sonnet) is an ordinary room.
+
+Seat names are lowercase letters, numbers and dashes, up to 20 characters, and cannot be `both`, `user`, `system`, `all` or `none` — those would collide with routing or with Parley's own voices in the transcript.
+
+In the **+** form, picking the same provider in both dropdowns reveals a pair of name fields, prefilled `claude` / `claude2`; type over them to get `@opus` and `@sonnet`. A seat whose name differs from its provider labels itself by that name, and the second seat on a provider is given a shifted colour, so the two are told apart at a glance in pills, avatars and receipt dots.
+
+```jsonc
+"agents": {
+  "alpha": { "provider": "claude", "model": "opus", ... },
+  "beta":  { "provider": "claude", "model": "sonnet", ... }
+}
+```
 
 ## Adding a provider
 

@@ -17,13 +17,54 @@
     --border2: rgba(255,255,255,.12);
     --text: #dee3ec;
     --text-dim: #8b93a5;
-    --text-faint: #5c6374;
+    /* Was #5c6374, about 3.2:1 on the page background — under AA for the
+       11-12px text this token is actually used for. */
+    --text-faint: #79808f;
     --user: #7aa2f7;
     --claude: #e8845c;
     --codex: #2fd6a8;
     --danger: #f26d6d;
+    /* Already the busy-pill amber; naming it keeps the palette the same size. */
+    --warn: #ffd479;
+    /* Text that sits ON an accent fill (a chip, the send button) rather than on
+       the page. It was the page background repeated as a literal in five
+       places, which is exactly what made a light theme impossible. */
+    --on-accent: #0b0e14;
+    --code-bg: #0a0d12;
+    --danger-fg: #ffb4b4;
+    --danger-wash: rgba(235,75,90,.14);
+    --danger-edge: rgba(235,75,90,.5);
+    --warn-wash: rgba(255,212,121,.10);
+    --warn-edge: rgba(255,212,121,.35);
     --radius: 14px;
     --mono: ui-monospace, "Cascadia Code", Consolas, "SF Mono", monospace;
+  }
+  /* Parley was dark-only, so anyone on a light desktop got an uninvited dark
+     app. Only the tokens change; every rule below is written against them. */
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f7f8fa;
+      --bg2: #eef1f5;
+      --panel: #ffffff;
+      --panel2: #f2f4f8;
+      --border: rgba(16,20,28,.10);
+      --border2: rgba(16,20,28,.17);
+      --text: #1b2130;
+      --text-dim: #5a6376;
+      --text-faint: #5f6879;
+      --user: #2f6fd0;
+      --claude: #b8502a;
+      --codex: #0f8f6a;
+      --danger: #c22f3f;
+      --warn: #9a6b13;
+      --on-accent: #ffffff;
+      --code-bg: #f4f6fa;
+      --danger-fg: #8c1f2c;
+      --danger-wash: rgba(194,47,63,.10);
+      --danger-edge: rgba(194,47,63,.35);
+      --warn-wash: rgba(154,107,19,.10);
+      --warn-edge: rgba(154,107,19,.32);
+    }
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; }
@@ -59,8 +100,13 @@
   .side-label button:hover { background: var(--panel2); color: var(--text); }
   #roomList { overflow-y: auto; flex: 1; padding: 0 10px; }
   .room-item {
-    display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
-    padding: 8px 10px; border-radius: 9px; color: var(--text-dim); margin-bottom: 2px;
+    display: flex; align-items: center; gap: 4px; width: 100%; text-align: left;
+    padding: 0 6px 0 0; border-radius: 9px; color: var(--text-dim); margin-bottom: 2px;
+  }
+  /* The row is a container; this is the part that opens the room. */
+  .room-item .ropen {
+    display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0;
+    padding: 8px 4px 8px 10px; color: inherit; border-radius: 9px 0 0 9px;
   }
   .room-item:hover { background: var(--panel); color: var(--text); }
   .room-item.active { background: var(--panel2); color: var(--text); }
@@ -70,7 +116,7 @@
   .room-item .rmeta { display: flex; gap: 3px; align-items: center; flex-shrink: 0; }
   .room-item .racts { display: none; gap: 1px; flex-shrink: 0; }
   .room-item:hover .rmeta { display: none; }
-  .room-item:hover .racts { display: flex; }
+  .room-item:hover .racts, .room-item:focus-within .racts { display: flex; }
   .room-item .ract { padding: 1px 4px; border-radius: 5px; color: var(--text-faint); font-size: 12px; line-height: 1.2; cursor: pointer; }
   .room-item .ract:hover { color: var(--text); background: var(--panel2); }
   .room-item .ract.del:hover { color: var(--danger); }
@@ -116,7 +162,7 @@
   .pill.claude b { color: var(--claude); font-weight: 600; }
   .pill.codex b { color: var(--codex); font-weight: 600; }
   .pill.linked .st { background: var(--user); }
-  .pill.busy .st { background: #ffd479; animation: pulse 1s infinite; }
+  .pill.busy .st { background: var(--warn); animation: pulse 1s infinite; }
   .hdot.withheld { background: none; border: 1px solid var(--danger); opacity: .75; position: relative; }
   .pill.bad .st { background: var(--danger); }
   .pill .ear, .pill .moon { font-size: 13px; line-height: 1; padding: 0 1px; opacity: .25; filter: grayscale(1); transition: opacity .15s, filter .15s; }
@@ -171,7 +217,7 @@
   .msg.user .who { color: var(--user); }
   .avatar {
     width: 22px; height: 22px; border-radius: 7px; display: inline-flex; align-items: center; justify-content: center;
-    font-size: 12px; font-weight: 700; color: #0b0e14;
+    font-size: 12px; font-weight: 700; color: var(--on-accent);
   }
   .msg.claude .avatar { background: var(--claude); }
   .msg.codex .avatar { background: var(--codex); }
@@ -231,12 +277,19 @@
   .bubble th:last-child, .bubble td:last-child { border-right: 0; }
   .bubble th.align-center, .bubble td.align-center { text-align: center; }
   .bubble th.align-right, .bubble td.align-right { text-align: right; }
-  .codeblock { position: relative; margin: 10px 0; border: 1px solid var(--border2); border-radius: 10px; background: #0a0d12; overflow: hidden; }
+  .codeblock { position: relative; margin: 10px 0; border: 1px solid var(--border2); border-radius: 10px; background: var(--code-bg); overflow: hidden; }
   .codeblock .cb-head { display: flex; justify-content: space-between; align-items: center; padding: 5px 12px; font-size: 11.5px; color: var(--text-faint); border-bottom: 1px solid var(--border); }
   .codeblock .cb-copy { font-size: 11.5px; color: var(--text-dim); padding: 2px 8px; border-radius: 6px; }
   .codeblock .cb-copy:hover { background: var(--panel2); color: var(--text); }
   .codeblock pre { margin: 0; padding: 12px 14px; overflow-x: auto; }
   .codeblock code { background: none; padding: 0; font-size: 13px; line-height: 1.5; }
+  /* Highlighting reuses the palette rather than introducing a theme of its
+     own, so it follows light and dark with everything else. */
+  .tok-com { color: var(--text-faint); font-style: italic; }
+  .tok-str { color: var(--codex); }
+  .tok-kw  { color: var(--user); }
+  .tok-lit { color: var(--claude); }
+  .tok-num { color: var(--claude); }
 
   .sysmsg { align-self: center; text-align: center; max-width: 85%; font-size: 12.8px; color: var(--text-dim);
     background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 7px 14px; animation: rise .18s ease-out; }
@@ -256,6 +309,14 @@
   @media (prefers-reduced-motion: reduce) {
     .msg, .activity, .sysmsg, .whisper { animation: none; }
     #chatWrap { scroll-behavior: auto; }
+    /* The entrance animations were stopped here, but the infinite ones kept
+       running: pulsing dots and a blinking caret are exactly what someone who
+       asked for less motion is asking to be rid of. A static dimmed state
+       carries the same meaning. */
+    .caret, .hdot.pending, .pill.busy .st, .qp-row.running .bs-dot, #jump.flash {
+      animation: none !important;
+    }
+    .thinking-dots i { animation: none !important; opacity: .6; }
   }
 
   /* who-heard-this receipt dots */
@@ -268,10 +329,31 @@
   .hdot.late { border: 1.5px solid var(--hc); opacity: .75; }
   .hdot.unheard { border: 1.5px solid var(--text-faint); opacity: .35; }
   .hdot.pending { border: 1.5px solid var(--hc); opacity: .8; animation: pulse 1s infinite; }
+  .hdot.interrupted { background: none; border: 1.5px solid var(--warn); opacity: .9; }
 
-  .meta .cpy { opacity: 0; font-size: 11px; padding: 0 4px; transition: opacity .15s; }
-  .msg:hover .meta .cpy { opacity: .6; }
-  .meta .cpy:hover { opacity: 1 !important; }
+  /* Per-seat delivery status, inline and in chronological place. The message is
+     permanent; its delivery state is changeable — so it says what happened to
+     it here, rather than being explained by a pill floating somewhere below. */
+  .dstatus { display: flex; flex-wrap: wrap; gap: 6px; margin: 5px 8px 0; font-size: 12px; }
+  .dchip { border-radius: 999px; padding: 1px 8px; border: 1px solid var(--border2);
+    background: var(--panel); color: var(--text-dim); }
+  .dchip.cancelled { color: var(--danger); border-color: rgba(242,109,109,.35); }
+  .dchip.interrupted { color: var(--warn); border-color: rgba(255,212,121,.35); }
+  .dchip.delivered { color: var(--text-faint); }
+  .dretry { color: var(--user); font-weight: 600; font-size: 12px; padding: 1px 4px; }
+  .dretry:hover { text-decoration: underline; }
+  .dretry[disabled] { opacity: .5; text-decoration: none; }
+  /* Readable, not struck through: the text is still the record. */
+  .bubble.dimmed { opacity: .62; }
+
+  /* Day boundary in a long-lived room. */
+  .daysep { display: flex; align-items: center; gap: 10px; margin: 14px 4px 6px;
+    color: var(--text-faint); font-size: 11px; letter-spacing: .04em; text-transform: uppercase; }
+  .daysep::before, .daysep::after { content: ""; flex: 1; height: 1px; background: var(--border); }
+
+  .meta .cpy, .meta .ask { opacity: 0; font-size: 11px; padding: 0 4px; transition: opacity .15s; }
+  .msg:hover .meta .cpy, .msg:hover .meta .ask { opacity: .6; }
+  .meta .cpy:hover, .meta .ask:hover { opacity: 1 !important; }
   .bubble.collapsed { max-height: 300px; overflow: hidden;
     -webkit-mask-image: linear-gradient(#000 75%, transparent); mask-image: linear-gradient(#000 75%, transparent); }
   .showmore { align-self: flex-start; font-size: 12px; color: var(--user); margin: 4px 6px 0; }
@@ -305,7 +387,7 @@
   .chip:hover { color: var(--text); }
   .chip:disabled { opacity: .35; cursor: not-allowed; }
   .chip:disabled:hover { color: var(--text-dim); }
-  .chip.active { color: #0b0e14; font-weight: 600; }
+  .chip.active { color: var(--on-accent); font-weight: 600; }
   .chip.active[data-t="auto"] { background: var(--text-dim); border-color: var(--text-dim); }
   .chip.active[data-t="claude"] { background: var(--claude); border-color: var(--claude); }
   .chip.active[data-t="codex"] { background: var(--codex); border-color: var(--codex); }
@@ -383,10 +465,20 @@
   #sendBtn, #stopBtn {
     width: 38px; height: 38px; border-radius: 12px; display: flex; align-items: center; justify-content: center; flex-shrink: 0;
   }
-  #sendBtn { background: var(--user); color: #0b0e14; }
+  #sendBtn { background: var(--user); color: var(--on-accent); }
   #sendBtn:disabled { background: var(--panel2); color: var(--text-faint); cursor: default; }
-  #stopWrap { position: relative; display: none; flex-shrink: 0; }
-  #stopBtn { background: rgba(242,109,109,.15); color: var(--danger); border: 1px solid rgba(242,109,109,.4); }
+  #stopWrap { position: relative; display: none; flex-shrink: 0; align-items: center; }
+  #stopBtn { background: rgba(242,109,109,.15); color: var(--danger); border: 1px solid rgba(242,109,109,.4); border-radius: 12px 3px 3px 12px; }
+  /* The arrow is always there, so the deliberate scopes — seat-only above all —
+     never depend on the primary happening to be ambiguous. */
+  #stopMore {
+    width: 20px; height: 38px; flex-shrink: 0; font-size: 10px; margin-left: 2px;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: 3px 12px 12px 3px;
+    background: rgba(242,109,109,.15); color: var(--danger);
+    border: 1px solid rgba(242,109,109,.4);
+  }
+  #stopBtn:hover, #stopMore:hover, #stopWrap.open #stopMore { background: rgba(242,109,109,.28); }
   #stopMenu {
     position: absolute; right: 0; bottom: calc(100% + 7px); display: none; min-width: 170px;
     padding: 5px; background: var(--panel2); border: 1px solid var(--border2); border-radius: 11px;
@@ -398,6 +490,11 @@
   #stopMenu button.stop-all { color: var(--danger); border-top: 1px solid var(--border); border-radius: 0 0 7px 7px; margin-top: 4px; padding-top: 9px; }
   #stopMenu button.stop-scope { color: var(--text-dim); }
   #stopMenu button .sm-sub { display: block; font-size: 10.5px; opacity: .62; margin-top: 1px; }
+  /* A row whose work ended while the menu was open is disabled where it stands,
+     never removed: pulling it out moves the row the cursor was aiming at. */
+  #stopMenu button:disabled { opacity: .4; cursor: default; }
+  #stopMenu button:disabled:hover { background: transparent; color: var(--text-dim); }
+  #stopMenu button.stop-all:disabled:hover { color: var(--danger); }
 
   /* Wake menu. Waking a seat with messages held for it is a three-way choice —
      deliver, wake only, or cancel — which a native confirm() cannot express:
@@ -413,6 +510,25 @@
   #wakeMenu button { width: 100%; padding: 8px 10px; border-radius: 7px; text-align: left; color: var(--text-dim); }
   #wakeMenu button:hover { background: var(--panel); color: var(--text); }
   #wakeMenu button .sm-sub { display: block; font-size: 10.5px; opacity: .62; margin-top: 1px; }
+
+  /* Ask menu. Fixed like the wake menu and for the same reason: the message row
+     it would otherwise anchor into is rebuilt on every render, and an anchored
+     child would be thrown away mid-choice. */
+  #askMenu {
+    position: fixed; display: none; min-width: 260px; max-width: 320px;
+    padding: 7px; background: var(--panel2); border: 1px solid var(--border2); border-radius: 11px;
+    box-shadow: 0 8px 30px rgba(0,0,0,.5); z-index: 40;
+  }
+  #askMenu.open { display: block; }
+  #askMenu button { width: 100%; padding: 8px 10px; border-radius: 7px; text-align: left; color: var(--text-dim); }
+  #askMenu button:hover { background: var(--panel); color: var(--text); }
+  #askMenu button .sm-sub { display: block; font-size: 10.5px; opacity: .62; margin-top: 1px; }
+  #askMenu input { width: 100%; margin: 2px 0 6px; padding: 6px 8px; border-radius: 7px;
+    background: var(--panel); border: 1px solid var(--border); color: var(--text); font: inherit; }
+  #askMenu .ask-seats { display: flex; gap: 4px; margin-bottom: 6px; }
+  #askMenu .ask-seats button { width: auto; flex: 1; text-align: center; padding: 5px 8px;
+    font-size: 12px; border: 1px solid var(--border); }
+  #askMenu .ask-seats button.active { color: var(--text); border-color: var(--user); }
 
   /* quote header: what a reply is answering. Lives between .meta and .bubble
      so copying a message never picks up the quoted text. */
@@ -466,6 +582,11 @@
   .qp-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 3px 5px 7px; font-size: 11.5px; color: var(--text-faint); }
   .qp-head button { color: var(--danger); font-size: 11.5px; padding: 2px 6px; border-radius: 6px; }
   .qp-head button:hover { background: rgba(242,109,109,.14); }
+  .qp-actions { display: flex; align-items: center; gap: 4px; }
+  /* The hold is not a destructive action, so it does not wear the discard red. */
+  .qp-head .qp-pause { color: var(--text-dim); }
+  .qp-head .qp-pause:hover { background: var(--panel); color: var(--text); }
+  .qp-card.paused { border-style: dashed; opacity: .85; }
   .qp-card { padding: 7px 8px; border-radius: 9px; background: var(--panel); border: 1px solid var(--border); margin-bottom: 6px; }
   .qp-card:last-child { margin-bottom: 0; }
   .qp-top { display: flex; align-items: flex-start; gap: 6px; }
@@ -558,7 +679,7 @@
   .mrow { display: flex; gap: 10px; margin-top: 18px; justify-content: space-between; align-items: center; }
   .btn { padding: 8px 18px; border-radius: 10px; font-size: 14px; border: 1px solid var(--border2); color: var(--text-dim); }
   .btn:hover { color: var(--text); background: var(--panel); }
-  .btn.primary { background: var(--user); border-color: var(--user); color: #0b0e14; font-weight: 600; }
+  .btn.primary { background: var(--user); border-color: var(--user); color: var(--on-accent); font-weight: 600; }
   .btn.primary:hover { filter: brightness(1.1); }
   .btn.danger { color: var(--danger); border-color: rgba(242,109,109,.4); }
   .btn.danger:hover { background: rgba(242,109,109,.1); }
@@ -573,8 +694,21 @@
   #toast.show { transform: translateX(-50%) translateY(0); }
   #toast.err { border-color: rgba(242,109,109,.5); color: #f2a1a1; }
 
+  #navToggle { display: none; }
+  #navScrim { display: none; position: fixed; inset: 0; z-index: 55; background: rgba(0,0,0,.45); }
   @media (max-width: 760px) {
-    #sidebar { display: none; }
+    /* The sidebar slides over the chat rather than disappearing: without it
+       rooms, the workspace, the transcript and settings were all unreachable,
+       and the only way back to another room was editing ?room= by hand. */
+    #sidebar {
+      position: fixed; inset: 0 auto 0 0; z-index: 60; width: min(280px, 86vw);
+      transform: translateX(-102%); transition: transform .18s ease;
+      box-shadow: 0 0 40px rgba(0,0,0,.5);
+    }
+    body.nav-open #sidebar { transform: none; }
+    body.nav-open #navScrim { display: block; }
+    #navToggle { display: flex; }
+    header { flex-wrap: wrap; row-gap: 6px; }
     .msg { max-width: 92%; }
     #composerWrap { padding: 8px 10px 12px; }
     .chips { gap: 5px; }
@@ -589,6 +723,7 @@
 </head>
 <body>
 <div id="app">
+  <div id="navScrim" hidden></div>
   <aside id="sidebar">
     <div class="logo">
       <svg width="30" height="30" viewBox="0 0 32 32"><circle cx="16" cy="16" r="13" fill="none" stroke="#555c6b" stroke-width="2"/><circle cx="16" cy="7" r="4" fill="#7aa2f7"/><circle cx="8" cy="22" r="4" fill="#e8845c"/><circle cx="24" cy="22" r="4" fill="#2fd6a8"/></svg>
@@ -598,12 +733,29 @@
     <form id="newRoomForm">
       <input id="newRoomInput" placeholder="room name…" maxlength="40" spellcheck="false">
       <div style="display:flex;gap:6px;margin-top:6px">
-        <select id="seat1" title="Seat 1" style="flex:1"></select>
-        <select id="seat2" title="Seat 2" style="flex:1"></select>
+        <select id="seat1" title="Seat 1 provider" style="flex:1"></select>
+        <select id="seat2" title="Seat 2 provider" style="flex:1"></select>
+      </div>
+      <div id="seatNames" style="display:none;gap:6px;margin-top:6px">
+        <input id="seat1Name" maxlength="20" spellcheck="false" style="flex:1" aria-label="Seat 1 name">
+        <input id="seat2Name" maxlength="20" spellcheck="false" style="flex:1" aria-label="Seat 2 name">
+      </div>
+      <div id="seatNamesHint" class="hint" style="display:none;margin-top:4px">
+        Two seats on the same provider need different names — these become their @mentions.
       </div>
       <button type="button" id="newRoomProj" class="ract"
         style="display:block;width:100%;text-align:left;margin-top:6px;padding:4px 2px;font-size:11.5px;color:var(--text-faint)"
         title="Point this room at an existing project folder"><span data-picker-label>📁 Link a project folder…</span> <span id="newRoomProjVal"></span></button>
+      <label id="newRoomReview" style="display:flex;gap:6px;align-items:flex-start;margin-top:6px;font-size:11.5px;color:var(--text-faint);cursor:pointer">
+        <input type="checkbox" id="newRoomReviewChk" style="margin-top:2px">
+        <span>Pair review room — seat 1 codes, seat 2 lurks and reviews every change</span>
+      </label>
+      <!-- A real submit button, not decoration. Without one the form relied on
+           implicit submission, which the HTML spec only performs when there is
+           exactly one text field — so adding the seat-name inputs silently
+           stopped Enter from creating anything at all. -->
+      <button type="submit" id="newRoomCreate" class="btn primary"
+        style="width:100%;margin-top:8px;padding:6px 10px;font-size:12px">Create room</button>
     </form>
     <nav id="roomList"></nav>
     <div class="side-foot">
@@ -612,11 +764,13 @@
       <a id="dlTranscript" href="#"><span class="ico">📄</span> Download transcript</a>
       <button id="openRoomDir"><span class="ico">🗂️</span> Room folder</button>
       <button id="settingsBtn2"><span class="ico">⚙️</span> Settings</button>
+      <a href="https://github.com/auspex0/parley#readme" target="_blank" rel="noreferrer noopener"><span class="ico">?</span> Docs</a>
     </div>
   </aside>
 
   <div id="main">
     <header>
+      <button class="hbtn" id="navToggle" aria-label="Rooms" aria-expanded="false" title="Rooms">☰</button>
       <div id="connDot" title="connection"></div>
       <div id="roomTitle">default</div>
       <div id="modeToggle" title="Talk: conversational, conservative defaults; explicit seat permission overrides remain active. Work: agents can write files in the workspace and run commands.">
@@ -631,11 +785,12 @@
       <span id="pairBannerText"></span>
       <button id="pairEndBtn" style="margin-left:10px;color:#c9b3f5;text-decoration:underline;font-size:12.5px">End pair mode</button>
     </div>
-    <div id="runtimeBanner" role="alert" style="display:none;padding:8px 20px;font-size:12.5px;color:#ffb4b4;background:rgba(235,75,90,.14);border-bottom:1px solid rgba(235,75,90,.5)"></div>
+    <div id="runtimeBanner" role="alert" style="display:none;padding:8px 20px;font-size:12.5px;color:var(--danger-fg);background:var(--danger-wash);border-bottom:1px solid var(--danger-edge)"></div>
+    <div id="setupBanner" role="status" style="display:none;padding:8px 20px;font-size:12.5px;color:var(--warn);background:var(--warn-wash);border-bottom:1px solid var(--warn-edge)"></div>
     <div id="workBanner">🔨 <b>Work room</b> — agents can write files in the shared workspace and run commands. Their actions show as inline activity lines.</div>
 
     <div id="chatWrap">
-      <div id="chat"></div>
+      <div id="chat" role="log" aria-live="polite" aria-relevant="additions" aria-label="Conversation"></div>
       <div id="empty" style="display:none">
         <div class="big">🃏</div>
         <h2>The table is set</h2>
@@ -693,7 +848,9 @@
           <button id="attachBtn" type="button" title="Attach files" aria-label="Attach files">📎</button>
           <textarea id="input" rows="1" placeholder="Message the table…  (@claude, @codex, @both)"></textarea>
           <div id="stopWrap">
-            <button id="stopBtn" title="Stop the running response" aria-haspopup="menu" aria-expanded="false">■</button>
+            <button id="stopBtn" title="Stop the running response">■</button>
+            <button id="stopMore" title="Choose what to stop" aria-label="Stop options"
+                    aria-haspopup="menu" aria-expanded="false">▾</button>
             <div id="stopMenu" role="menu"></div>
           </div>
           <button id="sendBtn" title="Send (Enter)">➤</button>
@@ -705,14 +862,21 @@
 </div>
 
 <div id="wakeMenu" role="menu"></div>
+<div id="askMenu" role="menu"></div>
 
 <div id="overlay">
-  <div class="modal">
-    <h2>Room settings</h2>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+    <h2 id="settingsTitle">Room settings</h2>
     <div class="sub" id="roomPath"></div>
     <div class="mgrid" id="seatCards"></div>
     <div class="fld" style="margin-top:14px"><label>Room note (standing instruction both agents see on every turn — also /note)</label>
       <input id="s_roomnote" placeholder="e.g. We're building a YT-transcription app; keep answers short." spellcheck="false"></div>
+    <div class="fld"><label>Notifications</label>
+      <label style="display:flex;gap:8px;align-items:flex-start;font-size:12.5px;color:var(--text-dim);cursor:pointer">
+        <input type="checkbox" id="s_notify" style="margin-top:3px">
+        <span>Tell me when a reply lands, a pair cycle needs my decision, or a turn fails — only while this tab is in the background.</span>
+      </label>
+      <div class="note">Per browser, not per room. Your browser will ask for permission the first time.</div></div>
     <div class="fld" style="margin-top:14px"><label>Project folder (blank = room's own sandbox workspace)</label>
       <div style="display:flex;gap:8px">
         <input id="s_projdir" placeholder="e.g. D:\Projects\my-app" spellcheck="false" style="flex:1">
@@ -791,6 +955,7 @@ const state = {
   renderFromN: null, // first entry shown by the windowed transcript render
   expandedMessages: new Set(),
   expandedActivity: new Set(),
+  doctor: {},        // seat -> first-run health, from /api/doctor
   eventVersion: 0,   // any newer SSE event makes a reconnect snapshot stale for live UI state
   resyncVersion: 0,
 };
@@ -810,7 +975,7 @@ function toast(msg, isErr) {
 // This blocks blind/cross-origin requests; it is not a secret from local
 // processes, which can fetch the public page and read the embedded token.
 const TOKEN = (document.querySelector('meta[name="parley-token"]') || {}).content || "";
-const REQUIRED_RUNTIME_PROTOCOL = "9";
+const REQUIRED_RUNTIME_PROTOCOL = "10";
 const PAGE_RUNTIME_PROTOCOL = (document.querySelector('meta[name="parley-runtime-protocol"]') || {}).content || "";
 const withToken = (url) => url + (url.includes("?") ? "&" : "?") +
   "token=" + encodeURIComponent(TOKEN) + "&protocol=" + encodeURIComponent(REQUIRED_RUNTIME_PROTOCOL);
@@ -996,7 +1161,114 @@ $("dlTranscript").onclick = async (ev) => {
   } catch (e) { toast(e.message, true); }
 };
 function hhmm(ts) { return (ts || "").slice(11, 16); }
+function dayOf(ts) { return (ts || "").slice(0, 10); }
+// A room that spans days showed a column of indistinguishable "14:02"s, with
+// nothing saying which day any of them belonged to.
+function dayLabel(ts) {
+  const day = dayOf(ts);
+  if (!day) return "";
+  const today = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  const asDay = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  if (day === asDay(today)) return "Today";
+  const yesterday = new Date(today.getTime() - 86400000);
+  if (day === asDay(yesterday)) return "Yesterday";
+  return day;
+}
 function secs(ms) { return (ms / 1000).toFixed(1) + "s"; }
+
+// ---- syntax highlighting ----
+// For an app whose whole point is watching two coding agents exchange code,
+// monochrome blocks were the most visible gap. This is deliberately a small
+// tokenizer rather than a vendored library: Parley ships two files and no
+// dependencies, and a hundred kilobytes of highlighter inlined into the page
+// would cost more than it is worth.
+//
+// SAFETY: this runs on text that esc() has ALREADY escaped, and it only ever
+// wraps existing characters in <span class="tok-…">. It never unescapes, never
+// interpolates, and never emits an attribute value — so it cannot reintroduce
+// markup that escaping removed. Everything it matches is bounded by the entity
+// forms &lt; &gt; &amp; &quot; that escaping produces, which is why the patterns
+// below look for those rather than for raw angle brackets.
+const HL_LANGS = {
+  js: {
+    keywords: /\b(?:async|await|break|case|catch|class|const|continue|default|delete|do|else|export|extends|finally|for|from|function|if|import|in|instanceof|let|new|of|return|static|super|switch|this|throw|try|typeof|var|void|while|yield)\b/g,
+    literals: /\b(?:true|false|null|undefined|NaN|Infinity)\b/g,
+    line: /\/\/[^\n]*/g,
+    block: /\/\*[\s\S]*?\*\//g,
+  },
+  py: {
+    keywords: /\b(?:and|as|assert|async|await|break|class|continue|def|del|elif|else|except|finally|for|from|global|if|import|in|is|lambda|nonlocal|not|or|pass|raise|return|try|while|with|yield)\b/g,
+    literals: /\b(?:True|False|None|self)\b/g,
+    line: /#[^\n]*/g,
+  },
+  sh: {
+    keywords: /\b(?:case|do|done|elif|else|esac|export|fi|for|function|if|in|local|return|set|then|until|while)\b/g,
+    literals: /\b(?:true|false)\b/g,
+    line: /#[^\n]*/g,
+  },
+  css: {
+    keywords: /@[a-z-]+/g,
+    literals: /#[0-9a-fA-F]{3,8}\b/g,
+    line: null,
+    block: /\/\*[\s\S]*?\*\//g,
+  },
+  json: { literals: /\b(?:true|false|null)\b/g },
+  html: { block: /&lt;!--[\s\S]*?--&gt;/g, keywords: /&lt;\/?[a-zA-Z][\w:-]*|\/?&gt;/g },
+};
+const HL_ALIAS = {
+  javascript: "js", jsx: "js", ts: "js", typescript: "js", tsx: "js", mjs: "js", cjs: "js",
+  python: "py", py3: "py", bash: "sh", shell: "sh", zsh: "sh", console: "sh", sh: "sh",
+  yaml: "json", yml: "json", jsonc: "json", scss: "css", less: "css",
+  xml: "html", svg: "html", vue: "html", markup: "html",
+};
+// Strings and comments are matched first and set aside, so a keyword inside a
+// string is never highlighted as one.
+// Strings and comments are matched first in the alternation below, so a keyword
+// inside a string is never highlighted as one.
+const HL_STRINGS = /&quot;(?:[^&\\\n]|\\.|&(?!quot;))*&quot;|'(?:[^'\\\n]|\\.)*'|`(?:[^`\\]|\\.)*`/;
+const HL_NUMBERS = /\b(?:0[xX][0-9a-fA-F]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\b/;
+
+// One left-to-right scan with a single alternation, rather than a sequence of
+// passes over placeholders: a placeholder scheme has to survive every later
+// pattern, and the number rule cheerfully matched the digits inside its own
+// placeholders. First alternative that matches at a position wins, and anything
+// unmatched is copied through untouched — so the output always reduces back to
+// the input with the spans removed.
+const hlCache = new Map();
+function hlPattern(rules) {
+  if (hlCache.has(rules)) return hlCache.get(rules);
+  const parts = [];
+  const order = [];
+  const add = (cls, re) => { if (re) { parts.push(`(${re.source})`); order.push(cls); } };
+  add("com", rules.block);
+  add("com", rules.line);
+  add("str", HL_STRINGS);
+  add("kw", rules.keywords);
+  add("lit", rules.literals);
+  add("num", HL_NUMBERS);
+  const compiled = { re: new RegExp(parts.join("|"), "g"), order };
+  hlCache.set(rules, compiled);
+  return compiled;
+}
+
+function highlightCode(escaped, lang) {
+  const key = HL_ALIAS[String(lang || "").toLowerCase()] || String(lang || "").toLowerCase();
+  const rules = HL_LANGS[key];
+  if (!rules) return escaped; // an unknown language stays plain rather than guessed at
+  const { re, order } = hlPattern(rules);
+  re.lastIndex = 0;
+  let out = "", at = 0, m;
+  while ((m = re.exec(escaped)) !== null) {
+    // Which alternative matched tells us what to call it.
+    let cls = null;
+    for (let g = 1; g < m.length; g++) if (m[g] !== undefined) { cls = order[g - 1]; break; }
+    out += escaped.slice(at, m.index) + `<span class="tok-${cls}">${m[0]}</span>`;
+    at = m.index + m[0].length;
+    if (m[0] === "") re.lastIndex++; // a zero-width match would loop forever
+  }
+  return out + escaped.slice(at);
+}
 
 // ------------------------------------------------------------ markdown (safe: escape first, then transform)
 // Code blocks are pulled out first and stashed behind private-use-area
@@ -1113,7 +1385,8 @@ function renderMD(src) {
     const b = blocks[+i];
     if (!b) return m;
     return `<div class="codeblock"><div class="cb-head"><span>${esc(b.lang || "code")}</span>` +
-      `<button class="cb-copy">copy</button></div><pre><code>${esc(b.code.replace(/\n$/, ""))}</code></pre></div>`;
+      `<button class="cb-copy">copy</button></div><pre><code>` +
+      `${highlightCode(esc(b.code.replace(/\n$/, "")), b.lang)}</code></pre></div>`;
   });
   return html;
 }
@@ -1132,10 +1405,14 @@ document.addEventListener("click", (e) => {
       cpy.textContent = "✓"; setTimeout(() => (cpy.textContent = "📋"), 1200);
     });
   }
-  if (!e.target.closest("#stopWrap")) {
-    $("stopWrap").classList.remove("open");
-    $("stopBtn").setAttribute("aria-expanded", "false");
+  // Delegated, not a per-node onclick: any arriving activity entry re-renders
+  // the transcript and would take a bound handler with it.
+  const ask = e.target.closest(".ask");
+  if (ask) {
+    const host = ask.closest("[data-n]");
+    if (host) { e.stopPropagation(); openAskMenu(ask, Number(host.dataset.n)); }
   }
+  if (!e.target.closest("#stopWrap")) closeStopMenu();
   if (!e.target.closest("#hopWrap")) closeHopMenu();
   if (!e.target.closest("#queueWrap")) closeQueuePop();
 });
@@ -1174,6 +1451,12 @@ function withheldFrom(a, n) {
   const seats = map[String(n)];
   return Array.isArray(seats) && seats.includes(a);
 }
+// The amber sibling: the seat did receive this, and its answer was stopped.
+function interruptedFrom(a, n) {
+  const map = (state.summary && state.summary.interruptedResponses) || {};
+  const seats = map[String(n)];
+  return Array.isArray(seats) && seats.includes(a);
+}
 function cappedFrom(a, n) {
   return state.entries.find((entry) => entry.kind === "system" && entry.meta &&
     entry.meta.relayCap && Array.isArray(entry.meta.relayCap.dropped) &&
@@ -1182,6 +1465,16 @@ function cappedFrom(a, n) {
 function computeHeard(a, e) {
   if (withheldFrom(a, e.n)) {
     return { cls: "withheld", title: `${a} · you cancelled this before it was delivered — never shown to ${a}` };
+  }
+  // Amber, and above receipts, cursor, busy state and terminal outcomes on
+  // purpose: the seat received this and the user stopped its answer. Every
+  // later turn carries the message in context, so anything that read a receipt
+  // first would resolve amber on the next completed turn, whatever it was
+  // about. Only the server supersedes it — by removing the record when that
+  // seat completes a run rooted here.
+  if (interruptedFrom(a, e.n)) {
+    return { cls: "interrupted",
+      title: `${a} · received this, but you stopped its response — nothing is retried automatically` };
   }
   const r = state.receipts.find((x) => x.agent === a && x.from < e.n && e.n <= x.upTo);
   if (r) {
@@ -1267,6 +1560,74 @@ function heardHTML(e) {
     return `<span class="hdot ${a} ${h.cls}" title="${esc(h.title)}"></span>`;
   }).join("") + `</div>`;
 }
+
+// The record model: the message is permanent, its delivery state is changeable.
+// A cancelled or interrupted message keeps its bubble in chronological position
+// — still the quote/jump target — and carries its own per-seat status, instead
+// of vanishing behind a pill floating further down the timeline.
+const STATUS_CHIP = {
+  cancelled: { all: "Discarded before delivery", one: (s) => `Discarded for ${s}` },
+  interrupted: { all: "Response stopped before it finished", one: (s) => `Response stopped for ${s}` },
+};
+function receivedBy(a, e) {
+  if (state.receipts.some((x) => x.agent === a && x.from < e.n && e.n <= x.upTo)) return true;
+  const agent = state.summary && state.summary.agents && state.summary.agents[a];
+  return !!agent && agent.cursor >= e.n;
+}
+// User messages only: an agent reply has no audience the user chose, so a
+// per-seat delivery chip on one would be inventing an addressee. A stopped hop
+// or answer return is carried by the amber dot alone.
+function deliveryStatus(e) {
+  if (e.kind !== "user") return [];
+  const aud = (e.meta && e.meta.audience) || {};
+  const named = [...new Set([...(aud.addressed || []), ...(aud.asleep || [])])];
+  const seats = named.length ? named
+    : ((state.summary && state.summary.seats) || []).filter((a) => e.target === "both" || e.target === a);
+  return seats.map((seat) => ({
+    seat,
+    kind: withheldFrom(seat, e.n) ? "cancelled"
+      : interruptedFrom(seat, e.n) ? "interrupted"
+        : receivedBy(seat, e) ? "delivered" : "pending",
+  }));
+}
+function statusDimmed(e) {
+  return deliveryStatus(e).some((s) => s.kind === "cancelled" || s.kind === "interrupted");
+}
+function statusChipHTML(e) {
+  const parts = deliveryStatus(e);
+  if (!statusDimmed(e)) return ""; // an ordinary message stays clean
+  const kinds = new Set(parts.map((s) => s.kind));
+  // Every addressed seat shared one outcome: say it once, without naming them.
+  const chips = kinds.size === 1 && STATUS_CHIP[parts[0].kind]
+    ? [{ kind: parts[0].kind, text: STATUS_CHIP[parts[0].kind].all }]
+    // A seat still waiting in the queue contributes nothing — the ⏳ badge and
+    // its own dot already say that, and it is not part of what went wrong.
+    : parts.filter((s) => s.kind !== "pending").map((s) => ({
+      kind: s.kind,
+      text: s.kind === "delivered"
+        ? `Delivered to ${seatLabel(s.seat)}`
+        : STATUS_CHIP[s.kind].one(seatLabel(s.seat)),
+    }));
+  // The undo lives with the fact it undoes. Per seat, because a split @both can
+  // be discarded for one half and delivered to the other — and the retry joins
+  // the tail of that seat's own lane, so it cannot overtake newer work.
+  const discarded = parts.filter((s) => s.kind === "cancelled").map((s) => s.seat);
+  const one = discarded.length === 1;
+  const retry = discarded.map((a) =>
+    `<button class="dretry" data-retry-discarded="${esc(String(e.n))}" data-retry-seats="${esc(a)}" ` +
+    `title="Deliver this message to ${esc(seatLabel(a))} after everything already queued">` +
+    `${one ? "Retry" : `Retry → ${esc(seatLabel(a))}`}</button>`).join("");
+  return `<div class="dstatus">` +
+    chips.map((c) => `<span class="dchip ${c.kind}">${esc(c.text)}</span>`).join("") + retry + `</div>`;
+}
+// The cancellation notice is a durable record for agents and for auditing — it
+// stays in events.jsonl, in transcript.md and in the seat's delta — but it is no
+// longer timeline furniture: the message it is about now says it itself, in
+// chronological place. The sleep variant is NOT hidden; it is the only thing
+// that explains why a seat went quiet with work still owed.
+function hiddenEntry(e) {
+  return e.kind === "system" && !!(e.meta && e.meta.cancelledQueue) && !(e.meta && e.meta.asleepSeat);
+}
 // Every status event asks for a full refresh, so this has to be cheap and it
 // has to leave untouched rows alone: replacing one restarts the pulse on a
 // pending dot, inside a message the reader may be part-way through.
@@ -1276,11 +1637,21 @@ function refreshHeard(fromN, upToN) {
     if (e.n <= fromN || e.n > upToN) continue;
     if (state.renderFromN !== null && e.n < state.renderFromN) continue; // not rendered
     const html = heardHTML(e);
-    if (!html || heardSig.get(e.n) === html) continue;
-    const el = chat.querySelector(`[data-n="${e.n}"] .heard`);
+    // The chip and the dots are one fact seen two ways, so they refresh in the
+    // same pass and share a signature — they can never disagree on screen.
+    const chip = statusChipHTML(e);
+    const sig = `${chip}${html}`;
+    if (!html || heardSig.get(e.n) === sig) continue;
+    const row = chat.querySelector(`[data-n="${e.n}"]`);
+    const el = row && row.querySelector(".heard");
     if (!el) continue;
+    const cur = row.querySelector(".dstatus"); // before el.outerHTML invalidates el
+    if (chip) { if (cur) cur.outerHTML = chip; else el.insertAdjacentHTML("beforebegin", chip); }
+    else if (cur) cur.remove();
+    const bub = row.querySelector(".bubble");
+    if (bub) bub.classList.toggle("dimmed", statusDimmed(e));
     el.outerHTML = html;
-    heardSig.set(e.n, html);
+    heardSig.set(e.n, sig);
   }
 }
 
@@ -1338,14 +1709,24 @@ function entryEl(e) {
     : e.meta && e.meta.hop && !(e.meta && e.meta.pair) ? ' <span style="opacity:.6">· ⛓ follow-up</span>' : deferTag);
   const userPair = e.meta && e.meta.pair && typeof e.meta.pair === "object"
     ? ` · 🔁 pair ×${e.meta.pair.rounds} (${e.meta.pair.worker} works, ${e.meta.pair.reviewer} reviews)` : "";
+  // An auto-composed "Continue responding to this message." must never read as
+  // something the user typed; the quote header above says what it is about, and
+  // this says how it got here.
+  const askTag = e.kind === "user" && e.meta && e.meta.askFrom
+    ? (e.meta.askFrom.redirect
+      ? ' <span style="opacity:.6" title="Sent with Stop current &amp; ask now">· ↪ redirect</span>'
+      : ' <span style="opacity:.6" title="Asked again about an earlier message">· ↪ ask again</span>')
+    : "";
   const label = e.kind === "user"
-    ? `You <span style="opacity:.65">→ @${esc(e.target)}${e.meta && e.meta.discussion ? " · 💬 discussion" : ""}${userPair}</span>`
+    ? `You <span style="opacity:.65">→ @${esc(e.target)}${e.meta && e.meta.discussion ? " · 💬 discussion" : ""}${userPair}</span>${askTag}`
     : e.author.charAt(0).toUpperCase() + e.author.slice(1) + lurkTag;
-  const av = e.kind === "user" ? "" : `<span class="avatar">${esc((state.providers[e.author] && state.providers[e.author].avatar) || e.author[0].toUpperCase())}</span>`;
-  div.innerHTML = `<div class="meta">${av}<span class="who">${label}</span><span>${hhmm(e.ts)}${dur}${tok}</span>` +
+  const av = e.kind === "user" ? "" : `<span class="avatar">${esc(seatAvatar(e.author))}</span>`;
+  div.innerHTML = `<div class="meta">${av}<span class="who">${label}</span><span title="${esc(String(e.ts || "").replace("T", " "))}">${hhmm(e.ts)}${dur}${tok}</span>` +
+    `<button class="ask" title="Ask about this message">↪</button>` +
     `<button class="cpy" title="Copy message">📋</button></div>` +
     entryQuoteHTML(e) +
-    `<div class="bubble">${renderMD(e.text)}</div>` + heardHTML(e);
+    `<div class="bubble${statusDimmed(e) ? " dimmed" : ""}">${renderMD(e.text)}</div>` +
+    statusChipHTML(e) + heardHTML(e);
   renderEntryAttachments(e, div.querySelector(".bubble"));
   if ((e.text || "").length > 2500) {
     const bub = div.querySelector(".bubble");
@@ -1499,10 +1880,27 @@ function appendActivityEntry(e) {
 }
 
 function appendEntryRange(parent, entries) {
+  let lastDay = null;
+  const dayDivider = (e) => {
+    const day = dayOf(e.ts);
+    if (!day || day === lastDay) return;
+    // Not before the very first rendered entry when it opens the window: a
+    // divider there is a label with nothing above it to separate from.
+    if (lastDay !== null) {
+      const sep = document.createElement("div");
+      sep.className = "daysep";
+      sep.setAttribute("role", "separator");
+      sep.innerHTML = `<span>${esc(dayLabel(e.ts))}</span>`;
+      parent.appendChild(sep);
+    }
+    lastDay = day;
+  };
   for (let i = 0; i < entries.length;) {
     const e = entries[i];
     if (e.kind !== "activity") {
-      parent.appendChild(entryEl(e));
+      // Filtered at render time only — never removed from state.entries, which
+      // every index, jump and quote lookup walks.
+      if (!hiddenEntry(e)) { dayDivider(e); parent.appendChild(entryEl(e)); }
       i++;
       continue;
     }
@@ -1588,11 +1986,11 @@ function refWho(src) {
   return src.kind === "user" ? "you" : seatLabel(src.author);
 }
 
-function quoteRefHTML(src) {
+function quoteRefHTML(src, label = "↩ replying to") {
   if (!src || src.n === undefined || src.n === null) return "";
   return `<button class="quote-ref" data-jump-n="${esc(String(src.n))}" title="Jump to this message">` +
     `<span class="qr-bar"></span><span class="qr-body">` +
-    `<span class="qr-head"><span>↩ replying to ${esc(refWho(src))}</span><span>${esc(hhmm(src.ts))}</span></span>` +
+    `<span class="qr-head"><span>${esc(label)} ${esc(refWho(src))}</span><span>${esc(hhmm(src.ts))}</span></span>` +
     `<span class="qr-text">${esc(src.text || "")}</span>` +
     `</span></button>`;
 }
@@ -1601,6 +1999,12 @@ function quoteRefHTML(src) {
 // is the whole point of putting the quote in the bubble rather than in a
 // transient strip, and it is what makes an old exchange readable months later.
 function entryQuoteHTML(e) {
+  // What makes an ask bubble auditable rather than looking like something the
+  // user typed — especially "Continue responding to this message."
+  if (e.kind === "user" && e.meta && e.meta.askFrom &&
+      e.meta.askFrom.sourceN !== undefined && e.meta.askFrom.sourceN !== null) {
+    return quoteRefHTML(refFromN(e.meta.askFrom.sourceN), "↪ asking about");
+  }
   if (e.kind !== "agent" || !e.meta || e.meta.replyTo === undefined || e.meta.replyTo === null) return "";
   return quoteRefHTML(refFromN(e.meta.replyTo));
 }
@@ -1625,6 +2029,22 @@ document.addEventListener("click", (e) => {
   if (!target) return;
   closeQueuePop();
   jumpToEntry(Number(target.dataset.jumpN));
+});
+// Re-deliver a message that was discarded before it reached a seat. Delegated,
+// because the button lives on a message that any rebuild may replace.
+document.addEventListener("click", async (e) => {
+  const btn = e.target.closest("[data-retry-discarded]");
+  if (!btn || btn.disabled) return;
+  const n = Number(btn.dataset.retryDiscarded);
+  const agents = (btn.dataset.retrySeats || "").split(",").filter(Boolean);
+  btn.disabled = true; // the summary that follows removes the row entirely
+  try {
+    await api("/api/queue/retry", { room: state.room, n, ...(agents.length ? { agents } : {}) });
+    toast(`Queued again for ${agents.map(seatLabel).join(" and ")}.`);
+  } catch (err) {
+    btn.disabled = false;
+    toast(err.message, true);
+  }
 });
 
 // The reader's place, as a message and an offset rather than a scroll position.
@@ -1721,6 +2141,10 @@ function addEntry(e) {
   const last = state.entries[state.entries.length - 1];
   const inOrder = !last || e.n > last.n;
   state.entries = mergeEntries(state.entries, [e]);
+  // Kept in state (it is real history and the transcript replays it) but never
+  // drawn: the message it is about now carries its own status, and the room
+  // summary that follows this entry repaints that chip.
+  if (hiddenEntry(e)) return;
   // an arriving entry replaces any live bubble for that agent
   if (e.kind === "agent" && state.live[e.author]) removeLive(e.author);
   if (e.kind === "system" && e.meta && e.meta.agent && state.live[e.meta.agent]) removeLive(e.meta.agent);
@@ -1730,7 +2154,7 @@ function addEntry(e) {
   // so the rebuild has to put them back where they were.
   if (!inOrder) {
     renderAll({ stickToBottom: wasAtBottom, anchor: true });
-    if (document.hidden && e.kind !== "activity") document.title = "● Parley";
+    if (document.hidden && e.kind !== "activity") { document.title = "● Parley"; notifyForEntry(e); }
     return;
   }
   if (state.renderFromN !== null && e.n < state.renderFromN) return;
@@ -1745,8 +2169,50 @@ function addEntry(e) {
   chat.appendChild(entryEl(e));
   // Keep any live bubbles after the durable transcript entry.
   for (const live of Object.values(state.live)) chat.appendChild(live.el);
-  if (document.hidden && e.kind !== "activity") document.title = "● Parley";
+  if (document.hidden && e.kind !== "activity") { document.title = "● Parley"; notifyForEntry(e); }
   scrollBottom(e.kind === "user" || wasAtBottom);
+}
+
+// ---- away-from-tab notifications ----
+// A work-mode turn can run for fifteen minutes and a pair cycle can pause
+// waiting for a decision, so the interesting moment usually arrives while the
+// user is in their editor. A dot on the tab title was the only signal. This is
+// opt-in, per browser, and never asks unprompted — the toggle lives in Settings.
+const NOTIFY_KEY = "parley.notify";
+function notifyEnabled() {
+  try { return localStorage.getItem(NOTIFY_KEY) === "1"; } catch { return false; }
+}
+function setNotifyEnabled(on) {
+  try { localStorage.setItem(NOTIFY_KEY, on ? "1" : "0"); } catch { /* private mode */ }
+}
+async function requestNotifyPermission() {
+  if (!("Notification" in window)) return false;
+  if (Notification.permission === "granted") return true;
+  if (Notification.permission === "denied") return false;
+  try { return (await Notification.requestPermission()) === "granted"; } catch { return false; }
+}
+// Only while the tab is hidden: a notification for something already on screen
+// is noise, and this feature exists for the moments the user is elsewhere.
+function notifyAway(title, body) {
+  if (!document.hidden || !notifyEnabled()) return;
+  if (!("Notification" in window) || Notification.permission !== "granted") return;
+  try {
+    const n = new Notification(title, { body: String(body || "").slice(0, 180), tag: "parley-" + state.room });
+    n.onclick = () => { window.focus(); n.close(); };
+  } catch { /* the browser refused; the tab title still carries the dot */ }
+}
+// The three moments worth interrupting someone for: an answer landed, the room
+// is waiting on a decision it cannot make, or something failed.
+function notifyForEntry(e) {
+  if (e.kind === "agent") {
+    notifyAway(`${seatLabel(e.author)} replied`, e.text);
+  } else if (e.kind === "system" && e.meta) {
+    if (e.meta.pairPause || /needs your decision|needs-user/i.test(e.text || "")) {
+      notifyAway("Parley is waiting on you", e.text);
+    } else if (e.meta.error) {
+      notifyAway("A turn failed", e.text);
+    }
+  }
 }
 
 // live (thinking / streaming) bubbles
@@ -1755,7 +2221,7 @@ function ensureLive(agent, startedAt, label) {
   const div = document.createElement("div");
   div.className = "msg agent " + agent;
   div.dataset.liveAgent = agent;
-  div.innerHTML = `<div class="meta"><span class="avatar">${esc((state.providers[agent] && state.providers[agent].avatar) || agent[0].toUpperCase())}</span>` +
+  div.innerHTML = `<div class="meta"><span class="avatar">${esc(seatAvatar(agent))}</span>` +
     `<span class="who">${agent.charAt(0).toUpperCase() + agent.slice(1)}</span>` +
     `<span class="live-label">${label || "is thinking"} <span class="elapsed"></span></span></div>` +
     `<div class="quote-slot"></div>` +
@@ -1911,9 +2377,17 @@ $("busyStrip").addEventListener("click", (e) => {
 function clearLive() {
   for (const agent of Object.keys(state.live)) removeLive(agent);
 }
-function liveStream(agent, text) {
+// The server sends increments, not the whole reply each time: `text` is a full
+// keyframe, `{from, delta}` extends what we already hold. An increment that
+// does not start exactly where our text ends means we missed one, so hold the
+// bubble as-is and wait for the next keyframe (at most two seconds) rather than
+// splicing text at the wrong offset. The finished entry is authoritative either
+// way, so the worst case is a briefly stale bubble.
+function liveStream(agent, msg) {
   const l = ensureLive(agent);
-  l.text = text;
+  if (typeof msg.text === "string") l.text = msg.text;
+  else if (msg.from === l.text.length) l.text += msg.delta;
+  else return;
   if (state.streamTimer[agent]) return;
   state.streamTimer[agent] = setTimeout(() => {
     delete state.streamTimer[agent];
@@ -1962,11 +2436,52 @@ setInterval(() => {
 // ------------------------------------------------------------ header / pills / busy
 // Seats are data: colors, avatars and controls all render from the summary's
 // seat list + provider catalog, so any provider pair just works.
+// A seat's look and settings come from its provider, which its id no longer has
+// to match. `seatInfo` carries that per seat; a summary from before it existed
+// (or a seat missing from it) falls back to the provider-keyed catalog, which
+// is correct whenever the id is the provider name.
+function seatMeta(a) {
+  const info = state.summary && state.summary.seatInfo && state.summary.seatInfo[a];
+  return info || (state.providers && state.providers[a]) || {};
+}
+const titleCaseSeat = (a) => String(a).charAt(0).toUpperCase() + String(a).slice(1);
+function seatAvatar(a) {
+  return seatMeta(a).avatar || String(a)[0].toUpperCase();
+}
+// What this room has actually spent, per seat. The numbers are already on every
+// reply (ground truth from the CLI, not model self-reporting); nothing summed
+// them, so the only cost signal was one bubble at a time — in an app whose Sleep
+// feature exists because people hit rate limits.
+function seatUsage(a) {
+  let out = 0, reasoning = 0, replies = 0;
+  for (const e of state.entries) {
+    if (e.kind !== "agent" || e.author !== a) continue;
+    const t = e.meta && e.meta.tokens;
+    if (!t) continue;
+    replies++;
+    if (typeof t.out === "number") out += t.out;
+    if (typeof t.reasoning === "number") reasoning += t.reasoning;
+  }
+  return { out, reasoning, replies };
+}
+function usageSummaryText(a) {
+  const u = seatUsage(a);
+  if (!u.replies) return "";
+  const parts = [`${u.out.toLocaleString()} output tokens`];
+  if (u.reasoning) parts.push(`${u.reasoning.toLocaleString()} reasoning`);
+  return `${parts.join(" · ")} over ${u.replies} repl${u.replies === 1 ? "y" : "ies"} in this conversation`;
+}
+
 function seatColor(a) {
-  return (state.providers[a] && state.providers[a].color) || "#7aa2f7";
+  return (seatMeta(a).color) || "#7aa2f7";
 }
 function seatLabel(a) {
-  return (state.providers[a] && state.providers[a].label) || a;
+  const meta = seatMeta(a);
+  // A seat's own name wins over its provider's label whenever they differ:
+  // that name is what you @mention, and in a room with two seats on one
+  // provider "Claude" and "Claude" would be indistinguishable.
+  if (meta.provider && meta.provider !== a) return titleCaseSeat(a);
+  return meta.label || titleCaseSeat(a);
 }
 function injectSeatStyles() {
   let css = "";
@@ -2072,7 +2587,9 @@ async function refreshGitId() {
   const room = state.room;
   if (!room) return;
   try {
-    const data = await api("/api/room?name=" + encodeURIComponent(room));
+    // The summary endpoint, not /api/room: this needs one field, and the full
+    // snapshot grows with the room's whole history.
+    const data = await api("/api/room/summary?name=" + encodeURIComponent(room));
     if (state.room !== room) return;
     if (state.summary) state.summary.git = data.room.git;
     renderGitId(data.room.git);
@@ -2100,8 +2617,18 @@ function applySummary(s) {
     pill.classList.toggle("busy", s.busy.includes(a));
     pill.classList.toggle("bad", !ag.command.ok);
     pill.classList.toggle("asleep", asleep);
+    // The pill's tooltip is where someone looks when they want to know what a
+    // seat has cost them so far.
+    const spent = usageSummaryText(a);
+    const health = (state.doctor && state.doctor[a]) || null;
+    pill.title = [
+      ag.command.ok ? `${seatLabel(a)} · ${ag.command.detail}` : `${seatLabel(a)}: ${ag.command.detail}`,
+      health && !health.ok && health.stage === "auth" ? `${health.detail} — ${health.how}` : "",
+      spent,
+    ].filter(Boolean).join("\n");
     let txt = "";
     if (!ag.command.ok) txt = "not found";
+    else if (health && !health.ok && health.stage === "auth") txt = "not signed in";
     else {
       // A seat can be both: sleep stops the *next* launch, so a response
       // already running still says so.
@@ -2194,7 +2721,7 @@ function applySummary(s) {
   for (const a of s.busy) ensureLive(a);
   applyLiveRefs();
   renderBusyStrip();
-  setQueue(s.queued || 0, s.queue, s.queuedDispatches);
+  setQueue(s.queued || 0, s.queue, s.queuedDispatches, s.queuePaused);
   refreshHeard(0, Infinity); // busy/cursor changes can flip pending/unheard dots
   updateBusyUI();
   renderHopControl();
@@ -2242,6 +2769,167 @@ document.addEventListener("click", (e) => {
   if (!e.target.closest("#wakeMenu") && !e.target.closest(".moon")) closeWakeMenu();
 });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeWakeMenu(); });
+
+// ↪ Ask on any user or agent message. Idle target: one action. Busy target: the
+// two that are genuinely different — queue behind the current response, or stop
+// it and ask now. The stop-and-ask is ONE server request pinned to the runId the
+// browser is showing; never a Stop click followed by a Send, which leaves a
+// window for the old run to finish and the queue to start something else.
+let askDraft = null; // { sourceN, target } while the menu is open
+function closeAskMenu() {
+  $("askMenu").classList.remove("open");
+  $("askMenu").innerHTML = "";
+  askDraft = null;
+}
+function askDefaultTarget(src) {
+  if (!src) return null;
+  return src.kind === "agent" ? src.author
+    : (src.target === "both" ? "both" : src.target);
+}
+function askPins(seats) {
+  const s = state.summary || {};
+  const info = (s.busyInfo || []).filter((b) => b.runId);
+  // A pair cycle is one unit: redirecting during one ends it, so its runs all
+  // go. Otherwise pin only the seats this ask is aimed at — killing an unrelated
+  // seat's response is not what "stop the current response" means.
+  const wanted = s.workingPair ? info : info.filter((b) => seats.includes(b.agent));
+  return wanted.map((b) => ({ agent: b.agent, runId: b.runId }));
+}
+function askSeatsFor(target) {
+  return target === "both" ? ((state.summary && state.summary.seats) || []) : [target];
+}
+function renderAskMenu(btn) {
+  if (!askDraft || !state.summary) return;
+  const menu = $("askMenu");
+  const seats = (state.summary.seats || []);
+  const busy = state.summary.busy || [];
+  const aimed = askSeatsFor(askDraft.target);
+  const contested = state.summary.workingPair || aimed.some((a) => busy.includes(a));
+  const chips = [...seats, ...(seats.length > 1 ? ["both"] : [])].map((t) =>
+    `<button data-ask-seat="${esc(t)}" class="${t === askDraft.target ? "active" : ""}">` +
+    `${esc(t === "both" ? "Both" : seatLabel(t))}</button>`).join("");
+  const draft = ($("askText") || {}).value || "";
+  const actions = !contested
+    ? `<button role="menuitem" data-ask-mode="now">↪ Ask now<span class="sm-sub">the seat is free</span></button>`
+    : `<button role="menuitem" data-ask-mode="queue">⏳ Queue after current` +
+      `<span class="sm-sub">everything already queued keeps its place</span></button>` +
+      `<button role="menuitem" data-ask-mode="stop">■ Stop current &amp; ask now` +
+      `<span class="sm-sub">stops the response on screen; queued work stays behind this</span></button>`;
+  menu.innerHTML = `<div class="ask-seats">${chips}</div>` +
+    `<input id="askText" placeholder="Add an instruction (optional)" value="${esc(draft)}">` + actions;
+  menu.classList.add("open");
+  // Only measure against the button on first open; a seat-chip re-render must
+  // not make the menu jump out from under the cursor.
+  if (btn) {
+    const r = btn.getBoundingClientRect();
+    const w = menu.offsetWidth;
+    menu.style.left = `${Math.max(8, Math.min(r.right - w, window.innerWidth - w - 8))}px`;
+    menu.style.top = `${r.bottom + 7}px`;
+  }
+}
+function openAskMenu(btn, sourceN) {
+  const src = entryByN(sourceN);
+  if (!src || !state.summary) return;
+  askDraft = { sourceN, target: askDefaultTarget(src) || (state.summary.seats || [])[0] };
+  if (!askDraft.target) { askDraft = null; return; }
+  renderAskMenu(btn);
+}
+async function askFromMenu(mode) {
+  if (!askDraft) return;
+  const seats = askSeatsFor(askDraft.target);
+  const body = {
+    room: state.room, sourceN: askDraft.sourceN, mode,
+    target: askDraft.target, text: ($("askText") || {}).value || "",
+    ...(mode === "stop" ? { runs: askPins(seats) } : {}),
+  };
+  // Nothing on screen to stop: asking for a pinned stop with no pins would be
+  // refused, and downgrading is what the user meant anyway.
+  if (mode === "stop" && !body.runs.length) { body.mode = "queue"; delete body.runs; }
+  closeAskMenu();
+  try {
+    const r = await api("/api/ask", body);
+    if (r.held && r.held.length) toast(`😴 held for ${r.held.join(" and ")} until wake`);
+    else if (r.stop && r.stop.stale) toast("That response had already finished — your message is next in line.");
+    else if (r.deferred && r.deferred.length) toast(`⏳ next in ${r.deferred.join(" and ")}'s lane`);
+  } catch (err) { toast(err.message, true); }
+}
+$("askMenu").addEventListener("click", (e) => {
+  const seat = e.target.closest("[data-ask-seat]");
+  if (seat && askDraft) { askDraft.target = seat.dataset.askSeat; renderAskMenu(null); return; }
+  const choice = e.target.closest("[data-ask-mode]");
+  if (choice) askFromMenu(choice.dataset.askMode);
+});
+document.addEventListener("click", (e) => {
+  if (!e.target.closest("#askMenu") && !e.target.closest(".ask")) closeAskMenu();
+});
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeAskMenu(); });
+
+// ---- narrow-width room navigation ----
+// Below 760px the sidebar slides over the chat instead of vanishing. Without
+// this, rooms, the workspace, the transcript and settings were all unreachable
+// and the only way to another room was editing ?room= by hand.
+function setNavOpen(open) {
+  document.body.classList.toggle("nav-open", open);
+  $("navToggle").setAttribute("aria-expanded", String(open));
+  $("navScrim").hidden = !open;
+}
+$("navToggle").onclick = () => setNavOpen(!document.body.classList.contains("nav-open"));
+$("navScrim").onclick = () => setNavOpen(false);
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") setNavOpen(false); });
+
+// ---- keyboard-navigable menus ----
+// These surfaces declare role="menu" but had no arrow keys, no focus move on
+// open and, for the stop menu, no Escape. Declaring the semantics without
+// honouring them is worse than not declaring them.
+function menuItems(menu) {
+  return [...menu.querySelectorAll("button")].filter((b) => !b.disabled);
+}
+function focusMenuItem(menu, index) {
+  const items = menuItems(menu);
+  if (!items.length) return;
+  const i = (index + items.length) % items.length;
+  items[i].focus();
+}
+// Called after a menu's contents are written, so the first item takes focus and
+// the arrow keys have somewhere to start.
+function focusMenu(menu) {
+  const items = menuItems(menu);
+  if (items.length) items[0].focus();
+}
+function wireMenuKeys(id, close) {
+  const menu = $(id);
+  if (!menu) return;
+  menu.addEventListener("keydown", (e) => {
+    const items = menuItems(menu);
+    if (!items.length) return;
+    const at = items.indexOf(document.activeElement);
+    if (e.key === "ArrowDown") { e.preventDefault(); focusMenuItem(menu, at + 1); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); focusMenuItem(menu, at - 1); }
+    else if (e.key === "Home") { e.preventDefault(); focusMenuItem(menu, 0); }
+    else if (e.key === "End") { e.preventDefault(); focusMenuItem(menu, items.length - 1); }
+    else if (e.key === "Escape") { e.preventDefault(); close(); }
+  });
+}
+wireMenuKeys("stopMenu", () => closeStopMenu());
+wireMenuKeys("wakeMenu", () => closeWakeMenu());
+wireMenuKeys("hopMenu", () => closeHopMenu());
+wireMenuKeys("askMenu", () => closeAskMenu());
+
+// ---- modal focus ----
+// Tab used to walk straight out of the settings dialog and through the page
+// behind it, and closing left focus on nothing.
+let settingsOpener = null;
+function trapSettingsTab(e) {
+  if (e.key !== "Tab" || $("overlay").style.display === "none") return;
+  const focusable = [...$("overlay").querySelectorAll(
+    'button, input, select, textarea, a[href], [tabindex]:not([tabindex="-1"])')]
+    .filter((el) => !el.disabled && el.offsetParent !== null);
+  if (!focusable.length) return;
+  const first = focusable[0], last = focusable[focusable.length - 1];
+  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+}
+document.addEventListener("keydown", trapSettingsTab);
 
 $("pills").addEventListener("click", async (e) => {
   const moon = e.target.closest(".moon");
@@ -2292,70 +2980,153 @@ document.querySelectorAll(".mbtn").forEach((b) => {
     catch (e) { toast(e.message, true); }
   };
 });
-// Two different questions. `working` — any chain mid-flight, including the gaps
-// between its turns — decides whether Stop is offered at all, so it doesn't
-// blink out between an agent's reply and the follow-up it triggers.
-// `workingPair` is narrower and controls wording only. The chooser follows the
-// whole exchange: when one half of @both finishes first, the remaining seat
-// must still be stoppable without turning the main button into Stop-all.
-const stopIsChoice = (s) => (s.busy || []).length > 1 || s.queued > 0 ||
-  (!!s.working && (s.busy || []).length > 0);
+// Two different questions, and only one of them is about the button's blast
+// radius. `working` — any chain mid-flight, including the gaps between its
+// turns — decides whether Stop is offered at all, so the button doesn't blink
+// out between an agent's reply and the follow-up it triggers. It is
+// deliberately *absent* from the chooser test: `working` is true for every
+// ordinary exchange, so ORing it in turned the commonest action in the room —
+// one seat replying — into two clicks, and made the blast radius of a single
+// click flip on sub-second timing the user cannot see. The chooser is for the
+// questions a single click genuinely cannot answer: two seats running, work
+// still queued, or a pair cycle larger than the turn on screen.
+const stopIsChoice = (s) => (s.busy || []).length > 1 || (s.queued || 0) > 0 ||
+  !!s.workingPair || !!s.queuePaused;
+
+// The open menu is a snapshot of the moment it was opened. Status events land
+// several times a second while agents work, and rebuilding the list under an
+// aiming cursor moves the row out from under the click. So while it is open the
+// row set and its order are frozen: work that ends goes disabled in place, work
+// that starts waits for the next open.
+let stopMenuShown = null;
+
+// Five explicit intentions instead of one button and a guess: each seat on its
+// own, the actives without the queue, the queue without the actives, and the
+// blunt everything. Each entry says what survives it. The key is stable so an
+// open menu can be reconciled instead of rebuilt.
+function stopMenuRows(summary) {
+  const active = summary.busy || [];
+  const queued = summary.queued || 0;
+  // Deliveries are what the lanes owe; messages are what the user sent. One
+  // @both held for both seats is two deliveries and one message — so labels
+  // count dispatches, never rows.
+  const queuedMessages = summary.queuedDispatches === undefined ? queued : summary.queuedDispatches;
+  const rows = active.map((a) => ({
+    key: `seat:${a}`, cls: "stop-scope",
+    attrs: `data-stop-scope="seat" data-stop-agent="${esc(a)}"`,
+    html: `■ Stop ${esc(seatLabel(a))}'s current response`,
+  }));
+  if (active.length) rows.push({
+    key: "active", cls: "stop-scope", attrs: `data-stop-scope="active"`,
+    html: `■ Stop current responses<span class="sm-sub">keeps queued work</span>`,
+  });
+  const held = !!summary.queuePaused;
+  // Not a stop scope: this row must never reach /api/stop.
+  if (queued > 0 || held) rows.push({
+    key: "hold", cls: "stop-scope", attrs: `data-queue-pause="${held ? "0" : "1"}"`,
+    html: `${held ? "▶ Resume the queue" : "⏸ Pause the queue"}` +
+      `<span class="sm-sub">${held
+        ? "queued messages start again, in order"
+        : "nothing new starts; running responses finish"}</span>`,
+  });
+  if (queued > 0) rows.push({
+    key: "queue", cls: "stop-scope", attrs: `data-stop-scope="queue"`,
+    html: `✕ Discard ${queuedMessages} queued message${queuedMessages === 1 ? "" : "s"}` +
+      `<span class="sm-sub">keeps active responses</span>`,
+  });
+  rows.push({
+    key: "all", cls: "stop-all", attrs: `data-stop-scope="all"`,
+    html: `■ Stop everything<span class="sm-sub">responses, pair cycle, hops, lurkers and queue</span>`,
+  });
+  return rows;
+}
+
+function stopMenuHTML(rows) {
+  return rows.map((r) =>
+    `<button role="menuitem" class="${r.cls}${r.gone ? " stop-gone" : ""}"` +
+    `${r.gone ? " disabled" : ""} data-stop-key="${esc(r.key)}" ${r.attrs}>${r.html}</button>`).join("");
+}
+
+function renderStopMenu(s) {
+  const live = stopMenuRows(s);
+  if (stopMenuShown && $("stopWrap").classList.contains("open")) {
+    const byKey = new Map(live.map((r) => [r.key, r]));
+    // Order and membership are frozen. Only the label of a row already on
+    // screen may change, and a row whose work ended is marked, never dropped.
+    stopMenuShown = stopMenuShown.map((row) => {
+      const next = byKey.get(row.key);
+      return next ? { ...next, gone: false } : { ...row, gone: true };
+    });
+  } else {
+    stopMenuShown = live;
+  }
+  const html = stopMenuHTML(stopMenuShown);
+  const menu = $("stopMenu");
+  // Most status events change nothing here. Writing innerHTML anyway restarted
+  // hover and could interrupt a click already in flight.
+  if (menu.dataset.sig === html) return;
+  menu.dataset.sig = html;
+  menu.innerHTML = html;
+}
+
+function closeStopMenu() {
+  $("stopWrap").classList.remove("open");
+  $("stopMore").setAttribute("aria-expanded", "false");
+  stopMenuShown = null; // the snapshot dies with the menu
+}
+function openStopMenu() {
+  stopMenuShown = null; // every open takes a fresh snapshot
+  $("stopWrap").classList.add("open");
+  $("stopMore").setAttribute("aria-expanded", "true");
+  if (state.summary) renderStopMenu(state.summary);
+  focusMenu($("stopMenu"));
+}
+function toggleStopMenu() {
+  if ($("stopWrap").classList.contains("open")) closeStopMenu();
+  else openStopMenu();
+}
 
 function updateBusyUI() {
   const summary = state.summary;
   const active = summary ? summary.busy : [];
   // Queued-but-idle counts: the queue is work the user asked for, and the menu
   // is where they cancel it without touching anything that is running.
-  const visible = !!summary && (active.length > 0 || summary.working || (summary.queued || 0) > 0);
+  const visible = !!summary &&
+    (active.length > 0 || summary.working || (summary.queued || 0) > 0 || !!summary.queuePaused);
   const wrap = $("stopWrap");
-  wrap.style.display = visible ? "block" : "none"; // sending stays allowed — messages queue
-  if (!visible) {
-    wrap.classList.remove("open");
-    $("stopBtn").setAttribute("aria-expanded", "false");
-    return;
-  }
+  wrap.style.display = visible ? "flex" : "none"; // sending stays allowed — messages queue
+  if (!visible) { closeStopMenu(); return; }
   const choose = stopIsChoice(summary);
-  $("stopBtn").title = choose ? "Choose which response to stop" :
-    active.length === 1 ? `Stop ${seatLabel(active[0])}` :
-      summary.workingPair ? "Stop the pair cycle" : "Stop the exchange";
-  // Five explicit intentions instead of one button and a guess: each seat on
-  // its own, the actives without the queue, the queue without the actives, and
-  // the blunt everything. Each entry says what survives it.
-  // Deliveries are what the lanes owe; messages are what the user sent. One
-  // @both held for both seats is two deliveries and one message — so labels
-  // count dispatches, never rows.
-  const queued = summary.queued || 0;
-  const queuedMessages = summary.queuedDispatches === undefined
-    ? queued : summary.queuedDispatches;
-  const rows = active.map((a) =>
-    `<button role="menuitem" class="stop-scope" data-stop-scope="seat" data-stop-agent="${esc(a)}">` +
-    `■ Stop ${esc(seatLabel(a))}'s current response</button>`);
-  if (active.length) {
-    rows.push(`<button role="menuitem" class="stop-scope" data-stop-scope="active">` +
-      `■ Stop current responses<span class="sm-sub">keeps queued work</span></button>`);
-  }
-  if (queued > 0) {
-    rows.push(`<button role="menuitem" class="stop-scope" data-stop-scope="queue">` +
-      `✕ Cancel ${queuedMessages} queued message${queuedMessages === 1 ? "" : "s"}` +
-      `<span class="sm-sub">keeps active responses</span></button>`);
-  }
-  rows.push(`<button role="menuitem" class="stop-all" data-stop-scope="all">` +
-    `■ Stop everything<span class="sm-sub">responses, pair cycle, hops, lurkers and queue</span></button>`);
-  $("stopMenu").innerHTML = rows.join("");
+  // Say what the primary click will actually do. A run-pinned `active` stop
+  // ends the chain the reply would have continued into, which is the part the
+  // user cares about and the part a seat-scoped stop deliberately does not do.
+  $("stopBtn").title = choose ? "Choose what to stop" :
+    active.length === 1
+      ? `Stop ${seatLabel(active[0])} and the follow-ups this reply would trigger`
+      : "Stop the exchange";
+  renderStopMenu(summary);
 }
 
 // ---- queued work ----
-function setQueue(n, items, dispatches) {
+function setQueue(n, items, dispatches, paused) {
   if (items) state.queue = items;
   if (state.summary) {
     state.summary.queued = n;
     if (dispatches !== undefined) state.summary.queuedDispatches = dispatches;
+    if (paused !== undefined) state.summary.queuePaused = !!paused;
   }
+  const held = !!(state.summary && state.summary.queuePaused);
   const shown = dispatches === undefined ? n : dispatches;
   const b = $("queueBadge");
-  b.style.display = n > 0 ? "inline-flex" : "none";
-  b.textContent = `⏳ ${shown} queued`;
-  if (n <= 0) closeQueuePop();
+  // An armed pause is never invisible: it survives an empty queue on purpose,
+  // so the badge has to stay and say so, or the next message the user sends
+  // would be held with nothing on screen explaining why.
+  b.style.display = (n > 0 || held) ? "inline-flex" : "none";
+  b.textContent = held ? (n > 0 ? `⏸ ${shown} held` : "⏸ queue paused") : `⏳ ${shown} queued`;
+  b.title = held
+    ? "The queue is paused — nothing new starts until you resume it"
+    : "See what's waiting";
+  if (n <= 0 && !held) closeQueuePop();
   else if ($("queueWrap").classList.contains("open")) renderQueuePop();
   // The Stop menu offers "cancel the queue" and counts what it would drop, so
   // it goes stale the moment the queue moves — including when the queue drains
@@ -2380,11 +3151,14 @@ function queueGroups() {
     if (!g) {
       g = {
         key, groupId: item.queueGroupId, sourceN: item.sourceN,
-        text: item.text, ts: item.ts, target: item.target, rows: [],
+        text: item.text, ts: item.ts, target: item.target, head: false, rows: [],
       };
       byKey.set(key, g);
       groups.push(g);
     }
+    // Otherwise a redirect appears above work the user sent earlier with
+    // nothing on the card explaining why.
+    g.head = g.head || !!item.head;
     for (const a of item.agents) {
       g.rows.push({ agent: a, pos: (item.positions || {})[a] || 0, kind: item.kind });
     }
@@ -2402,26 +3176,43 @@ function queueCardHTML(g) {
   const runRows = running.map((b) =>
     `<span class="qp-row running"><i class="bs-dot" style="background:${esc(seatColor(b.agent))}"></i>` +
     `${esc(seatLabel(b.agent))} ${esc(RUNNING_VERB[b.phase] || "responding")}</span>`);
+  // Position survives a hold — that is exactly what pause preserves — so the
+  // "#3" suffix stays in both wordings.
+  const held = !!(state.summary && state.summary.queuePaused);
   const waitRows = g.rows.map((r) =>
     `<span class="qp-row"><i class="bs-dot" style="background:${esc(seatColor(r.agent))}"></i>` +
-    `${esc(seatLabel(r.agent))} ${r.kind === "cycle" ? "pair cycle queued" : "queued"}` +
+    `${esc(seatLabel(r.agent))} ${r.kind === "cycle"
+      ? (held ? "pair cycle held" : "pair cycle queued")
+      : (held ? "held" : "queued")}` +
     `${r.pos ? ` #${r.pos}` : ""}</span>`);
-  const meta = [hhmm(g.ts), g.target ? `@${g.target}` : ""].filter(Boolean).join(" · ");
-  return `<div class="qp-card">` +
+  const meta = [g.head ? "↪ next" : "", hhmm(g.ts), g.target ? `@${g.target}` : ""]
+    .filter(Boolean).join(" · ");
+  return `<div class="qp-card${held ? " paused" : ""}">` +
     `<div class="qp-top">` +
     `<button class="qp-src"${g.sourceN === null || g.sourceN === undefined ? "" : ` data-jump-n="${esc(String(g.sourceN))}"`} title="Jump to this message">` +
     `<span class="qp-snip">${esc(g.text || "(no text)")}</span><span class="qp-meta">${esc(meta)}</span></button>` +
     (g.groupId ? `<button class="qp-x" data-cancel-group="${esc(g.groupId)}" ` +
-      `title="Cancel everything this message still has waiting — anything already running continues">✕</button>` : "") +
+      `title="Discard everything this message still has waiting — anything already running continues">✕</button>` : "") +
     `</div><div class="qp-rows">${runRows.join("")}${waitRows.join("")}</div></div>`;
 }
 function renderQueuePop() {
   const groups = queueGroups();
-  $("queuePop").innerHTML = groups.length
-    ? `<div class="qp-head"><span>Queued work</span>` +
-      `<button data-cancel-group="" title="Drop everything still waiting; running responses continue">Cancel all queued</button></div>` +
-      groups.map(queueCardHTML).join("")
-    : `<div class="qp-empty">Nothing is waiting.</div>`;
+  const held = !!(state.summary && state.summary.queuePaused);
+  const head = `<div class="qp-head"><span>${held ? "Held by you" : "Queued work"}</span>` +
+    `<span class="qp-actions">` +
+    `<button class="qp-pause" data-queue-pause="${held ? "0" : "1"}" title="${held
+      ? "Start delivering queued work again, in order"
+      : "Hold everything still waiting; running responses finish and nothing is lost"}">` +
+    `${held ? "▶ Resume" : "⏸ Pause"}</button>` +
+    (groups.length
+      ? `<button data-cancel-group="" title="Discard everything still waiting; running responses continue">Discard all queued</button>`
+      : "") +
+    `</span></div>`;
+  $("queuePop").innerHTML = head + (groups.length
+    ? groups.map(queueCardHTML).join("")
+    : `<div class="qp-empty">${held
+      ? "Nothing is waiting — anything you send now is held."
+      : "Nothing is waiting."}</div>`);
 }
 $("queueBadge").onclick = (e) => {
   e.stopPropagation();
@@ -2432,13 +3223,15 @@ $("queueBadge").onclick = (e) => {
   if (open) renderQueuePop();
 };
 $("queuePop").addEventListener("click", async (e) => {
+  const hold = e.target.closest("[data-queue-pause]");
+  if (hold) return setQueuePaused(hold.dataset.queuePause === "1");
   const btn = e.target.closest("[data-cancel-group]");
   if (!btn) return;
   const groupId = btn.dataset.cancelGroup;
   try {
     const r = await api("/api/queue/cancel", { room: state.room, ...(groupId ? { groupId } : {}) });
     // Already drained is not a failure: what the user asked to be gone is gone.
-    toast(r.cancelled ? `Cancelled ${r.cancelled} queued deliver${r.cancelled === 1 ? "y" : "ies"}.`
+    toast(r.cancelled ? `Discarded ${r.cancelled} queued deliver${r.cancelled === 1 ? "y" : "ies"}.`
       : "That was already out of the queue.");
   } catch (err) { toast(err.message, true); }
 });
@@ -2699,7 +3492,7 @@ function connect(resyncOnOpen = false) {
     if (msg.type === "entry") addEntry(msg.entry);
     else if (msg.type === "receipt") addReceipt(msg.receipt);
     else if (msg.type === "queue") {
-      setQueue(msg.size, msg.items, msg.dispatches);
+      setQueue(msg.size, msg.items, msg.dispatches, msg.paused);
     }
     else if (msg.type === "lurk") whisper(msg.agent, msg.error, msg.hop, msg.skipped, msg.asleep, msg.held, msg.queued, msg.attention);
     else if (msg.type === "status") {
@@ -2743,7 +3536,7 @@ function connect(resyncOnOpen = false) {
       renderBusyStrip();
       if ($("queueWrap").classList.contains("open")) renderQueuePop();
     }
-    else if (msg.type === "stream") liveStream(msg.agent, msg.text);
+    else if (msg.type === "stream") liveStream(msg.agent, msg);
     else if (msg.type === "room") {
       applySummary(msg.room);
     }
@@ -2774,6 +3567,24 @@ function connect(resyncOnOpen = false) {
 }
 
 // ------------------------------------------------------------ load room
+// What a first run needs to know before anything is spent. An unauthenticated
+// CLI used to surface as an opaque exit code on the first real message, which is
+// the worst possible moment to find out.
+async function refreshDoctor(roomName) {
+  try {
+    const d = await api("/api/doctor?room=" + encodeURIComponent(roomName));
+    if (state.room !== roomName) return;
+    state.doctor = d.seats || {};
+    const bad = Object.entries(state.doctor).filter(([, h]) => !h.ok);
+    const banner = $("setupBanner");
+    if (!bad.length) { banner.style.display = "none"; return; }
+    banner.innerHTML = bad.map(([seat, h]) =>
+      `<div><b>${esc(seatLabel(seat))} isn't ready</b> — ${esc(h.detail)}. ${esc(h.how)}</div>`).join("");
+    banner.style.display = "block";
+    if (state.summary) applySummary(state.summary); // repaint the pills
+  } catch { /* the room still works; the pills carry what they know */ }
+}
+
 async function loadRoom(name) {
   retireSettingsPick(); // a folder dialog open for the old room must not land here
   let data;
@@ -2800,6 +3611,7 @@ async function loadRoom(name) {
     state.hopChoice = storedHopChoice(roomName);
   }
   state.room = roomName;
+  refreshDoctor(roomName);
   history.replaceState(null, "", roomName === "default" ? location.pathname : "?room=" + encodeURIComponent(roomName));
   // Keep an explicit destination if it exists in the destination room. Only a
   // genuinely stale seat id falls back to automatic routing.
@@ -2860,24 +3672,37 @@ async function refreshRooms() {
     const linked = typeof r === "string" ? false : r.linked;
     const seats = (typeof r === "string" ? null : r.seats) || [];
     const nonDefault = seats.length && seats.join(",") !== "claude,codex";
+    // The listing carries each seat's provider, because a room in the sidebar
+    // is not the open room and seatMeta has no summary to resolve against.
+    const rowProviders = (typeof r === "string" ? null : r.providers) || {};
+    const rowAvatar = (a) => {
+      const p = state.providers[rowProviders[a] || a];
+      return (p && p.avatar) || String(a)[0].toUpperCase();
+    };
     const seatTag = nonDefault
-      ? `<span style="font-size:10px;opacity:.7">${seats.map((s) => (state.providers[s] && state.providers[s].avatar) || s[0].toUpperCase()).join("+")}</span>`
+      ? `<span style="font-size:10px;opacity:.7">${seats.map(rowAvatar).join("+")}</span>`
       : "";
-    const b = document.createElement("button");
-    b.className = "room-item" + (name === state.room ? " active" : "");
-    b.innerHTML = `<span class="dot"></span><span style="flex:1;overflow:hidden;text-overflow:ellipsis">${esc(name)}</span>` +
-      `<span class="rmeta">${seatTag}${linked ? "📁" : ""}${mode === "work" ? "🔨" : ""}</span>` +
-      `<span class="racts"><span class="ract" data-act="rename" title="Rename room">✎</span>` +
+    // A row, not one big button: the rename and delete controls have to be real
+    // buttons to be reachable by keyboard, and nesting a button inside a button
+    // is invalid — which is why they used to be unfocusable spans revealed only
+    // on hover, leaving no keyboard path to either action.
+    const row = document.createElement("div");
+    row.className = "room-item" + (name === state.room ? " active" : "");
+    row.innerHTML =
+      `<button type="button" class="ropen"><span class="dot"></span>` +
+      `<span style="flex:1;overflow:hidden;text-overflow:ellipsis;text-align:left">${esc(name)}</span>` +
+      `<span class="rmeta">${seatTag}${linked ? "📁" : ""}${mode === "work" ? "🔨" : ""}</span></button>` +
+      `<span class="racts"><button type="button" class="ract" data-act="rename" title="Rename room" aria-label="Rename ${esc(name)}">✎</button>` +
       // the default room is the app's fallback; it can be emptied, not removed
-      (name === "default" ? "" : `<span class="ract del" data-act="delete" title="Delete room">✕</span>`) +
+      (name === "default" ? "" : `<button type="button" class="ract del" data-act="delete" title="Delete room" aria-label="Delete ${esc(name)}">✕</button>`) +
       `</span>`;
-    b.onclick = (e) => {
+    row.onclick = (e) => {
       const act = e.target.closest(".ract");
-      if (!act) return loadRoom(name);
+      if (!act) { setNavOpen(false); return loadRoom(name); }
       e.stopPropagation();
       if (act.dataset.act === "rename") renameFlow(name); else deleteFlow(name);
     };
-    list.appendChild(b);
+    list.appendChild(row);
   }
 }
 // New-room seat pickers: pre-filled with the default pair, visible so the
@@ -2888,7 +3713,36 @@ function fillSeatPickers() {
   for (const [sel, def] of [[$("seat1"), "claude"], [$("seat2"), "codex"]]) {
     sel.innerHTML = ids.map((p) => `<option value="${esc(p)}">${esc(state.providers[p].label)}</option>`).join("");
     sel.value = ids.includes(def) ? def : ids[sel === $("seat2") ? 1 : 0] || ids[0];
+    sel.onchange = syncSeatNames;
   }
+  syncSeatNames();
+}
+// Two seats may run the same provider — what has to differ is their names,
+// because a seat id is its @mention, its config key and the author on every
+// line it writes. The name fields only appear when they are actually needed;
+// picking two different providers keeps the form exactly as it was.
+function syncSeatNames() {
+  const p1 = $("seat1").value, p2 = $("seat2").value;
+  const same = !!p1 && p1 === p2;
+  $("seatNames").style.display = same ? "flex" : "none";
+  $("seatNamesHint").style.display = same ? "block" : "none";
+  if (!same) return;
+  // Prefill rather than demand: "claude" and "claude2" are a fine default, and
+  // anyone who wants "opus"/"sonnet" can just type over them.
+  if (!$("seat1Name").value.trim()) $("seat1Name").value = p1;
+  if (!$("seat2Name").value.trim()) $("seat2Name").value = p2 + "2";
+  $("seat1Name").placeholder = p1;
+  $("seat2Name").placeholder = p2 + "2";
+}
+// Mirrors the server's rule so the message names the problem instead of
+// bouncing back a 400. The server still validates; this is only the wording.
+const RESERVED_SEAT_NAMES = new Set(["both", "user", "system", "all", "none"]);
+function seatNameIssue(id) {
+  if (!/^[a-z][a-z0-9-]{0,19}$/.test(id)) {
+    return `"${id}" — seat names are lowercase letters, numbers and dashes, starting with a letter.`;
+  }
+  if (RESERVED_SEAT_NAMES.has(id)) return `"${id}" is reserved — it would collide with routing.`;
+  return null;
 }
 
 // ------------------------------------------------------------ composer
@@ -3232,8 +4086,7 @@ window.addEventListener("drop", (e) => {
 // ended the server says so and this returns quietly — an error toast there is
 // exactly what makes someone press Stop a second time.
 async function stopResponses(scope, agent) {
-  $("stopWrap").classList.remove("open");
-  $("stopBtn").setAttribute("aria-expanded", "false");
+  closeStopMenu();
   const info = agent ? busyInfoFor(agent) : null;
   // "Stop the current responses" means the ones on screen when it was clicked.
   // Between the click and the request landing, a run can finish and the queue
@@ -3252,24 +4105,49 @@ async function stopResponses(scope, agent) {
     if (r && r.stale) return; // already over; the user's intent already holds
     if (scope === "queue") {
       toast(r && r.cancelled
-        ? `Cancelled ${r.cancelled} queued deliver${r.cancelled === 1 ? "y" : "ies"} — running responses continue.`
+        ? `Discarded ${r.cancelled} queued deliver${r.cancelled === 1 ? "y" : "ies"} — running responses continue.`
         : "Nothing was left in the queue.");
     }
   } catch (e) { toast(e.message, true); }
 }
+// A hold, not a stop: nothing is dropped, reordered or abandoned, and running
+// responses finish. Shared by the Stop menu row and the queue popover.
+async function setQueuePaused(paused) {
+  closeStopMenu();
+  try {
+    const r = await api("/api/queue/pause", { room: state.room, paused });
+    setQueue(r.queued, undefined, r.dispatches, r.paused);
+    toast(r.paused
+      ? "Queue paused — running responses finish; anything you send is held."
+      : "Queue resumed.");
+  } catch (e) { toast(e.message, true); }
+}
+// One click, one meaning. With a single response running and nothing queued the
+// primary stops exactly that run — pinned to its runId, `active` scope, so the
+// chain it would have continued into stops with it rather than hopping on after
+// the reply the user just killed. It never widens: a second seat, queued work or
+// a pair cycle each raise a question one click cannot answer, and those open the
+// chooser. In the gap between a reply and the hop it triggers there is no run to
+// name, so the only honest meaning left is the room-wide line — and the queue is
+// empty there by construction, because queued work would have opened the chooser
+// instead of reaching this branch.
 $("stopBtn").onclick = () => {
   if (!state.summary) return;
+  if (stopIsChoice(state.summary)) return toggleStopMenu();
   const active = state.summary.busy || [];
-  if (!stopIsChoice(state.summary)) {
-    return active.length === 1 ? stopResponses("seat", active[0]) : stopResponses("all", null);
-  }
-  const wrap = $("stopWrap");
-  const open = wrap.classList.toggle("open");
-  $("stopBtn").setAttribute("aria-expanded", String(open));
+  return active.length === 1 ? stopResponses("active", null) : stopResponses("all", null);
 };
+// The deliberate scopes stay one click away whatever the primary does —
+// seat-only is otherwise unreachable now that one busy seat stops directly.
+$("stopMore").onclick = () => { if (state.summary) toggleStopMenu(); };
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeStopMenu(); });
 $("stopMenu").onclick = (e) => {
+  const hold = e.target.closest("[data-queue-pause]");
+  if (hold && !hold.disabled) return setQueuePaused(hold.dataset.queuePause === "1");
   const choice = e.target.closest("[data-stop-scope]");
-  if (choice) stopResponses(choice.dataset.stopScope, choice.dataset.stopAgent || null);
+  // A row whose run ended while the menu was open is disabled where it stands.
+  if (!choice || choice.disabled) return;
+  stopResponses(choice.dataset.stopScope, choice.dataset.stopAgent || null);
 };
 input.addEventListener("keydown", (e) => {
   if (mentionKeydown(e)) return;
@@ -3345,6 +4223,8 @@ function mentionKeydown(e) {
 // ------------------------------------------------------------ rooms sidebar
 $("addRoomBtn").onclick = () => {
   clearNewRoomProject(); // a fresh form never inherits the last one's folder
+  $("seat1Name").value = ""; $("seat2Name").value = "";
+  syncSeatNames();
   $("newRoomForm").style.display = "block";
   $("newRoomInput").focus();
 };
@@ -3372,8 +4252,17 @@ $("newRoomForm").onsubmit = async (e) => {
   e.preventDefault();
   const name = $("newRoomInput").value.trim();
   if (!name) return;
-  const seats = [$("seat1").value, $("seat2").value].filter(Boolean);
-  if (seats.length === 2 && seats[0] === seats[1]) return toast("Pick two different seats.", true);
+  const providers = [$("seat1").value, $("seat2").value].filter(Boolean);
+  let seats = providers;
+  if (providers.length === 2 && providers[0] === providers[1]) {
+    // Same provider twice is a real room; the names are what distinguish them.
+    const ids = [$("seat1Name").value.trim().toLowerCase() || providers[0],
+      $("seat2Name").value.trim().toLowerCase() || providers[1] + "2"];
+    if (ids[0] === ids[1]) return toast("Give the two seats different names.", true);
+    const issue = ids.map(seatNameIssue).find(Boolean);
+    if (issue) return toast(issue, true);
+    seats = ids.map((id, i) => ({ id, provider: providers[i] }));
+  }
   const body = { name };
   if (seats.length === 2) body.seats = seats;
   if (newRoomProjectDir) body.projectDir = newRoomProjectDir;
@@ -3382,9 +4271,25 @@ $("newRoomForm").onsubmit = async (e) => {
   // only cleared on success — a rejected name leaves the form up, and the user
   // shouldn't have to pick their project again to fix a typo.
   newRoomPick++;
+  const asReview = $("newRoomReviewChk").checked;
   try {
     await api("/api/rooms", body);
+    // The flagship workflow used to take four separate actions to assemble:
+    // create, flip to work, turn on the reviewer's ear, then find lurkStyle.
+    // As a preset it is one checkbox — configured after creation so the room
+    // exists to configure, and reported rather than silently half-applied.
+    const reviewerId = typeof seats[1] === "string" ? seats[1] : (seats[1] || {}).id;
+    if (asReview && seats.length === 2 && reviewerId) {
+      try {
+        await api("/api/config", {
+          room: name,
+          config: { mode: "work", agents: { [reviewerId]: { lurk: true, lurkStyle: "balanced" } } },
+        });
+      } catch (err) { toast(`Room created, but the review preset didn't apply: ${err.message}`, true); }
+    }
     $("newRoomInput").value = "";
+    $("seat1Name").value = ""; $("seat2Name").value = "";
+    $("newRoomReviewChk").checked = false;
     $("newRoomForm").style.display = "none";
     clearNewRoomProject();
     await loadRoom(name);
@@ -3465,6 +4370,13 @@ function seatFieldHTML(a, field, p) {
     `<option value="bypassPermissions">full access — bypass ordinary Claude permission checks</option></select>` +
     `<div class="note">An effective mode change starts a fresh Claude session; the transcript keeps the room history.</div>` +
     `<div class="note danger">With Claude Code 2.1.126+, Full access includes protected paths such as .git and can reach outside this project. Explicit policy and OS limits may still apply. Claude recommends an isolated container or VM; using it directly on a trusted host grants host-level access.</div></div>`;
+  if (field === "approvalMode") return `<div class="fld"><label>Approval mode</label><select ${d(a, "approvalMode")}>` +
+    `<option value="auto">room default — Gemini's default in Talk, auto-approve edits in Work</option>` +
+    `<option value="plan">plan — read &amp; propose only, even in work rooms</option>` +
+    `<option value="auto_edit">auto edit — edits auto-approved; other tools still prompt</option>` +
+    `<option value="yolo">full access — auto-approve every tool</option></select>` +
+    `<div class="note">An effective mode change starts a fresh Gemini session; the transcript keeps the room history.</div>` +
+    `<div class="note danger">Full access auto-approves every tool call, including commands and writes outside this project. An isolated container or VM is the recommended place for it.</div></div>`;
   if (field === "sandbox") return `<div class="fld"><label>Sandbox</label><select ${d(a, "sandbox")}>` +
     `<option value="read-only">read-only (default)</option><option value="workspace-write">workspace-write</option>` +
     `<option value="danger-full-access">danger-full-access</option></select>` +
@@ -3557,7 +4469,7 @@ document.addEventListener("click", (e) => {
 });
 function renderSeatCards(s) {
   $("seatCards").innerHTML = s.seats.map((a) => {
-    const p = s.providers[a] || {};
+    const p = (s.seatInfo && s.seatInfo[a]) || s.providers[a] || {};
     const ag = s.agents[a];
     let f = (p.fields || []).map((field) => seatFieldHTML(a, field, p)).join("");
     f += `<div class="fld"><label>Lurk assertiveness (when 👂 is on)</label><select data-seat="${esc(a)}" data-f="lurkStyle">` +
@@ -3587,13 +4499,18 @@ function retireSettingsPick() { settingsPick++; }
 function closeSettings() {
   retireSettingsPick();
   $("overlay").classList.remove("open");
+  // Closing a dialog used to leave focus on nothing at all.
+  if (settingsOpener && document.contains(settingsOpener)) settingsOpener.focus();
+  settingsOpener = null;
 }
 function openSettings() {
   const s = state.summary; if (!s) return;
+  settingsOpener = document.activeElement;
   retireSettingsPick();
   $("roomPath").textContent = s.dir;
   $("mDelete").hidden = s.name === "default"; // the fallback room can't be removed
   renderSeatCards(s);
+  $("s_notify").checked = notifyEnabled();
   $("s_projdir").value = s.cfg.projectDir || "";
   $("s_roomnote").value = s.cfg.roomNote || "";
   $("s_default").innerHTML = s.seats.map((x) => `<option>${esc(x)}</option>`).join("");
@@ -3627,21 +4544,25 @@ $("mSave").onclick = async () => {
       if (v !== undefined) agents[a][f] = v;
     }
   }
-  if (agents.claude && s.cfg.agents.claude) {
-    const before = effectiveSeatPermission("claude", s.cfg.agents.claude, s.cfg.mode || "talk");
-    const afterCfg = { ...s.cfg.agents.claude, ...agents.claude };
-    const after = effectiveSeatPermission("claude", afterCfg, s.cfg.mode || "talk");
-    if (!isFullAccess(before) && isFullAccess(after)) {
-      const scope = $("s_projdir").value.trim() || "the room workspace";
-      const accepted = confirm(
-        `⚠ Give Claude Full access in this room?\n\n` +
-        `Claude will bypass its ordinary permission prompts and checks. With Claude Code 2.1.126+, it can modify protected paths such as .git; it can also run commands, use inherited credentials and network access, and change files outside:\n${scope}\n\n` +
-        `Explicit ask/deny rules, managed policy, OS permissions, and Claude's hard safety limits may still restrict actions.\n\n` +
-        `Parley requests separate Plan invocations for protected @both discussions, pair reviews, and lurk turns. They discard Claude's ordinary native session; the next ordinary turn is re-briefed from room history. Ordinary handoffs and pair-worker turns still receive Full access. Trusted external Claude settings or wrappers remain outside this boundary.\n\n` +
-        `Claude will start a fresh session. Claude recommends an isolated container or VM; continuing directly on this trusted host grants host-level access.`
-      );
-      if (!accepted) return;
-    }
+  // Every seat, not the one that happens to be called "claude": a seat can be
+  // named anything, and the warned escalation has to follow the seat actually
+  // being elevated.
+  for (const a of s.seats) {
+    if (!agents[a] || !s.cfg.agents[a]) continue;
+    const roomMode = s.cfg.mode || "talk";
+    const before = effectiveSeatPermission(a, s.cfg.agents[a], roomMode);
+    const after = effectiveSeatPermission(a, { ...s.cfg.agents[a], ...agents[a] }, roomMode);
+    if (isFullAccess(before) || !isFullAccess(after)) continue;
+    const who = seatLabel(a);
+    const scope = $("s_projdir").value.trim() || "the room workspace";
+    const accepted = confirm(
+      `⚠ Give ${who} Full access in this room?\n\n` +
+      `${who} will bypass its ordinary permission prompts and checks. It can modify protected paths such as .git; it can also run commands, use inherited credentials and network access, and change files outside:\n${scope}\n\n` +
+      `Explicit ask/deny rules, managed policy, OS permissions, and the CLI's own hard safety limits may still restrict actions.\n\n` +
+      `Parley requests separate read-only invocations for protected @both discussions, pair reviews, and lurk turns. They discard the seat's ordinary native session; the next ordinary turn is re-briefed from room history. Ordinary handoffs and pair-worker turns still receive Full access. Trusted external CLI settings or wrappers remain outside this boundary.\n\n` +
+      `${who} will start a fresh session. Running an agent with full access directly on a trusted host grants host-level access; an isolated container or VM is the recommended place for it.`
+    );
+    if (!accepted) return;
   }
   // Build the request from what is on screen now, then retire the picker: a
   // dialog that resolves while the save is in flight would otherwise fill the
@@ -3655,6 +4576,16 @@ $("mSave").onclick = async () => {
     roomNote: $("s_roomnote").value.trim() || null,
     agents,
   };
+  // The notification preference is this browser's, not the room's, so it is
+  // applied here rather than sent to the server. Asking for permission only
+  // when it is switched on keeps the prompt tied to a deliberate action.
+  const wantNotify = $("s_notify").checked;
+  if (wantNotify && !notifyEnabled()) {
+    if (await requestNotifyPermission()) setNotifyEnabled(true);
+    else toast("Your browser blocked notifications for this page.", true);
+  } else if (!wantNotify) {
+    setNotifyEnabled(false);
+  }
   retireSettingsPick();
   try {
     const saved = await api("/api/config", { room: state.room, config });

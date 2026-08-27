@@ -8,7 +8,7 @@
  *   logins. Never reads, stores or forwards credentials.
  * - Binds to 127.0.0.1 only.
  *
- * Usage: node parley.mjs [--port N] [--root DIR] [--no-open]
+ * Usage: node parley.mjs [--port N] [--root DIR] [--no-open] [--version]
  */
 
 import { spawn, spawnSync } from "node:child_process";
@@ -39,7 +39,24 @@ const UI_HTML = fs.readFileSync(UI_FILE, "utf8");
 //    distinguish a deliberately bounded exchange from an undelivered reply.
 // 9: live causal request/answer scheduling generalizes that guarantee across
 //    explicit hops, concurrent @both replies and recovered Wake/Retry work.
-const RUNTIME_PROTOCOL = "9";
+// 10: stream events carry increments ({from, delta}) rather than the whole
+//    reply each time, with periodic full-text keyframes. An older UI reads only
+//    `text` and would blank the live bubble on every increment. The summary
+//    also gains `interruptedResponses` beside `cancelledDeliveries`, so "you
+//    stopped this seat's answer" is a distinct persisted fact rather than
+//    nothing at all, and the cancellation record renders inside the message it
+//    is about instead of as a floating pill. A cached older UI reads a stopped
+//    response as "hasn't seen this yet" — claiming a seat never received a
+//    message it did receive — and still draws the pill the new page moved.
+//    Finally, the queue can be deliberately held: summaries and the queue event
+//    carry `queuePaused`, and a discarded message carries its own per-seat
+//    Retry. A cached older page would render held work as ordinary waiting on a
+//    seat that is visibly idle, with no control to release it. Finally, a user
+//    entry may carry `meta.askFrom`, whose quote header is the only thing
+//    separating an auto-composed "Continue responding to this message" bubble
+//    from something the user typed, and queue rows carry `head` — the one place
+//    lane order is not arrival order.
+const RUNTIME_PROTOCOL = "10";
 const IS_WIN = process.platform === "win32";
 
 const IMAGE_TYPES = new Map([
@@ -63,6 +80,11 @@ const CLAUDE_NATIVE_IMAGE_BYTES = MAX_IMAGE_TOTAL_BYTES;
 const CLAUDE_STDIN_SAFE_BYTES = 9_500_000;
 const MAX_MESSAGE_TEXT = 200_000;
 const MAX_MESSAGE_BODY_BYTES = 18 * 1024 * 1024;
+// Line assembly for CLI stdout. stdout itself is capped below, but the
+// accumulator waiting for a newline was not: a CLI emitting a huge newline-free
+// run (one giant stream-json event, or binary) grew it until the heap died,
+// which is an abort rather than a catchable error.
+const MAX_CLI_LINE_BYTES = 20_000_000;
 
 // ---------------------------------------------------------------- CLI args
 
@@ -71,14 +93,28 @@ function argValue(flag) {
   const i = argv.indexOf(flag);
   return i >= 0 && argv[i + 1] ? argv[i + 1] : null;
 }
+// Read from the packaged manifest rather than a second literal that would drift
+// from it. A source checkout and an npm install both keep it one level up from
+// this file, but a bug report is worth more than a crash if that ever changes.
+function packageVersion() {
+  try { return JSON.parse(fs.readFileSync(path.join(__dirname, "package.json"), "utf8")).version || "unknown"; }
+  catch { return "unknown"; }
+}
+if (argv.includes("--version") || argv.includes("-v")) {
+  console.log(packageVersion());
+  process.exit(0);
+}
 if (argv.includes("--help") || argv.includes("-h")) {
   console.log(`Parley — a shared chat room for you, Claude and Codex.
 
-Usage: parley [--port N] [--root DIR] [--no-open]
+Usage: parley [--port N] [--root DIR] [--no-open] [--version]
 
-  --port N     Port to serve the UI on (default 4141, auto-increments if busy)
+  --port N     Port to serve the UI on (default 4141, auto-increments if busy;
+               0 asks the OS for any free port)
   --root DIR   Directory that holds room folders (default ~/.parley)
-  --no-open    Don't open the browser automatically`);
+  --no-open    Don't open the browser automatically
+  --version    Print the version and exit
+  --help       Print this message and exit`);
   process.exit(0);
 }
 const portArg = argValue("--port");
@@ -102,18 +138,50 @@ const NO_OPEN = argv.includes("--no-open");
 // The token lives in memory, so restarting the server invalidates it.
 const SESSION_TOKEN = crypto.randomBytes(24).toString("base64url");
 
+// Hash both sides so the comparison is over fixed-length buffers regardless of
+// what a caller sent, then compare without leaking position through timing.
+function sameSecret(given, expected) {
+  const h = (v) => crypto.createHash("sha256").update(String(v || ""), "utf8").digest();
+  return crypto.timingSafeEqual(h(given), h(expected));
+}
+
 // ---------------------------------------------------------------- constants
 
 /**
  * Providers — the kinds of agent that can sit at the table. A room seats
- * exactly TWO, chosen at creation. The seat's key in room config IS the
- * provider name, so existing rooms need no migration and @mentions match.
+ * exactly TWO seats. Each seat has an **id** (its @mention name, its key in
+ * cfg.agents and state.agents, and the author on every entry and receipt) and a
+ * **provider** (`cfg.agents[id].provider`, a key of this registry).
  *
- * ADDING A PROVIDER: implement a send(room, opts) adapter with the same
- * contract as claudeSend/codexSend (return { text, sessionRef, usage? };
- * read your seat config from room.cfg.agents.<yourname>), add it to the
- * `adapters` map below the adapter definitions, and describe it here. The
- * seat picker, settings, colors and routing pick it up automatically.
+ * The id defaults to the provider name, which is why every room written before
+ * seats and providers were separate migrates by gaining one field and renaming
+ * nothing. That matters more than it looks: the seat id is the primary key of
+ * every durable record in the room — sessions, cursors, receipts, withdrawals,
+ * sleep, pair roles, queue lanes and the author of every transcript line. A
+ * migration that renamed seats would orphan all of it at once.
+ *
+ * ADDING A PROVIDER: implement an adapter with the same contract as
+ * claudeSend/codexSend/geminiSend — read config from `room.cfg.agents[seat]`
+ * and state from `room.state.agents[seat]`, pass `{ room, agent: seat }` to
+ * runCli or Stop cannot reach your process, and return
+ * `{ text, sessionRef, usage? }`. Add it to the `adapters` map below and to
+ * this registry. Anything the engine needs to know about your provider is
+ * *declared* in `capabilities`, never branched on by name outside the adapter:
+ *   sessions            "resume" (Parley can reattach) or "none"
+ *   sessionScope        { field, of(seatCfg, roomMode) } — the permission
+ *                       provenance stamped on a saved session, so a session
+ *                       created under looser rules is never silently resumed
+ *   isolateProtectedTurn(seatCfg, roomMode) — true when a read-only turn must
+ *                       not reuse this seat's saved session at all
+ *   extraArgsIssue(args) — provider-specific dangerous-flag rules
+ *   resumeLostPatterns  stderr shapes meaning "that session is gone"
+ *   sentinelSessionRefs session refs that are not durable identities
+ *   sentinelNote        one-time warning text when a sentinel is in use
+ *   nativeImageBytes    cap on natively-attached image bytes
+ *   sessionFixedFields  seat fields baked in at session creation; changing one
+ *                       must start a fresh session
+ *   resetOnRoomModeChange whether a Talk/Work flip invalidates the session
+ * The seat picker, settings, colours and routing pick it up automatically.
  */
 const PROVIDERS = {
   claude: {
@@ -128,6 +196,43 @@ const PROVIDERS = {
     efforts: ["low", "medium", "high", "xhigh", "max", "ultracode"],
     models: ["fable", "opus", "sonnet", "haiku"],
     effortLabels: { xhigh: "Extra High", ultracode: "Ultracode (xhigh + workflow orchestration)" },
+    capabilities: {
+      sessions: "resume",
+      // Arrow functions, so effectiveClaudePermissionMode being declared later
+      // in the file is fine — they are evaluated at call time, not at load.
+      sessionScope: { field: "permissionScope", of: (seatCfg, roomMode) => effectiveClaudePermissionMode(seatCfg, roomMode) },
+      isolateProtectedTurn: (seatCfg, roomMode) => effectiveClaudePermissionMode(seatCfg, roomMode) === "bypassPermissions",
+      nativeImageBytes: CLAUDE_NATIVE_IMAGE_BYTES,
+      // Room Settings is the supported, warned route to Full access; these are
+      // the raw argument shapes that would reach it without the warning.
+      extraArgsIssue: (args) => {
+        let seen = 0;
+        for (let i = 0; i < args.length; i++) {
+          const raw = args[i];
+          if (raw.split("=", 1)[0].toLowerCase() !== "--permission-mode") continue;
+          if (++seen > 1) return "Only one Claude --permission-mode override is allowed";
+          const mode = raw.includes("=") ? raw.slice(raw.indexOf("=") + 1) : args[i + 1];
+          if (!String(mode || "").trim() || String(mode).startsWith("-")) {
+            return "Claude --permission-mode requires a value";
+          }
+          if (String(mode || "").trim().toLowerCase() === "bypasspermissions") {
+            return "Use Claude's warned Full access setting instead of bypassPermissions in Extra CLI args";
+          }
+        }
+        return null;
+      },
+      resumeLostPatterns: [
+        /\bno conversation found with session id\b/i,
+        /\bconversation(?:\s+with)?(?:\s+session)?(?:\s+id)?[^\r\n]{0,80}\b(?:not found|does not exist)\b/i,
+      ],
+      enums: {
+        permissionMode: {
+          values: () => CLAUDE_PERMISSION_MODES,
+          fallback: "auto",
+          error: (v) => `Unknown Claude permission mode: ${v}. Choose room default, plan, acceptEdits, or full access.`,
+        },
+      },
+    },
   },
   codex: {
     label: "Codex", sub: "OpenAI Codex CLI", desc: "OpenAI's coding agent",
@@ -156,14 +261,108 @@ const PROVIDERS = {
       }
       return models.length ? { models, efforts: [...efforts].map(([value, hint]) => ({ value, hint })) } : null;
     },
+    capabilities: {
+      sessions: "resume",
+      resumeLostPatterns: [
+        /\bno rollout found for (?:thread|conversation) id\b/i,
+        /\bsession not found for (?:thread|request)_id\b/i,
+        /\bthread not found\b/i,
+      ],
+      // `--last` resumes "whatever ran most recently", which is not this room's
+      // thread and not a durable identity.
+      sentinelSessionRefs: ["--last"],
+      sentinelNote: "Note: {seat} did not report a thread id, so Parley will resume its most recent session (--last). Using {seat} outside Parley at the same time could cross threads.",
+      sessionFixedFields: ["sandbox"],
+      resetOnRoomModeChange: true,
+    },
+  },
+  gemini: {
+    label: "Gemini", sub: "Google Gemini CLI", desc: "Google's coding agent",
+    avatar: "G", color: "#8ab4f8",
+    defaults: { command: "gemini", model: null, extraArgs: [], lurk: false, lurkStyle: "balanced", lurkPrompt: null, approvalMode: "auto" },
+    fields: ["command", "model", "approvalMode", "extraArgs"],
+    // The CLI exposes no reasoning-effort dial, so the seat card omits it.
+    models: ["gemini-3-pro", "gemini-3-flash"],
+    capabilities: {
+      // Verified against gemini 0.53.0: `--session-id <uuid>` starts a session
+      // with an id we choose and `--resume <uuid>` reattaches to it, so the
+      // delta protocol works here exactly as it does for the other two.
+      sessions: "resume",
+      sessionScope: { field: "approvalScope", of: (seatCfg, roomMode) => effectiveGeminiApprovalMode(seatCfg, roomMode) },
+      fullAccessScope: "yolo",
+      resumeLostPatterns: [
+        /\bsession not found\b/i,
+        /\bno session\b[^\r\n]{0,40}\bfound\b/i,
+      ],
+      nativeImageBytes: Infinity,
+      // Same reasoning as Claude's: Room Settings is the warned route to yolo.
+      extraArgsIssue: (args) => {
+        for (let i = 0; i < args.length; i++) {
+          const flag = args[i].split("=", 1)[0].toLowerCase();
+          if (flag === "-y" || flag === "--yolo") {
+            return "Use Gemini's warned Full access setting instead of --yolo in Extra CLI args";
+          }
+          if (flag === "--approval-mode") {
+            const mode = args[i].includes("=") ? args[i].slice(args[i].indexOf("=") + 1) : args[i + 1];
+            if (String(mode || "").trim().toLowerCase() === "yolo") {
+              return "Use Gemini's warned Full access setting instead of --approval-mode yolo in Extra CLI args";
+            }
+          }
+        }
+        return null;
+      },
+      // The approval mode is chosen per invocation, so nothing about it is
+      // baked into the session.
+      enums: {
+        approvalMode: {
+          values: () => GEMINI_APPROVAL_MODES,
+          fallback: "auto",
+          error: (v) => `Unknown Gemini approval mode: ${v}. Choose room default, plan, auto_edit, or full access.`,
+        },
+      },
+    },
   },
 };
 const DEFAULT_SEATS = ["claude", "codex"];
 const CLAUDE_PERMISSION_MODES = new Set(["auto", "plan", "acceptEdits", "bypassPermissions"]);
+// Gemini's own vocabulary, minus the interactive-only cases. "auto" is Parley's
+// room default rather than one of the CLI's values, matching Claude's field.
+const GEMINI_APPROVAL_MODES = new Set(["auto", "plan", "auto_edit", "yolo"]);
 
 function seatIds(room) { return Object.keys(room.cfg.agents); }
 function otherSeat(room, id) { return seatIds(room).find((s) => s !== id) || id; }
-function providerOf(id) { return PROVIDERS[id] || PROVIDERS[DEFAULT_SEATS[0]]; }
+// A seat's provider comes from its config; a seat written before the two were
+// separate has none, and its id is the provider name. Null means the seat
+// resolves to nothing real — the same condition a junk seat key produced before.
+function providerIdFor(seatCfg, seatId) {
+  const p = seatCfg && seatCfg.provider;
+  return PROVIDERS[p] ? p : (PROVIDERS[seatId] ? seatId : null);
+}
+// Only where there is no room to consult, i.e. building a default config.
+function providerById(id) { return PROVIDERS[id] || PROVIDERS[DEFAULT_SEATS[0]]; }
+// The state field a provider stamps its session's permission provenance into,
+// or null if its sessions carry none. Takes a seat config rather than a room so
+// defaultState can use it before the room object exists.
+function sessionScopeField(seatCfg, seatId) {
+  const pid = providerIdFor(seatCfg, seatId);
+  const scope = pid && (PROVIDERS[pid].capabilities || {}).sessionScope;
+  return scope ? scope.field : null;
+}
+function providerOf(room, seatId) { return providerById(providerIdFor(room.cfg.agents[seatId], seatId)); }
+// Everything the engine needs to know about a seat's provider, declared rather
+// than branched on by name. See the PROVIDERS doc comment for the keys.
+function capsOf(room, seatId) { return providerOf(room, seatId).capabilities || {}; }
+// The provider id that drives a seat, for keying the adapters map.
+function providerIdOf(room, seatId) { return providerIdFor(room.cfg.agents[seatId], seatId) || DEFAULT_SEATS[0]; }
+
+// A seat id is an @mention, a config key, an author on every transcript line and
+// a lane name, so it has to be unambiguous and it can never change afterwards.
+// `both` would collide with the routing target; the other two name Parley's own
+// voices in the transcript.
+const RESERVED_SEAT_IDS = new Set(["both", "user", "system", "all", "none"]);
+function validSeatId(id) {
+  return /^[a-z][a-z0-9-]{0,19}$/.test(String(id || "")) && !RESERVED_SEAT_IDS.has(id);
+}
 // Effort names sort by depth, not alphabetically, however they arrive.
 const EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "ultracode"];
 const byDepth = (a, b) => {
@@ -198,25 +397,101 @@ function providerCatalog() {
   }));
   return catalogCache;
 }
+
+// The same catalog, resolved per seat, so a seat can be called anything and the
+// UI still knows which CLI's label, colour, avatar and settings fields to draw.
+// Deliberately not memoized: it has to follow config edits.
+// Two seats on one provider would otherwise share a colour, and the colour is
+// what the receipt dots, avatars and busy pills are keyed on — so the second one
+// is shifted far enough around the wheel to read as a different seat at a
+// glance, while staying recognisably that provider's family.
+function shiftHue(hex, degrees) {
+  const m = /^#([0-9a-f]{6})$/i.exec(String(hex || ""));
+  if (!m) return hex;
+  const n = parseInt(m[1], 16);
+  let [r, g, b] = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map((v) => v / 255);
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+  const l = (max + min) / 2;
+  const sat = d === 0 ? 0 : d / (1 - Math.abs(2 * l - 1));
+  let h = 0;
+  if (d !== 0) {
+    h = max === r ? ((g - b) / d) % 6 : max === g ? (b - r) / d + 2 : (r - g) / d + 4;
+    h *= 60;
+  }
+  h = (h + degrees + 360) % 360;
+  const c = (1 - Math.abs(2 * l - 1)) * sat, x = c * (1 - Math.abs(((h / 60) % 2) - 1)), mm = l - c / 2;
+  const seg = Math.floor(h / 60) % 6;
+  const rgb = [[c, x, 0], [x, c, 0], [0, c, x], [0, x, c], [x, 0, c], [c, 0, x]][seg];
+  return "#" + rgb.map((v) => Math.round((v + mm) * 255).toString(16).padStart(2, "0")).join("");
+}
+
+function seatCatalog(room) {
+  const cat = providerCatalog();
+  const seen = new Map();
+  return Object.fromEntries(seatIds(room).map((id) => {
+    const pid = providerIdOf(room, id);
+    const caps = (PROVIDERS[pid] || {}).capabilities || {};
+    const nth = seen.get(pid) || 0;
+    seen.set(pid, nth + 1);
+    return [id, {
+      ...cat[pid],
+      color: nth === 0 ? cat[pid].color : shiftHue(cat[pid].color, 150),
+      provider: pid,
+      sessions: caps.sessions || "resume",
+      // Which field, if any, holds this seat's permission choice, and which of
+      // its values means host-level trust — so the warning dialog does not have
+      // to know the provider by name.
+      permissionField: Object.keys(caps.enums || {})[0] || null,
+      fullAccessValue: caps.fullAccessScope || null,
+    }];
+  }));
+}
+
 // Drop config keys that aren't real seats (typos, junk from hand-edits).
 function pruneSeats(cfg) {
-  const keys = Object.keys(cfg.agents || {}).filter((k) => PROVIDERS[k]).slice(0, 2);
+  // Resolvability, not "the key happens to be a provider name": a seat is real
+  // if its config names a provider, or if its own id is one — which is what
+  // every room written before the two were separate looks like.
+  const keys = Object.keys(cfg.agents || {}).filter((k) => providerIdFor(cfg.agents[k], k)).slice(0, 2);
   cfg.agents = keys.length === 2
     ? Object.fromEntries(keys.map((k) => [k, cfg.agents[k]]))
     : defaultConfig().agents;
+  // Write the resolved provider back, so the migration happens once and the
+  // file says plainly what drives each seat.
+  for (const k of Object.keys(cfg.agents)) {
+    cfg.agents[k].provider = providerIdFor(cfg.agents[k], k) || k;
+  }
   return cfg;
 }
 
+// Seats arrive either as a bare id (id === provider, the shape every room used
+// before the two were separate) or as { id, provider }.
+function seatSpecs(seats) {
+  return (seats || DEFAULT_SEATS).map((s) => typeof s === "string"
+    ? { id: s, provider: s }
+    : { id: String(s.id), provider: String(s.provider || s.id) });
+}
+
 function defaultConfig(seats = DEFAULT_SEATS) {
+  const specs = seatSpecs(seats);
   return {
-    defaultAgent: seats[0],
+    defaultAgent: specs[0].id,
     mode: "talk",     // "talk" (chat, conservative permissions) | "work" (agents may write/run in the workspace)
-    hopBudget: -1,    // agent-to-agent follow-ups per user message (-1 = until settled, 0 = none)
+    // Agent-to-agent follow-ups per user message. A NEW room starts bounded:
+    // one charged hop can mean two provider calls, so an unlimited default
+    // let a first cross-tagged exchange spend a dozen calls before the user
+    // had any sense of what a hop costs. -1 (until settled) stays one click
+    // away in Settings and in the composer control, and every room created
+    // before this keeps whatever it already had.
+    hopBudget: 3,
     pairRounds: 0,    // review rounds per message in pair mode (0 = until the reviewer approves)
     projectDir: null, // absolute path of a real project to work in (null = room's own sandbox workspace)
     roomNote: null,   // standing instruction prepended to every prompt (set via Settings or /note)
     timeoutMs: 900000,
-    agents: Object.fromEntries(seats.map((s) => [s, { ...providerOf(s).defaults }])),
+    // `provider` is written first so it reads first in room.json, and it is a
+    // real persisted key rather than something derived on read — otherwise the
+    // migration would not be idempotent.
+    agents: Object.fromEntries(specs.map((s) => [s.id, { provider: s.provider, ...providerById(s.provider).defaults }])),
   };
 }
 
@@ -250,7 +525,8 @@ function requireMessageHopBudget(value, label = "message hopBudget") {
   }
   return n;
 }
-function defaultState(seats = DEFAULT_SEATS) {
+function defaultState(agentsCfg) {
+  const seats = Object.keys(agentsCfg || {});
   return {
     lastAddressed: null,
     nextTurn: 1,
@@ -259,6 +535,13 @@ function defaultState(seats = DEFAULT_SEATS) {
     // Persisted, because "nobody received this" has to stay true on every
     // later turn, not just for the exchange that was cancelled.
     cancelledDeliveries: {},
+    // turn number -> seats that DID receive it and whose launched response the
+    // user stopped before it produced anything durable. The amber half of the
+    // same truth: red says "never delivered", this says "delivered, answer cut
+    // short". Persisted for the same reason — it is a fact about a message/seat
+    // pair, not live lifecycle state — and superseded only by that seat
+    // completing a run rooted in this same entry.
+    interruptedResponses: {},
     // Terminal outcomes for a lurk obligation that was selected but could not
     // complete. Successful/caught-up receipts outrank these historical ranges
     // in the UI, so they never need destructive invalidation.
@@ -285,7 +568,10 @@ function defaultState(seats = DEFAULT_SEATS) {
       // merged into legacy state and claim a live session heard instructions
       // it never received. They are written together only after a successful
       // turn leaves a concrete, durable native session identity.
-      ...(s === "claude" ? { permissionScope: null } : {}),
+      // Declared by the provider rather than branched on by seat name: only a
+      // provider whose sessions carry permission provenance gets the field,
+      // and it is never leaked onto one that does not.
+      ...(sessionScopeField(agentsCfg[s], s) ? { [sessionScopeField(agentsCfg[s], s)]: null } : {}),
     }])),
   };
 }
@@ -301,8 +587,23 @@ function readJSON(file) {
   // tolerate a UTF-8 BOM — hand-edited configs often have one on Windows
   return JSON.parse(fs.readFileSync(file, "utf8").replace(/^﻿/, ""));
 }
+// A torn write is the difference between a room that reopens and a room that
+// answers 500 forever: state.json is rewritten on every entry, so the
+// truncate-then-fill window recurs dozens of times per turn. Fill a sibling
+// file and rename over the target instead — the rename is atomic on the same
+// volume, the property the conversation archive already depends on.
 function writeJSON(file, obj) {
-  fs.writeFileSync(file, JSON.stringify(obj, null, 2) + "\n", "utf8");
+  const data = JSON.stringify(obj, null, 2) + "\n";
+  const tmp = `${file}.tmp`;
+  try {
+    fs.writeFileSync(tmp, data, "utf8");
+    fs.renameSync(tmp, file);
+  } catch {
+    // A briefly locked sibling (antivirus, backup software) must not cost the
+    // save itself. Fall back to writing in place: no worse than before.
+    try { fs.rmSync(tmp, { force: true }); } catch { /* best effort */ }
+    fs.writeFileSync(file, data, "utf8");
+  }
 }
 function deepMerge(base, extra) {
   if (extra === undefined) return base; // absent field: keep
@@ -311,7 +612,14 @@ function deepMerge(base, extra) {
   if (Array.isArray(base) || Array.isArray(extra)) return extra;
   if (typeof base === "object" && typeof extra === "object") {
     const out = { ...base };
-    for (const k of Object.keys(extra)) out[k] = k in base ? deepMerge(base[k], extra[k]) : extra[k];
+    for (const k of Object.keys(extra)) {
+      // JSON.parse makes "__proto__" an own property, but assigning it here
+      // would run the prototype setter instead of storing a key — a hand-edited
+      // room.json could hand the config object a prototype full of phantom
+      // inherited settings that survive no round-trip.
+      if (k === "__proto__" || k === "constructor" || k === "prototype") continue;
+      out[k] = k in base ? deepMerge(base[k], extra[k]) : extra[k];
+    }
     return out;
   }
   return extra;
@@ -350,9 +658,13 @@ function effectiveClaudePermissionMode(cfg, roomMode) {
   return configured === "auto" ? (roomMode === "work" ? "acceptEdits" : "default") : configured;
 }
 
-function isolatedClaudeProtectedTurn(room, agent, { discussion, readOnly } = {}) {
-  return agent === "claude" && !!(discussion || readOnly) &&
-    effectiveClaudePermissionMode(room.cfg.agents.claude, room.cfg.mode) === "bypassPermissions";
+// Some providers cannot make a read-only turn safe inside a session that was
+// created with broader powers, so that turn has to run outside the session
+// entirely. Which providers those are is declared, not assumed.
+function isolatedProtectedTurn(room, agent, { discussion, readOnly } = {}) {
+  if (!(discussion || readOnly)) return false;
+  const isolate = capsOf(room, agent).isolateProtectedTurn;
+  return typeof isolate === "function" && !!isolate(room.cfg.agents[agent], room.cfg.mode);
 }
 
 // A native session is created under one set of settings and cannot be changed
@@ -379,9 +691,12 @@ function applyAdapterSession(room, agent, res, epoch) {
   if (res.resetSession) room.state.agents[agent].sessionRef = null;
   else if (res.sessionRef) {
     room.state.agents[agent].sessionRef = res.sessionRef;
-    if (agent === "claude") {
-      room.state.agents.claude.permissionScope = effectiveClaudePermissionMode(
-        room.cfg.agents.claude, room.cfg.mode);
+    // Provenance, where the provider says its sessions carry it: a session
+    // created under looser rules must never be silently resumed under
+    // stricter ones, and the check on load is what enforces that.
+    const scope = capsOf(room, agent).sessionScope;
+    if (scope) {
+      room.state.agents[agent][scope.field] = scope.of(room.cfg.agents[agent], room.cfg.mode);
     }
   }
 }
@@ -413,35 +728,23 @@ function stampPromptDelivery(room, agent, res, epoch, delivery) {
 // Claude bypass arguments are rejected here as well as in the config endpoint
 // because room.json is intentionally hand-editable. Provider/user settings and
 // custom command wrappers remain part of the trusted local CLI boundary.
-function extraArgsViolation(agent, value) {
+function extraArgsViolation(room, agent, value) {
   if (!Array.isArray(value)) return "Extra CLI args must be a list";
   const args = value.map((v) => String(v));
-  let claudePermissionFlags = 0;
-  for (let i = 0; i < args.length; i++) {
-    const raw = args[i];
+  for (const raw of args) {
     const flag = raw.split("=", 1)[0].toLowerCase();
+    // The one rule that holds for every provider.
     if (flag.startsWith("--dangerously-") || flag.startsWith("--allow-dangerously-")) {
       return `${raw} is intentionally blocked by Parley`;
     }
-    if (agent === "claude" && flag === "--permission-mode") {
-      claudePermissionFlags++;
-      if (claudePermissionFlags > 1) {
-        return "Only one Claude --permission-mode override is allowed";
-      }
-      const mode = raw.includes("=") ? raw.slice(raw.indexOf("=") + 1) : args[i + 1];
-      if (!String(mode || "").trim() || String(mode).startsWith("-")) {
-        return "Claude --permission-mode requires a value";
-      }
-      if (String(mode || "").trim().toLowerCase() === "bypasspermissions") {
-        return "Use Claude's warned Full access setting instead of bypassPermissions in Extra CLI args";
-      }
-    }
   }
-  return null;
+  // Anything else is the provider's own vocabulary, so the provider owns it.
+  const issue = (room ? capsOf(room, agent) : (PROVIDERS[agent] || {}).capabilities || {}).extraArgsIssue;
+  return typeof issue === "function" ? (issue(args) || null) : null;
 }
 
-function checkedExtraArgs(agent, value) {
-  const issue = extraArgsViolation(agent, value || []);
+function checkedExtraArgs(room, agent, value) {
+  const issue = extraArgsViolation(room, agent, value || []);
   if (issue) throw new AdapterError(`unsafe Extra CLI args: ${issue}`);
   return (value || []).map((v) => String(v));
 }
@@ -464,18 +767,11 @@ function withoutArgWithValue(args, option) {
 // says the native conversation no longer exists. Authentication, rate limits,
 // transport errors and tool failures must surface without an automatic second
 // paid invocation (which could also duplicate side effects).
-function missingNativeSession(agent, r) {
-  const src = `${r.stderr || ""}\n${r.stdout || ""}`;
-  if (agent === "claude") {
-    return /\bno conversation found with session id\b/i.test(src) ||
-      /\bconversation(?:\s+with)?(?:\s+session)?(?:\s+id)?[^\r\n]{0,80}\b(?:not found|does not exist)\b/i.test(src);
-  }
-  if (agent === "codex") {
-    return /\bno rollout found for (?:thread|conversation) id\b/i.test(src) ||
-      /\bsession not found for (?:thread|request)_id\b/i.test(src) ||
-      /\bthread not found\b/i.test(src);
-  }
-  return false;
+function missingNativeSession(room, agent, r) {
+  const src = `${r.stderr || ""}
+${r.stdout || ""}`;
+  const patterns = capsOf(room, agent).resumeLostPatterns || [];
+  return patterns.some((re) => re.test(src));
 }
 
 class AdapterError extends Error {
@@ -627,7 +923,7 @@ function runCli(spec, args, { cwd, timeoutMs, input, onLine, room, agent }) {
       if (run.stopRequested) { child.rtStopped = true; killTree(child); }
     }
 
-    let stdout = "", stderr = "", buf = "", timedOut = false, spawnErr = null;
+    let stdout = "", stderr = "", buf = "", bufOverflow = false, timedOut = false, spawnErr = null;
     const timer = setTimeout(() => { timedOut = true; killTree(child); }, timeoutMs || 300000);
 
     child.on("error", (e) => { spawnErr = e; });
@@ -638,15 +934,19 @@ function runCli(spec, args, { cwd, timeoutMs, input, onLine, room, agent }) {
       let i;
       while ((i = buf.indexOf("\n")) >= 0) {
         const line = buf.slice(0, i); buf = buf.slice(i + 1);
+        // The tail of a line we already gave up on: resynchronise here rather
+        // than handing a consumer half a JSON object.
+        if (bufOverflow) { bufOverflow = false; continue; }
         if (onLine) { try { onLine(line.trim()); } catch { /* tolerate bad line */ } }
       }
+      if (buf.length > MAX_CLI_LINE_BYTES) { buf = ""; bufOverflow = true; }
     });
     child.stderr.on("data", (d) => { if (stderr.length < 2_000_000) stderr += d.toString("utf8"); });
     child.on("close", (code) => {
       clearTimeout(timer);
       if (room && agent && room.procs.get(agent) === child) room.procs.delete(agent);
       if (run && run.child === child) run.child = null;
-      if (buf.trim() && onLine) { try { onLine(buf.trim()); } catch { /* ignore */ } }
+      if (!bufOverflow && buf.trim() && onLine) { try { onLine(buf.trim()); } catch { /* ignore */ } }
       resolve({
         code: spawnErr ? -1 : code,
         stdout, stderr: spawnErr ? String(spawnErr.message) : stderr,
@@ -655,6 +955,12 @@ function runCli(spec, args, { cwd, timeoutMs, input, onLine, room, agent }) {
         spawnError: !!spawnErr,
       });
     });
+    // A prompt too large for the OS pipe buffer stays pending in libuv. If the
+    // child exits first — a logged-out CLI, a rejected flag, or the Stop above
+    // killing it — the failed write surfaces asynchronously as a stream 'error',
+    // and an unhandled one is a fatal uncaught exception, not a rejected write.
+    // The try/catch only ever covered the synchronous case.
+    child.stdin.on("error", () => { /* child gone; 'close' reports the outcome */ });
     try { child.stdin.write(input || ""); child.stdin.end(); } catch { /* proc died early */ }
   });
 }
@@ -707,7 +1013,7 @@ function composeStandingContract(agent, room) {
   const values = {
     "{{AGENT}}": agent,
     "{{OTHER}}": other,
-    "{{OTHER_DESC}}": providerOf(other).desc,
+    "{{OTHER_DESC}}": providerOf(room, other).desc,
     "{{TRANSCRIPT_FILE}}": room.transcriptFile,
     "{{WORKDIR_KIND}}": room.cfg.projectDir ? "the user's project folder" : "a shared scratch workspace",
     "{{WORKDIR}}": workDir(room),
@@ -1002,12 +1308,12 @@ function codexItemLabel(item) {
 }
 
 /** Claude Code CLI: print mode + stream-json for live partial text. */
-async function claudeSend(room, { prompt, briefing, onStream, onActivity, discussion, readOnly, images = [], inputDir = null, allowEmpty = false }) {
-  const cfg = room.cfg.agents.claude;
+async function claudeSend(room, { seat = "claude", prompt, briefing, onStream, onActivity, discussion, readOnly, images = [], inputDir = null, allowEmpty = false }) {
+  const cfg = room.cfg.agents[seat];
   const protectedTurn = !!(discussion || readOnly);
-  const isolatedProtected = isolatedClaudeProtectedTurn(room, "claude", { discussion, readOnly });
-  const sess = isolatedProtected ? null : room.state.agents.claude.sessionRef;
-  const checked = checkedExtraArgs("claude", cfg.extraArgs);
+  const isolatedProtected = isolatedProtectedTurn(room, seat, { discussion, readOnly });
+  const sess = isolatedProtected ? null : room.state.agents[seat].sessionRef;
+  const checked = checkedExtraArgs(room, seat, cfg.extraArgs);
   // A protected discussion/review turn must not be reopened by an advanced
   // per-room permission override. Provider/user-level CLI settings remain part
   // of the local trust boundary, so the prompt still carries the same rule.
@@ -1100,7 +1406,7 @@ async function claudeSend(room, { prompt, briefing, onStream, onActivity, discus
   if (r.spawnError) throw new AdapterError(`could not launch claude (command: "${cfg.command}") — ${r.stderr}`);
   if (r.code !== 0) {
     throw new AdapterError(`claude (command: "${cfg.command}") exited with code ${r.code}${stderrTail(r)}`, {
-      resumeFailed: !!sess && missingNativeSession("claude", r),
+      resumeFailed: !!sess && missingNativeSession(room, seat, r),
     });
   }
   let text = resultText ?? assistantText ?? (acc || null);
@@ -1117,10 +1423,10 @@ async function claudeSend(room, { prompt, briefing, onStream, onActivity, discus
 }
 
 /** Codex CLI: exec mode + JSONL events; final text via --output-last-message. */
-async function codexSend(room, { prompt, briefing, onStream, onActivity, images = [], inputDir = null, allowEmpty = false }) {
-  const cfg = room.cfg.agents.codex;
-  const sess = room.state.agents.codex.sessionRef;
-  const extraArgs = checkedExtraArgs("codex", cfg.extraArgs);
+async function codexSend(room, { seat = "codex", prompt, briefing, onStream, onActivity, images = [], inputDir = null, allowEmpty = false }) {
+  const cfg = room.cfg.agents[seat];
+  const sess = room.state.agents[seat].sessionRef;
+  const extraArgs = checkedExtraArgs(room, seat, cfg.extraArgs);
   const tmp = path.join(os.tmpdir(), `parley-codex-${crypto.randomUUID()}.txt`);
 
   // Work rooms upgrade the default read-only sandbox; explicit settings win.
@@ -1193,12 +1499,109 @@ async function codexSend(room, { prompt, briefing, onStream, onActivity, images 
   if (r.spawnError) throw new AdapterError(`could not launch codex (command: "${cfg.command}") — ${r.stderr}`);
   if (r.code !== 0) {
     throw new AdapterError(`codex (command: "${cfg.command}") exited with code ${r.code}${stderrTail(r)}`, {
-      resumeFailed: !!sess && missingNativeSession("codex", r),
+      resumeFailed: !!sess && missingNativeSession(room, seat, r),
     });
   }
   const text = fileText ?? lastMsg ?? (acc || null);
   if (!text && !allowEmpty) throw new AdapterError("codex returned an empty reply");
   return { text: text || "", emptyReply: !text, sessionRef: threadRef || "--last", sentinelThread: !threadRef || threadRef === "--last", usage };
+}
+
+// `auto` is Parley's "follow the room", matching Claude's field, rather than one
+// of Gemini's own values. An explicit Extra CLI arg still wins.
+function effectiveGeminiApprovalMode(cfg, roomMode) {
+  const override = cliArgValue(cfg.extraArgs || [], "--approval-mode");
+  if (override !== null) return override || "invalid";
+  const configured = GEMINI_APPROVAL_MODES.has(cfg.approvalMode) ? cfg.approvalMode : "auto";
+  return configured === "auto" ? (roomMode === "work" ? "auto_edit" : "default") : configured;
+}
+
+/**
+ * Google Gemini CLI: headless mode with JSON output.
+ *
+ * Verified against gemini 0.53.0 rather than assumed:
+ *  - Headless mode triggers on a non-TTY stdin, which is how Parley spawns it,
+ *    so the whole prompt goes on stdin and never near a command line — Windows
+ *    would otherwise truncate a normal delta somewhere past 32 KB.
+ *  - `--output-format json` returns one object: { response, stats, error? }.
+ *  - `--session-id <uuid>` starts a session with an id we choose, and
+ *    `--resume <uuid>` reattaches to it. That is what makes Gemini a full
+ *    delta-protocol seat rather than a stateless one that re-reads history
+ *    every turn: Parley mints the id, so it knows the session's name before the
+ *    process has said anything.
+ *  - `--approval-mode` takes default | auto_edit | yolo | plan. `plan` is a
+ *    real read-only mode, which is what protected discussion, reviewer and
+ *    listener turns need — the same role Claude's Plan mode plays.
+ */
+async function geminiSend(room, { seat = "gemini", prompt, briefing, onStream, onActivity, discussion, readOnly, images = [], inputDir = null, allowEmpty = false }) {
+  const cfg = room.cfg.agents[seat];
+  const protectedTurn = !!(discussion || readOnly);
+  const sess = room.state.agents[seat].sessionRef;
+  const extraArgs = checkedExtraArgs(room, seat, cfg.extraArgs);
+  const args = ["--output-format", "json"];
+  // Reattach to the session Parley named, or name the next one. Either way the
+  // id is ours, so a reply never has to tell us what it just created.
+  const sessionRef = sess || crypto.randomUUID();
+  if (sess) args.push("--resume", sess);
+  else args.push("--session-id", sessionRef);
+  if (cfg.model) args.push("--model", cfg.model);
+  // Disposable copies of attachments, never the room's canonical store.
+  if (inputDir) args.push("--include-directories", inputDir);
+  const approval = protectedTurn ? "plan" : effectiveGeminiApprovalMode(cfg, room.cfg.mode);
+  args.push("--approval-mode", approval);
+  // A protected turn must not be reopened by an advanced per-room override.
+  args.push(...(protectedTurn ? withoutArgWithValue(extraArgs, "--approval-mode") : extraArgs));
+
+  // The briefing is a system-level instruction for the other two providers, but
+  // Gemini's headless mode has no equivalent flag, so it leads the prompt. The
+  // fresh-session case is the only one that has a briefing at all.
+  const input = briefing ? `${briefing}\n\n${prompt}` : prompt;
+
+  let usage = null;
+  let responseText = null;
+  let errorText = null;
+  // json mode emits one object at the end rather than a stream, so there is
+  // nothing to feed onStream — the live bubble simply stays on "thinking" until
+  // the reply lands, which is honest rather than fake.
+  const onLine = (line) => {
+    if (!line.startsWith("{")) return;
+    let obj; try { obj = JSON.parse(line); } catch { return; }
+    if (typeof obj.response === "string") responseText = obj.response;
+    if (obj.error) errorText = obj.error.message || String(obj.error);
+    const stats = obj.stats && (obj.stats.tokens || obj.stats);
+    if (stats && typeof stats.output === "number") {
+      usage = { out: stats.output, ...(typeof stats.thoughts === "number" ? { reasoning: stats.thoughts } : {}) };
+    }
+  };
+
+  const r = await runCli(resolveCommand(cfg.command), args, {
+    cwd: workDir(room), timeoutMs: seatTimeout(room, seat), input, onLine, room, agent: seat,
+  });
+
+  // json mode can also emit the object as one multi-line blob rather than a
+  // single line, so parse the whole of stdout if the line reader found nothing.
+  if (responseText === null && r.stdout) {
+    try {
+      const obj = JSON.parse(r.stdout.trim());
+      if (typeof obj.response === "string") responseText = obj.response;
+      if (obj.error) errorText = obj.error.message || String(obj.error);
+    } catch { /* not a single JSON document; fall through to the raw text */ }
+  }
+
+  if (r.stopped) throw new AdapterError(`${seat} was stopped by you`, { stopped: true });
+  if (r.timedOut) throw new AdapterError(`${seat} timed out after ${Math.round(seatTimeout(room, seat) / 1000)}s — raise "Timeout" in Settings if it needs longer`);
+  if (r.spawnError) throw new AdapterError(`could not launch ${seat} (command: "${cfg.command}") — ${r.stderr}`);
+  if (r.code !== 0) {
+    throw new AdapterError(`${seat} (command: "${cfg.command}") exited with code ${r.code}${stderrTail(r)}`, {
+      // Exit 42 is the CLI's "input error", which is what a resume against a
+      // session it no longer has looks like.
+      resumeFailed: !!sess && (r.code === 42 || missingNativeSession(room, seat, r)),
+    });
+  }
+  if (errorText) throw new AdapterError(`${seat}: ${truncate(errorText, 300)}`);
+  const text = responseText ?? (r.stdout || "").trim() ?? null;
+  if (!text && !allowEmpty) throw new AdapterError(`${seat} returned an empty reply`);
+  return { text: text || "", emptyReply: !text, sessionRef, ...(usage ? { usage } : {}) };
 }
 
 // A briefing is a string (fresh session) or null (resumed session). Anything
@@ -1215,7 +1618,13 @@ function briefedAdapter(send) {
     return send(room, opts);
   };
 }
-const adapters = { claude: briefedAdapter(claudeSend), codex: briefedAdapter(codexSend) };
+// Keyed by provider, not by seat name — which is what lets a seat be called
+// anything and still be driven by the right CLI.
+const adapters = {
+  claude: briefedAdapter(claudeSend),
+  codex: briefedAdapter(codexSend),
+  gemini: briefedAdapter(geminiSend),
+};
 
 // ---------------------------------------------------------------- rooms
 
@@ -1241,7 +1650,8 @@ function cleanRoomName(name) {
 // how a deleted room could otherwise resurrect itself.
 function loadRoom(name, seatChoice, create = false) {
   if (rooms.has(name)) return rooms.get(name);
-  if (!validRoomName(name)) throw new Error(`invalid room name: ${name}`);
+  // Client input, not a server fault — report it like the 404 two lines below.
+  if (!validRoomName(name)) throw Object.assign(new Error(`invalid room name: ${name}`), { status: 400 });
   const dir = path.join(ROOT, name);
   if (!create && !fs.existsSync(dir)) {
     throw Object.assign(new Error(`no such room: ${name}`), { status: 404 });
@@ -1267,13 +1677,24 @@ function loadRoom(name, seatChoice, create = false) {
       delete raw.maxHops;
       cfgMigrated = true;
     }
-    const seats = Object.keys(raw.agents || {}).filter((k) => PROVIDERS[k]).slice(0, 2);
+    // A seat is described by its id and its provider. A room written before the
+    // two were separate names no provider, and its id is the provider — which
+    // is why this migration adds one field and renames nothing.
+    const seats = Object.entries(raw.agents || {})
+      .filter(([k, v]) => providerIdFor(v, k))
+      .slice(0, 2)
+      .map(([k, v]) => ({ id: k, provider: providerIdFor(v, k) }));
+    if (seats.some(({ id, provider }) => (raw.agents[id] || {}).provider !== provider)) cfgMigrated = true;
     cfg = pruneSeats(deepMerge(defaultConfig(seats.length === 2 ? seats : DEFAULT_SEATS), raw));
     cfg.hopBudget = normalizeHopBudget(cfg.hopBudget, -1);
     // A hand-edited unknown value must fail closed to Parley's room default,
-    // rather than becoming an ambiguous permission state in the UI.
-    if (cfg.agents.claude && !CLAUDE_PERMISSION_MODES.has(cfg.agents.claude.permissionMode)) {
-      cfg.agents.claude.permissionMode = "auto";
+    // rather than becoming an ambiguous permission state in the UI. Which
+    // fields are enumerated, and what they fall back to, is the provider's.
+    for (const id of Object.keys(cfg.agents)) {
+      const enums = (PROVIDERS[providerIdFor(cfg.agents[id], id)].capabilities || {}).enums || {};
+      for (const [field, rule] of Object.entries(enums)) {
+        if (!rule.values().has(cfg.agents[id][field])) cfg.agents[id][field] = rule.fallback;
+      }
     }
     // Rooms created before deep reasoning levels existed carry the old
     // five-minute cap, which now kills healthy turns; lift only that value.
@@ -1289,10 +1710,23 @@ function loadRoom(name, seatChoice, create = false) {
   let state;
   let rawState = null;
   if (fs.existsSync(stateFile)) {
-    rawState = readJSON(stateFile);
-    state = deepMerge(defaultState(seats), rawState);
+    try {
+      rawState = readJSON(stateFile);
+      state = deepMerge(defaultState(cfg.agents), rawState);
+    } catch {
+      // Runtime state is reconstructible — events.jsonl is the authoritative
+      // record and is append-only, so it survives whatever truncated this file.
+      // Refusing to load would strand the whole room (and, for the default
+      // room, the whole process) behind a file the user cannot see. Keep the
+      // damaged copy for inspection and carry on from defaults.
+      try { fs.renameSync(stateFile, `${stateFile}.corrupt`); } catch { /* best effort */ }
+      rawState = null;
+      state = defaultState(cfg.agents);
+      console.error(`parley: ${name}/state.json was unreadable; kept it as state.json.corrupt and reset runtime state (the transcript is intact).`);
+      writeJSON(stateFile, state);
+    }
   }
-  else { state = defaultState(seats); writeJSON(stateFile, state); }
+  else { state = defaultState(cfg.agents); writeJSON(stateFile, state); }
 
   // A native Claude session was created under one effective permission mode.
   // Persist that provenance so an offline room.json edit (or an upgrade from a
@@ -1332,11 +1766,18 @@ function loadRoom(name, seatChoice, create = false) {
       stateMigrated = true;
     }
   }
-  if (state.agents.claude) {
-    const expectedScope = effectiveClaudePermissionMode(cfg.agents.claude, cfg.mode);
-    if (state.agents.claude.permissionScope !== expectedScope) {
-      state.agents.claude.sessionRef = null;
-      state.agents.claude.permissionScope = expectedScope;
+  // A saved session was created under one set of permissions. Where the provider
+  // says its sessions carry that provenance, a mismatch means the file was
+  // edited (or predates the field), and resuming would silently reattach a
+  // more-privileged session under a newly conservative configuration.
+  for (const id of seats) {
+    const pid = providerIdFor(cfg.agents[id], id);
+    const scope = pid && (PROVIDERS[pid].capabilities || {}).sessionScope;
+    if (!scope || !state.agents[id]) continue;
+    const expected = scope.of(cfg.agents[id], cfg.mode);
+    if (state.agents[id][scope.field] !== expected) {
+      state.agents[id].sessionRef = null;
+      state.agents[id][scope.field] = expected;
       stateMigrated = true;
     }
   }
@@ -1379,6 +1820,30 @@ function loadRoom(name, seatChoice, create = false) {
     }
   }
 
+  // appendEntry hands out `n` and only then persists the counter, so a crash in
+  // that window — or a state.json restored from backup, or the reset above —
+  // comes back with a counter that reissues turn numbers already on disk.
+  // Everything keyed on `n` (cursors, receipts, reply chains, cancelled
+  // deliveries, and every entries.find) assumes they are unique and ascending,
+  // so reconcile against the log, which is the record that cannot lose writes.
+  let counterMigrated = false;
+  const maxEntryN = entries.reduce((m, e) => (Number.isSafeInteger(e.n) && e.n > m ? e.n : m), 0);
+  if (!Number.isSafeInteger(state.nextTurn) || state.nextTurn <= maxEntryN) {
+    state.nextTurn = maxEntryN + 1;
+    counterMigrated = true;
+  }
+  // A cursor past the end of history would silently swallow the entries a seat
+  // has genuinely not seen yet.
+  for (const id of seats) {
+    const seat = state.agents[id];
+    if (!seat) continue;
+    if (Number.isSafeInteger(seat.cursor) && seat.cursor > maxEntryN) {
+      seat.cursor = maxEntryN;
+      counterMigrated = true;
+    }
+  }
+  if (counterMigrated) writeJSON(stateFile, state);
+
   const room = {
     name, dir, workspace, cfgFile, stateFile, eventsFile, transcriptFile,
     cfg, state, entries, receipts,
@@ -1388,6 +1853,12 @@ function loadRoom(name, seatChoice, create = false) {
     // fence. See applyAdapterSession.
     cfgEpoch: {},
     busy: new Map(),      // agent -> { startedAt, runId }
+    streams: new Map(),   // agent -> coalesced live-reply state, see streamText
+    // A deliberate hold on the queue, not a property of the conversation. In
+    // memory beside `pending` for the same reason `pending` is: a restart has no
+    // queue to hold, so a persisted flag would come back armed with nothing
+    // behind it and silently swallow the next message the user sent.
+    queuePaused: false,
     procs: new Map(),     // agent -> child process
     // agent -> the run record that owns the seat right now. Unlike `procs`,
     // this exists from the instant the seat is claimed, so a Stop pressed
@@ -1430,6 +1901,61 @@ function broadcast(room, obj) {
   for (const res of room.clients) {
     try { res.write(payload); } catch { room.clients.delete(res); }
   }
+}
+
+// ---- live reply streaming ----
+// Each provider hands us the whole reply so far on every token, and that is
+// what used to go out to every tab: an L-character reply cost on the order of
+// L²/32 bytes through JSON.stringify, the socket and the browser's parser —
+// tens of megabytes for one long reply. Send the increment instead, coalesced
+// into at most one event per tick, with a periodic full-text keyframe so a tab
+// that connects mid-reply (or misses an event) can resynchronise. Streaming has
+// always been a progressive enhancement: the entry appended at the end is the
+// authoritative text, so a dropped increment costs nothing but a moment of
+// staleness in the bubble.
+const STREAM_FLUSH_MS = 90;
+const STREAM_KEYFRAME_MS = 2000;
+
+function streamText(room, agent, text) {
+  let st = room.streams.get(agent);
+  if (!st) {
+    st = { text: "", sent: 0, timer: null, keyframeAt: 0, needKeyframe: true };
+    room.streams.set(agent, st);
+  }
+  st.text = text;
+  if (!st.timer) st.timer = setTimeout(() => flushStream(room, agent), STREAM_FLUSH_MS);
+}
+
+function flushStream(room, agent) {
+  const st = room.streams.get(agent);
+  if (!st) return;
+  st.timer = null;
+  const now = Date.now();
+  if (st.needKeyframe || now - st.keyframeAt >= STREAM_KEYFRAME_MS) {
+    st.needKeyframe = false;
+    st.keyframeAt = now;
+    st.sent = st.text.length;
+    broadcast(room, { type: "stream", agent, text: st.text });
+    return;
+  }
+  if (st.text.length <= st.sent) return;
+  broadcast(room, { type: "stream", agent, from: st.sent, delta: st.text.slice(st.sent) });
+  st.sent = st.text.length;
+}
+
+// The run is over. Whatever was still coalescing is superseded by the durable
+// entry the caller is about to append, which replaces the live bubble outright.
+function endStream(room, agent) {
+  const st = room.streams.get(agent);
+  if (!st) return;
+  if (st.timer) clearTimeout(st.timer);
+  room.streams.delete(agent);
+}
+
+// A tab that joins mid-reply holds none of the increments, so the next flush
+// has to carry full text rather than an offset it cannot apply.
+function markStreamsForKeyframe(room) {
+  for (const st of room.streams.values()) st.needKeyframe = true;
 }
 
 function transcriptHeader(e) {
@@ -1712,8 +2238,9 @@ function stageProviderInputs(room, agent, entries, imageBudget) {
   };
 }
 
-function nativeImageBudget(agent) {
-  return agent === "claude" ? CLAUDE_NATIVE_IMAGE_BYTES : Infinity;
+function nativeImageBudget(room, agent) {
+  const cap = capsOf(room, agent).nativeImageBytes;
+  return cap === undefined ? Infinity : cap;
 }
 
 function transcriptAttachmentMarkdown(entry) {
@@ -1750,6 +2277,68 @@ function appendReceipt(room, { agent, from, upTo, turn, mode, spoke }) {
   broadcast(room, { type: "receipt", receipt: rec });
 }
 
+// The exchange coordinators run detached: nobody awaits them, so there is
+// nobody to hand a rejection to. Node treats an unhandled one as fatal, which
+// turns a transient disk error during one room's cleanup into the loss of every
+// room's in-flight turn. Catch it, leave a trace the user can actually see, and
+// keep the server up. The chains' own try/finally blocks still unwind state.
+function noteChainFailure(room, label, err) {
+  console.error(`parley: ${label} failed in room ${room && room.name}:`, (err && err.stack) || err);
+  try {
+    appendEntry(room, {
+      kind: "system", author: "system",
+      text: `⚠️ Parley hit an error while finishing this exchange (${label}): ${truncate(String((err && err.message) || err), 200)}\n\nThe transcript above is intact and the room is still usable. If this repeats, check free disk space and whether another program is locking the room folder.`,
+      meta: { chainFailure: { label } },
+    });
+  } catch { /* the append is what failed — the console line is the record */ }
+}
+
+// ---- first-run health ----
+// A missing CLI already shows on the seat pill. An unauthenticated one did not:
+// it surfaced as an opaque exit code on the user's first real message, which is
+// the worst possible moment to learn it. Each provider keeps its credentials in
+// a file it owns, so this reads that file's presence rather than spending a call
+// to find out — cheap enough to run on demand, and honest about only checking
+// that a login exists rather than that it is still valid.
+const AUTH_HINTS = {
+  claude: {
+    paths: [[".claude", ".credentials.json"], [".claude", "credentials.json"], [".config", "claude", ".credentials.json"]],
+    how: "Run `claude` once in a terminal and complete the login.",
+  },
+  codex: {
+    paths: [[".codex", "auth.json"]],
+    how: "Run `codex` once in a terminal and sign in.",
+  },
+  gemini: {
+    paths: [[".gemini", "oauth_creds.json"], [".gemini", "google_accounts.json"]],
+    how: "Run `gemini` once in a terminal and complete the login, or set GEMINI_API_KEY.",
+  },
+};
+const AUTH_ENV = { gemini: ["GEMINI_API_KEY", "GOOGLE_API_KEY"], claude: ["ANTHROPIC_API_KEY"], codex: ["OPENAI_API_KEY"] };
+
+function seatHealth(room, seat) {
+  const cfg = room.cfg.agents[seat];
+  const spec = resolveCommand(cfg.command);
+  if (spec.error) {
+    return {
+      ok: false, stage: "command", detail: spec.error,
+      how: `Install the CLI and restart Parley — PATH is read once at launch.`,
+    };
+  }
+  const pid = providerIdOf(room, seat);
+  const hint = AUTH_HINTS[pid];
+  if (hint) {
+    const envKey = (AUTH_ENV[pid] || []).find((k) => process.env[k]);
+    const signedIn = envKey || hint.paths.some((parts) => {
+      try { return fs.existsSync(path.join(os.homedir(), ...parts)); } catch { return false; }
+    });
+    if (!signedIn) {
+      return { ok: false, stage: "auth", detail: `${spec.via} is installed but no ${PROVIDERS[pid].label} login was found`, how: hint.how };
+    }
+  }
+  return { ok: true, stage: "ready", detail: spec.via };
+}
+
 function roomSummary(room) {
   const seats = seatIds(room);
   const cmdStatus = {};
@@ -1766,6 +2355,10 @@ function roomSummary(room) {
     lastAddressed: room.state.lastAddressed,
     seats,
     providers: providerCatalog(),
+    // Per seat, because a seat's id no longer has to be its provider's. Purely
+    // additive: an older page still keys off `providers` and, for a room whose
+    // ids are provider names, gets the same answer.
+    seatInfo: seatCatalog(room),
     agents: Object.fromEntries(seats.map((a) => [a, {
       linked: !!room.state.agents[a].sessionRef,
       sessionRef: room.state.agents[a].sessionRef ? String(room.state.agents[a].sessionRef).slice(0, 8) : null,
@@ -1803,6 +2396,11 @@ function roomSummary(room) {
     // spans a withdrawn entry, so without this the UI cheerfully reports that
     // the seat caught up on a message it was never shown.
     cancelledDeliveries: { ...(room.state.cancelledDeliveries || {}) },
+    // Amber, and ahead of every receipt for the same reason: this seat received
+    // the message and every later turn carries it again in context, so a
+    // receipt-first read would quietly erase the fact that the user stopped its
+    // answer.
+    interruptedResponses: { ...(room.state.interruptedResponses || {}) },
     lurkOutcomes: [...(room.state.lurkOutcomes || [])],
     hopRuns: [...(room.hopRuns || new Map()).values()].map((run) => ({ ...run })),
     queued: queueSize(room),
@@ -1810,6 +2408,8 @@ function roomSummary(room) {
     // for both seats is two of them. Anything the user reads has to count
     // messages instead, or a single held @both reads as "2 queued messages".
     queuedDispatches: queuedDispatchCount(room),
+    // Held on purpose, not merely waiting: the seat may well be free.
+    queuePaused: !!room.queuePaused,
     queue: queueSnapshot(room),
     canRetry: retryTargets(room).length > 0,
   };
@@ -1845,6 +2445,9 @@ function beginRun(room, agent, { phase, startedAt, rootN = null, sourceN = null,
     stopRequested: false,
     child: null,
   };
+  // Anything left over from the previous run would make this one's first
+  // increment arrive at a stale offset.
+  endStream(room, agent);
   room.busy.set(agent, { startedAt, runId: run.runId });
   room.runs.set(agent, run);
   broadcast(room, {
@@ -1984,6 +2587,51 @@ function withdrawalNote(room, agent, e) {
     : "";
 }
 
+// The amber half of the same per-message truth as cancelledDeliveries. Red says
+// the seat never received it; this says the seat did receive it and the user cut
+// its answer short before anything durable existed. Written only where a turn
+// that actually launched throws `stopped` — never for a delivery dropped from
+// the queue (that is a withdrawal) and never for a request the causal
+// coordinator declined to launch (that is already a terminal outcome with its
+// own copy).
+function interruptedFor(room, n) {
+  const map = room.state.interruptedResponses || {};
+  const seats = map[String(n)];
+  return Array.isArray(seats) ? seats : [];
+}
+
+function recordInterrupted(room, agent, n) {
+  if (n === undefined || n === null) return false;
+  if (!room.state.interruptedResponses) room.state.interruptedResponses = {};
+  const map = room.state.interruptedResponses;
+  const key = String(n);
+  if ((map[key] || []).includes(agent)) return false;
+  map[key] = [...(map[key] || []), agent];
+  saveState(room);
+  // Same reason clearWithdrawals broadcasts: the dot's meaning changes before
+  // the seat is released, and the browser must not sit on a stale one.
+  broadcast(room, { type: "room", room: roomSummary(room) });
+  return true;
+}
+
+// Superseded, never cleared on a timer or by unrelated traffic: only this seat
+// completing a run rooted in this same entry resolves it. Every later turn
+// carries the message in its context bundle, so resolving on a receipt or a
+// cursor advance would degenerate into "amber clears on the next completed
+// turn, whatever it is about". If the replacement run is stopped too, the
+// record simply stands.
+function resolveInterrupted(room, agent, n) {
+  const map = room.state.interruptedResponses;
+  if (!map) return false;
+  const key = String(n);
+  if (!Array.isArray(map[key]) || !map[key].includes(agent)) return false;
+  const left = map[key].filter((seat) => seat !== agent);
+  if (left.length) map[key] = left; else delete map[key];
+  saveState(room);
+  broadcast(room, { type: "room", room: roomSummary(room) });
+  return true;
+}
+
 // Rendered per source and per seat, because the notice must neither reveal a
 // withheld message nor tell a seat whose own delivery ran to disregard it.
 // `explained` prevents repeating what an original entry or placeholder in this
@@ -2068,7 +2716,7 @@ function notePrefix(room) {
 // delta at its real position. Said for a single held message too — staleness
 // comes from the elapsed gap, not the count, and sleep here is quota-shaped, so
 // it is measured in hours.
-function buildPrompt(room, deltaLines, userTurn, attachmentContext = null, heldCount = 0) {
+function buildPrompt(room, deltaLines, userTurn, attachmentContext = null, heldCount = 0, askBlock = "") {
   const head = notePrefix(room);
   const many = heldCount > 1;
   const held = heldCount >= 1
@@ -2079,8 +2727,39 @@ function buildPrompt(room, deltaLines, userTurn, attachmentContext = null, heldC
     : "";
   const current = relayMessage("user (to you)", userTurn.text,
     attachmentPromptLines(room, [userTurn], attachmentContext));
-  if (!deltaLines.length) return `${head}${held}${current}`;
-  return `${head}[Room activity since your last turn]\n${deltaLines.join("\n")}\n[End of room activity]\n\n${held}${current}`;
+  // The ask block sits after the delta and before the current message: every
+  // downstream framing assumption — including the fake CLI's — is that the last
+  // relay label in the prompt is the live instruction.
+  if (!deltaLines.length) return `${head}${held}${askBlock}${current}`;
+  return `${head}[Room activity since your last turn]\n${deltaLines.join("\n")}\n[End of room activity]\n\n${held}${askBlock}${current}`;
+}
+
+// The message a Redirect is about, restaged into that turn's prompt. The agent
+// may have it far back in context or, after a session reset, not at all — and
+// the instruction ("Continue responding to this message") is meaningless without
+// it. Framed through relayMessage like every other participant's words, so a
+// body containing `user (to you):` cannot manufacture user authority, and
+// deliberately NOT labelled "(to you)" so the notion of "the current
+// instruction" stays the actual current message.
+function askSourceBlock(room, agent, source, attachmentContext, inDelta) {
+  if (!source) return "";
+  // Withdrawal is a standing promise: Parley stops putting a withheld message in
+  // front of that seat, "not in that turn's prompt, not in any later one". A
+  // redirect must not be the loophole. The seat still sees the instruction and
+  // the reference; it just gets no body and no attachments.
+  if (withdrawnFrom(room, agent, source)) {
+    return `[The user is redirecting you to message #${source.n}, whose contents were withheld from you.]\n\n`;
+  }
+  // Already in this turn's delta: point at it instead of printing a second copy.
+  if (inDelta) {
+    return `[The user is asking you about message #${source.n} from ` +
+      `${source.kind === "user" ? "the user" : source.author}, shown above in the room activity.]\n\n`;
+  }
+  const label = source.kind === "user" ? `user (quoted message #${source.n})`
+    : `${source.author} (quoted message #${source.n})`;
+  return `[The user is asking you about this earlier message]\n` +
+    `${relayMessage(label, source.text, attachmentPromptLines(room, [source], attachmentContext))}\n` +
+    `[End quoted message]\n\n`;
 }
 
 // @both in a work room is a table discussion: reads allowed, mutations not.
@@ -2209,7 +2888,7 @@ async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) 
     phase: "start", startedAt, rootN: userTurn.n, sourceN: userTurn.n,
     queueGroupId: opts.queueGroupId || null, chain: opts.chain || null,
   });
-  const onStream = (text) => broadcast(room, { type: "stream", agent, text });
+  const onStream = (text) => streamText(room, agent, text);
   const onActivity = (label) => {
     if (gen === room.generation) appendEntry(room, { kind: "activity", author: agent, text: label }, { md: false });
   };
@@ -2225,11 +2904,25 @@ async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) 
     // The current root wins the native-input budget. Older unseen attachments
     // follow newest-first. Canonical files never enter the provider sandbox;
     // only this invocation's disposable copies do.
+    // Derived from the entry, never passed in as an option: Retry and Wake &
+    // deliver both re-launch the stored user entry, and a redirect that lost its
+    // quoted source on retry would become an instruction with no referent.
+    // Restaging is prompt-only — the seat's cursor is a high-water mark and
+    // rewinding it to reach an old source would re-send context the seat already
+    // heard on every later turn.
+    const askFrom = userTurn.meta && userTurn.meta.askFrom;
+    const askSource = askFrom && Number.isSafeInteger(Number(askFrom.sourceN))
+      ? room.entries.find((e) => e.n === Number(askFrom.sourceN)) || null : null;
     providerInputs = stageProviderInputs(room, agent,
-      [userTurn, ...unseen.slice().reverse()], nativeImageBudget(agent));
+      [userTurn, ...(askSource ? [askSource] : []), ...unseen.slice().reverse()],
+      nativeImageBudget(room, agent));
     const delta = buildDelta(room, agent, userTurn.n, unseen, providerInputs);
     const images = providerInputs.images;
-    const basePrompt = buildPrompt(room, delta, userTurn, providerInputs, opts.heldCount || 0);
+    const askBlock = askSource
+      ? askSourceBlock(room, agent, askSource, providerInputs,
+        unseen.some((e) => e.n === askSource.n))
+      : "";
+    const basePrompt = buildPrompt(room, delta, userTurn, providerInputs, opts.heldCount || 0, askBlock);
     // Scope, prompt note and Claude isolation are all derived together, per
     // attempt: the recovery retry below launches a second process that may
     // start under a mode the first one never saw.
@@ -2244,7 +2937,7 @@ async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) 
     let turnScope = scopeNow();
     let prompt = noted(turnScope.discussion ? `${basePrompt}\n\n${DISCUSSION_NOTE}` : basePrompt);
     retireOutdatedSession(room, agent);
-    const isolated = isolatedClaudeProtectedTurn(room, agent, turnScope);
+    const isolated = isolatedProtectedTurn(room, agent, turnScope);
     const fresh = !room.state.agents[agent].sessionRef || isolated;
     let delivery = composePromptDelivery(room, agent, fresh, isolated);
     const briefing = delivery.briefing;
@@ -2255,7 +2948,8 @@ async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) 
     // change begins under the new configuration and may keep what it creates.
     let epoch = seatEpoch(room, agent);
     try {
-      res = await adapters[agent](room, {
+      res = await adapters[providerIdOf(room, agent)](room, {
+        seat: agent,
         prompt, briefing, onStream, onActivity, images, inputDir: providerInputs.dir,
         allowEmpty: !!opts.allowEmpty, ...turnScope,
       });
@@ -2270,7 +2964,8 @@ async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) 
         const b2 = resetRecoveryBriefing(room, agent);
         delivery = { ...delivery, contractDelivered: true, expectedSessionRef: null };
         epoch = seatEpoch(room, agent);
-        res = await adapters[agent](room, {
+        res = await adapters[providerIdOf(room, agent)](room, {
+        seat: agent,
           prompt, briefing: b2, onStream, onActivity, images, inputDir: providerInputs.dir,
           allowEmpty: !!opts.allowEmpty, ...turnScope,
         });
@@ -2285,6 +2980,11 @@ async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) 
     // backward, or later turns would re-send context the seat already heard.
     room.state.agents[agent].cursor = Math.max(heardFrom, userTurn.n, heardThrough);
     if (room.state.lastUser && room.state.lastUser.n === userTurn.n) room.state.lastUser.done[agent] = true;
+    // This seat has now completed a run explicitly rooted in this message — the
+    // one thing that supersedes an earlier stopped attempt at it. Above the
+    // emptyReply branch so a [pass]/empty completion counts too: the seat was
+    // handed the message again and chose to say nothing.
+    resolveInterrupted(room, agent, userTurn.n);
     if (res.emptyReply) {
       appendReceipt(room, {
         agent, from: heardFrom, upTo: Math.max(userTurn.n, heardThrough),
@@ -2312,22 +3012,37 @@ async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) 
       turn: userTurn.n, mode: "turn",
     });
 
-    if (agent === "codex" && res.sentinelThread && !room.state.codexLastWarned) {
-      room.state.codexLastWarned = true;
+    // Some providers can fall back to a session ref that is not a durable
+    // identity. Warn once per room, in the provider's own words.
+    const sentinelNote = capsOf(room, agent).sentinelNote;
+    if (sentinelNote && res.sentinelThread && !room.state.codexLastWarned) {
+      room.state.codexLastWarned = true; // legacy key name; one note per room
       saveState(room);
       appendEntry(room, {
         kind: "system", author: "system",
-        text: "Note: codex did not report a thread id, so Parley will resume its most recent session (--last). Using codex outside Parley at the same time could cross threads.",
+        text: sentinelNote.replaceAll("{seat}", agent),
       });
     }
     return replyEntry;
   } catch (e) {
     if (gen !== room.generation) return null; // room was reset; drop the stale error
+    // Amber. The seat received this message — the process ran with it in the
+    // prompt — and the user cut the answer short. Recorded before the notice so
+    // the durable fact survives even if the append throws, and deliberately not
+    // recorded for a provider failure: a failure already renders an error entry
+    // with its own Retry button, while "stopped" is the vocabulary for a run the
+    // user ended. A timeout is not `stopped` and correctly stays a failure.
+    if (e.stopped) recordInterrupted(room, agent, userTurn.n);
     const icon = e.stopped ? "⏹" : "⚠";
     appendEntry(room, {
       kind: "system", author: "system",
       text: `${icon} ${e.stopped ? e.message : `${agent} failed: ${e.message}`}`,
-      meta: { agent, error: !e.stopped, stopped: !!e.stopped },
+      meta: {
+        agent, error: !e.stopped, stopped: !!e.stopped,
+        // Ties the click to the message it interrupted, for auditing and for
+        // asking the same question again from the stop notice.
+        ...(e.stopped ? { interrupted: { agent, sourceN: userTurn.n, rootN: run.rootN } } : {}),
+      },
     });
     return e.stopped && opts.signalStop ? STEP_STOPPED : null;
   } finally {
@@ -2395,7 +3110,7 @@ async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE, opts = 
     sourceN: (catchUpSource || ordinarySource || catchUpRootEntries[catchUpRootEntries.length - 1]).n,
     chain: opts.chain || null,
   });
-  const onStream = (text) => broadcast(room, { type: "stream", agent, text });
+  const onStream = (text) => streamText(room, agent, text);
   const onActivity = (label) => {
     if (gen === room.generation) appendEntry(room, { kind: "activity", author: agent, text: label }, { md: false });
   };
@@ -2403,7 +3118,7 @@ async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE, opts = 
   let providerInputs = null;
   try {
     providerInputs = stageProviderInputs(room, agent,
-      [...catchUpRootEntries.slice().reverse(), ...unseen.slice().reverse()], nativeImageBudget(agent));
+      [...catchUpRootEntries.slice().reverse(), ...unseen.slice().reverse()], nativeImageBudget(room, agent));
     const delta = buildDelta(room, agent, -1, unseen, providerInputs,
       opts.catchUp ? { catchUpRoots: catchUpRootSet } : {});
     const images = providerInputs.images;
@@ -2434,7 +3149,7 @@ async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE, opts = 
     let turnScope = scopeNow();
     let prompt = head + (turnScope.discussion ? `\n${DISCUSSION_NOTE}` : "");
     retireOutdatedSession(room, agent);
-    const isolated = isolatedClaudeProtectedTurn(room, agent, turnScope);
+    const isolated = isolatedProtectedTurn(room, agent, turnScope);
     const fresh = !room.state.agents[agent].sessionRef || isolated;
     let delivery = composePromptDelivery(room, agent, fresh, isolated);
     const briefing = delivery.briefing;
@@ -2443,7 +3158,8 @@ async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE, opts = 
     let res;
     let epoch = seatEpoch(room, agent); // per attempt — see applyAdapterSession
     try {
-      res = await adapters[agent](room, {
+      res = await adapters[providerIdOf(room, agent)](room, {
+        seat: agent,
         prompt, briefing, onStream, onActivity, images, inputDir: providerInputs.dir, ...turnScope,
       });
     } catch (e) {
@@ -2455,7 +3171,8 @@ async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE, opts = 
         turnScope = scopeNow();
         prompt = head + (turnScope.discussion ? `\n${DISCUSSION_NOTE}` : "");
         epoch = seatEpoch(room, agent);
-        res = await adapters[agent](room, {
+        res = await adapters[providerIdOf(room, agent)](room, {
+        seat: agent,
           prompt, briefing: b2, onStream, onActivity, images, inputDir: providerInputs.dir, ...turnScope,
         });
       } else throw e;
@@ -2493,6 +3210,12 @@ async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE, opts = 
     // already say this with a neutral ⏹ entry; routing a deliberate Stop down
     // the lurk-error whisper instead put an error in front of the user for
     // something they asked for.
+    // Deliberately no interrupted record on either branch below. A stopped or
+    // failed lurk did not move the cursor and produced no reply anyone was
+    // owed, so the honest status is still "hasn't seen it" — which the
+    // lurkOutcomes range already says precisely, and which a later deliberate
+    // delivery heals. Amber means "received it, answer cut short"; a lurk has
+    // no answer the user asked for.
     if (e.stopped) {
       if (opts.onTerminal) opts.onTerminal("stopped", {
         sinceN: heardFrom + 1, throughN: lastSeen, triggerN: userTurnN,
@@ -2620,9 +3343,13 @@ function findHopTarget(room, entry, opts = {}) {
 // A hop waits for the seat's running turn *and* for any user delivery held for
 // it: the user asked first, so their message must not be answered after a
 // follow-up the agents generated between themselves.
+// A paused delivery is the exception. It will not run until the user says so,
+// and this wait has a deadline (seatTimeout + 5s) — so leaving it in would spend
+// that whole deadline and then record the request as `wait-aborted`, silently
+// losing an agent follow-up because the user pressed ⏸.
 async function waitForHopSeat(room, agent, gen, chain) {
   const deadline = Date.now() + seatTimeout(room, agent) + 5000;
-  while (seatOccupied(room, agent)) {
+  while (seatBlocked(room, agent)) {
     if (gen !== room.generation || chainHalted(room, chain)) return false;
     if (Date.now() > deadline) return false;
     await new Promise((resolve) => setTimeout(resolve, 150));
@@ -2708,7 +3435,7 @@ async function runHopTurn(room, agent, triggerEntry, rootN, scope = NO_SCOPE, op
     sourceN: triggerEntry.n,
     chain: opts.chain || null,
   });
-  const onStream = (text) => broadcast(room, { type: "stream", agent, text });
+  const onStream = (text) => streamText(room, agent, text);
   const onActivity = (label) => {
     if (gen === room.generation) appendEntry(room, { kind: "activity", author: agent, text: label }, { md: false });
   };
@@ -2721,7 +3448,7 @@ async function runHopTurn(room, agent, triggerEntry, rootN, scope = NO_SCOPE, op
     const rootEntry = room.entries.find((entry) => entry.n === rootN && entry.kind === "user") || null;
     providerInputs = stageProviderInputs(room, agent,
       [...(rootEntry ? [rootEntry] : []), triggerEntry, ...unseen.slice().reverse()],
-      nativeImageBudget(agent));
+      nativeImageBudget(room, agent));
     const delta = buildDelta(room, agent, triggerEntry.n, unseen, providerInputs);
     // The first reviewer often receives the root in its ordinary delta. Add
     // the root attachment block separately only after that cursor has moved
@@ -2747,7 +3474,7 @@ async function runHopTurn(room, agent, triggerEntry, rootN, scope = NO_SCOPE, op
     let turnScope = scopeNow();
     let prompt = body + (turnScope.discussion ? `\n${DISCUSSION_NOTE}` : "");
     retireOutdatedSession(room, agent);
-    const isolated = isolatedClaudeProtectedTurn(room, agent, turnScope);
+    const isolated = isolatedProtectedTurn(room, agent, turnScope);
     const fresh = !room.state.agents[agent].sessionRef || isolated;
     let delivery = composePromptDelivery(room, agent, fresh, isolated);
     const briefing = delivery.briefing;
@@ -2760,7 +3487,8 @@ async function runHopTurn(room, agent, triggerEntry, rootN, scope = NO_SCOPE, op
       // the logical hop at the adapter boundary; a native resume-recovery retry
       // remains part of this same delivered turn and does not charge twice.
       if (opts.onLaunch) opts.onLaunch();
-      res = await adapters[agent](room, {
+      res = await adapters[providerIdOf(room, agent)](room, {
+        seat: agent,
         prompt, briefing, onStream, onActivity, images, inputDir: providerInputs.dir,
         allowEmpty: !!opts.allowEmpty, ...turnScope,
       });
@@ -2773,7 +3501,8 @@ async function runHopTurn(room, agent, triggerEntry, rootN, scope = NO_SCOPE, op
         turnScope = scopeNow();
         prompt = body + (turnScope.discussion ? `\n${DISCUSSION_NOTE}` : "");
         epoch = seatEpoch(room, agent);
-        res = await adapters[agent](room, {
+        res = await adapters[providerIdOf(room, agent)](room, {
+        seat: agent,
           prompt, briefing: b2, onStream, onActivity, images, inputDir: providerInputs.dir,
           allowEmpty: !!opts.allowEmpty, ...turnScope,
         });
@@ -2784,6 +3513,11 @@ async function runHopTurn(room, agent, triggerEntry, rootN, scope = NO_SCOPE, op
     applyAdapterSession(room, agent, res, epoch);
     stampPromptDelivery(room, agent, res, epoch, delivery);
     room.state.agents[agent].cursor = Math.max(heardFrom, triggerEntry.n, heardThrough);
+    // A hop, pair review/fix, sibling attention or answer return is explicitly
+    // rooted at the entry it was handed. Completing one supersedes an earlier
+    // stopped attempt at that same entry for this seat. Keyed on the entry the
+    // turn was answering, not the root: that is the one that went amber.
+    resolveInterrupted(room, agent, triggerEntry.n);
     if (res.emptyReply) {
       saveState(room);
       appendReceipt(room, {
@@ -2819,10 +3553,17 @@ async function runHopTurn(room, agent, triggerEntry, rootN, scope = NO_SCOPE, op
   } catch (e) {
     if (gen !== room.generation) return null;
     if (e.stopped) {
+      // Same amber rule as an ordinary turn, and it covers hops, pair
+      // review/fix steps, sibling attention delivery and answer returns
+      // uniformly — every one of them actually launched a provider process.
+      recordInterrupted(room, agent, triggerEntry.n);
       appendEntry(room, {
         kind: "system", author: "system",
         text: `⏹ ${e.message}`,
-        meta: { agent, error: false, stopped: true },
+        meta: {
+          agent, error: false, stopped: true,
+          interrupted: { agent, sourceN: triggerEntry.n, rootN: run.rootN },
+        },
       });
       // Pair review/fix callers must distinguish this from both a failed hop
       // and a silent/pass reply. Ordinary hops deliberately retain null.
@@ -3330,12 +4071,22 @@ async function continuePair(room, requestedCapN = null) {
     } finally {
       finishPairWork(room, active, gen);
     }
-  })();
+  })().catch((e) => noteChainFailure(room, "pair cycle", e));
 }
 
 // Work out how a message will run before running it, so the queue and the
 // handler always agree about which seats it actually needs. A pair cycle
 // needs both; an explicitly tagged aside needs only the seat it names.
+// Ask again is Redirect with a default instruction, not a third code path. A
+// literally empty user bubble would leave the chronological cause unauditable,
+// so the default text is real text: it is what appendEntry writes to
+// transcript.md, what buildDelta relays, and what the agent is actually told.
+const ASK_AGAIN_TEXT = "Continue responding to this message.";
+// "now"   — the seat looked idle; dispatch, or fall to the ordinary tail
+// "queue" — identical to sending an ordinary message
+// "stop"  — the only producer of head-of-lane placement in the whole system
+const ASK_MODES = new Set(["now", "queue", "stop"]);
+
 function planMessage(room, raw, targetSel) {
   const pairCmd = parsePair(raw);
   if (pairCmd && pairCmd.action === "end") {
@@ -3688,16 +4439,16 @@ function relayPolicyForEntry(room, entry) {
 // scheduler as a normal accepted message. Keeping the exchange counter open
 // through attention work prevents a false-idle window and gives Stop/config
 // guards the same chain object for the entire recovered conversation.
-function startRecoveredDelivery(room, userTurn, targets, scope, turnOptions = null) {
+function startRecoveredDelivery(room, userTurn, targets, scope, turnOptions = null, opts = {}) {
   const gen = room.generation;
   const chain = newChain(room);
   const queueGroupId = `d${room.dispatchSeq++}`;
   const relayPolicy = relayPolicyForEntry(room, userTurn);
-  const noteStoppedRecoveryLurkers = (invoked = new Set(targets)) => {
+  const noteRecoveryLurkers = (reason, invoked = new Set(targets)) => {
     if (relayPolicy.solo || userTurn.target === "both") return;
     for (const agent of seatIds(room)) {
       if (!invoked.has(agent) && room.cfg.agents[agent].lurk) {
-        noteLurkOutcome(room, agent, userTurn.n, "stopped");
+        noteLurkOutcome(room, agent, userTurn.n, reason);
       }
     }
   };
@@ -3709,9 +4460,18 @@ function startRecoveredDelivery(room, userTurn, targets, scope, turnOptions = nu
   room.hopRuns.set(queueGroupId, hopRun);
   (async () => {
     try {
+      const dispatch = { queueGroupId, chain };
       const results = await Promise.allSettled(targets.map((agent) => {
-        chain.delivered++;
         const extra = typeof turnOptions === "function" ? (turnOptions(agent) || {}) : (turnOptions || {});
+        // Retrying a discarded delivery is an ordinary enqueue, never a launch:
+        // it joins the tail of the seat's own lane, so it cannot overtake work
+        // the user sent afterwards and needs no idle seat to be accepted.
+        if (opts.viaQueue) {
+          return deferDelivery(room, agent, userTurn, scope, dispatch, {
+            turnOptions: extra, onStart: opts.onStart || null,
+          });
+        }
+        chain.delivered++;
         return runAgentTurn(room, agent, userTurn, scope, {
           ...extra, queueGroupId, chain,
         });
@@ -3719,8 +4479,14 @@ function startRecoveredDelivery(room, userTurn, targets, scope, turnOptions = nu
       if (gen !== room.generation) return;
       await withRootRelay(room, userTurn.n, async () => {
         if (gen !== room.generation) return;
+        // Every re-delivery this retry owed was discarded again before it ran.
+        // There is no exchange to continue and no lurk check to run.
+        if (chain.cancelled && !chain.delivered) {
+          noteRecoveryLurkers("cancelled");
+          return;
+        }
         if (chainHalted(room, chain)) {
-          noteStoppedRecoveryLurkers();
+          noteRecoveryLurkers("stopped");
           return;
         }
         const replies = results
@@ -3747,7 +4513,7 @@ function startRecoveredDelivery(room, userTurn, targets, scope, turnOptions = nu
         // too instead of creating one permanently un-overheard exchange class.
         if (gen !== room.generation) return;
         if (chainHalted(room, chain)) {
-          noteStoppedRecoveryLurkers(coordinator.invoked);
+          noteRecoveryLurkers("stopped", coordinator.invoked);
           return;
         }
         const listeners = relayPolicy.solo || userTurn.target === "both"
@@ -3794,13 +4560,143 @@ function startRecoveredDelivery(room, userTurn, targets, scope, turnOptions = nu
       broadcast(room, { type: "room", room: roomSummary(room) });
       scheduleCatchUps(room);
     }
-  })();
+  })().catch((e) => noteChainFailure(room, "recovered delivery", e));
   broadcast(room, { type: "room", room: roomSummary(room) });
 }
 
 // Synchronous validation + kickoff; agent turns continue in the background
 // and surface over SSE. Throws (with .status) on invalid input so the HTTP
 // route can report it.
+// The dispatch tail every accepted ordinary user turn runs: one coordinator, one
+// delivery per addressed seat, then the causal scheduler and the lurk pass.
+// Shared by handleUserMessage and handleAsk so the two can never drift into
+// different conversation contracts — the same reason planMessage is shared.
+// `head` is the single head-of-lane producer in the system; see enqueueAhead.
+function launchUserDispatch(room, userTurn, {
+  agents, deferred, listeners, scope, relayPolicy, head = false,
+}) {
+  // One id per accepted dispatch, not per message. The queue view groups rows by
+  // it and hangs the ✕ off it.
+  const queueGroupId = `d${room.dispatchSeq++}`;
+  // One chain object per dispatch, shared by its runs and its queued items, so a
+  // scoped Stop can end exactly this exchange.
+  const chain = newChain(room);
+  const dispatch = { queueGroupId, chain };
+  const gen = room.generation;
+  // An exchange is in flight from here until the chain closes, including the
+  // gaps between its turns where no seat is busy. A hop launches a new process
+  // in one of those gaps, so anything that must not change underneath a single
+  // exchange — the project folder — asks about this, not about `busy`.
+  room.exchanges++;
+  const hopRun = {
+    id: queueGroupId, rootN: userTurn.n, used: relayUsed(room, userTurn.n),
+    budget: relayPolicy.hopBudget, phase: "running",
+  };
+  room.hopRuns.set(queueGroupId, hopRun);
+  (async () => {
+   try {
+    // One entry, one coordinator, one delivery per addressed seat. A free seat
+    // starts now; an occupied one starts the moment its lane reaches it. Both
+    // kinds are awaited here, so the hop and lurk chain below still runs
+    // exactly once, after every addressed seat has had its say — or failed, or
+    // been stopped.
+    const results = await Promise.allSettled(agents.map((a) => {
+      if (deferred.has(a)) return deferDelivery(room, a, userTurn, scope, dispatch, { head });
+      chain.delivered++;
+      return runAgentTurn(room, a, userTurn, scope, { queueGroupId, chain });
+    }));
+    if (gen !== room.generation) return;
+    await withRootRelay(room, userTurn.n, async () => {
+    if (gen !== room.generation) return;
+    // Every delivery this message owed was cancelled before it ran, so there is
+    // no exchange to continue: no hops, and no lurk check either — a lurker
+    // chiming in about a message the user cancelled is the whole bug. A split
+    // @both whose other half already ran keeps its chain.
+    if (chain.cancelled && !chain.delivered) {
+      for (const a of listeners) noteLurkOutcome(room, a, userTurn.n, "cancelled");
+      return;
+    }
+    if (chainHalted(room, chain)) {
+      for (const a of listeners) noteLurkOutcome(room, a, userTurn.n, "stopped");
+      return;
+    }
+    const localInitialReplies = results
+      .filter((r) => r.status === "fulfilled" && isEntryResult(r.value))
+      .map((r) => r.value)
+      .sort((a, b) => a.n - b.n);
+    // A same-root Retry/Wake may have produced the missing @both half while
+    // this coordinator was still awaiting its original provider. Reconcile
+    // exact direct-root entries at the serialized boundary; never infer a
+    // successful half from a high cursor or unrelated later traffic.
+    const initialReplies = userTurn.target === "both"
+      ? directRootReplies(room, userTurn) : localInitialReplies;
+    const successfulInitialAuthors = new Set(initialReplies.map((entry) => entry.author));
+    const coordinator = createCausalCoordinator(room, {
+      userTurn, scope, chain, gen, relayPolicy, hopRun,
+      invoked: new Set(agents),
+    });
+    coordinator.enqueueInitial(initialReplies, successfulInitialAuthors);
+    await coordinator.settle();
+    if (gen !== room.generation) return;
+    if (chainHalted(room, chain)) {
+      // A listener already invoked by causal routing has handled this root;
+      // don't also persist a contradictory "lurk stopped" outcome for it.
+      for (const a of listeners) {
+        if (!coordinator.invoked.has(a)) noteLurkOutcome(room, a, userTurn.n, "stopped");
+      }
+      return;
+    }
+
+    const lurkers = listeners.filter((a) => !coordinator.invoked.has(a)).filter((a) => {
+      // Asked before busy: a sleeping seat is not busy, and the busy path's
+      // "the delta catches it up later" is exactly what does not hold here.
+      if (isAsleep(room, a)) {
+        noteSleepSkip(room, a, "lurk", { sourceN: userTurn.n });
+        return false;
+      }
+      if (!room.cfg.agents[a].lurk) {
+        noteLurkOutcome(room, a, userTurn.n, "disabled");
+        return false;
+      }
+      if (seatOccupied(room, a)) {
+        const throughN = room.entries.length ? room.entries[room.entries.length - 1].n : userTurn.n;
+        queueLurkCatchUp(room, a, userTurn.n, throughN);
+        return false;
+      }
+      return true;
+    });
+    const chimeResults = lurkers.length
+      ? await Promise.allSettled(lurkers.map((a) => runListenerTurn(room, a, userTurn.n, scope, {
+        chain,
+        onTerminal: (reason, range) => persistLurkOutcome(room, a, range, reason),
+      })))
+      : [];
+    if (gen !== room.generation || chainHalted(room, chain)) return;
+
+    const chimes = chimeResults
+      .filter((r) => r.status === "fulfilled" && isEntryResult(r.value))
+      .map((r) => r.value);
+    if (chimes.length) {
+      coordinator.enqueueLurks(chimes);
+      await coordinator.settle();
+      if (gen !== room.generation) return;
+    }
+
+    coordinator.finishCaps();
+    drainLanes(room); // messages the user queued while the table was busy
+    });
+   } finally {
+     room.exchanges = Math.max(0, room.exchanges - 1);
+     room.hopRuns.delete(queueGroupId);
+     broadcast(room, { type: "room", room: roomSummary(room) });
+     scheduleCatchUps(room);
+   }
+  })().catch((e) => noteChainFailure(room, "exchange", e));
+  // after kickoff, so the summary includes the now-busy agents
+  broadcast(room, { type: "room", room: roomSummary(room) });
+  return { queueGroupId, deferred: [...deferred] };
+}
+
 function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles, rawRelay = {}) {
   const raw0 = String(rawText || "").trim();
   if (raw0.length > MAX_MESSAGE_TEXT) {
@@ -3939,7 +4835,10 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles, rawRel
   // sent to two busy agents still reaches whichever frees first instead of
   // waiting for the slower one. A pair turn has no half to deliver, so what
   // waits is its whole cycle; the mode change and the task still land now.
-  const deferred = new Set(asPairTurn ? [] : agents.filter((a) => seatOccupied(room, a)));
+  // A paused queue holds new work too. A "pause" that only held what was already
+  // there would keep launching everything sent afterwards, which is the opposite
+  // of what someone reaching for it wants.
+  const deferred = new Set(asPairTurn ? [] : agents.filter((a) => room.queuePaused || seatOccupied(room, a)));
   // Every occupied seat is deferred above, so this cannot fire — it guards the
   // invariant that nothing starts a second turn on a seat already running one.
   if (!asPairTurn && agents.some((a) => room.busy.has(a) && !deferred.has(a))) {
@@ -3992,18 +4891,17 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles, rawRel
     return { target: effectiveTarget, explicit: plan.explicit, held: sleeping };
   }
   const scope = makeScope(room, userTurn.n, effectiveTarget, discussion);
-  // One id per accepted dispatch, not per message: a message that produces a
-  // second batch later gets a second id, so cancelling one never reaches the
-  // other. The queue view groups rows by it and hangs the ✕ off it.
-  const queueGroupId = `d${room.dispatchSeq++}`;
-  // One chain object per dispatch, shared by its runs and its queued items, so
-  // a scoped Stop can end exactly this exchange. `delivered`/`cancelled` count
-  // what the dispatch actually got to do, which is how a cancelled queue entry
-  // ends its own chain without ending one a sibling seat is already running.
-  const chain = newChain(room);
-  const dispatch = { queueGroupId, chain };
 
   if (asPairTurn) {
+    // One id per accepted dispatch, not per message: a message that produces a
+    // second batch later gets a second id, so cancelling one never reaches the
+    // other. The queue view groups rows by it and hangs the ✕ off it.
+    const queueGroupId = `d${room.dispatchSeq++}`;
+    // One chain object per dispatch, shared by its runs and its queued items, so
+    // a scoped Stop can end exactly this exchange. `delivered`/`cancelled` count
+    // what the dispatch actually got to do, which is how a cancelled queue entry
+    // ends its own chain without ending one a sibling seat is already running.
+    const chain = newChain(room);
     const gen = room.generation;
     // The roles and round cap are snapshotted here, at acceptance, so a queued
     // cycle runs the pairing the user actually asked for even if /pair start
@@ -4012,8 +4910,9 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles, rawRel
     // Read the epoch when the cycle actually starts, not when it was accepted:
     // a queued cycle that survives a "keep queued work" stop runs under the
     // line drawn behind it.
-    const start = () => runPairCycle(room, userTurn, snap, gen, chain);
-    if (room.pairActive || allSeats.some((a) => seatOccupied(room, a))) {
+    const start = () => runPairCycle(room, userTurn, snap, gen, chain)
+      .catch((e) => noteChainFailure(room, "pair cycle", e));
+    if (room.queuePaused || room.pairActive || allSeats.some((a) => seatOccupied(room, a))) {
       enqueue(room, {
         kind: "cycle", agents: [...allSeats], pairTurn: true, gen,
         stopAt: chain.stopAt, chain,
@@ -4032,119 +4931,10 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles, rawRel
     return { target: effectiveTarget, explicit: plan.explicit };
   }
 
-  const gen = room.generation;
-  // An exchange is in flight from here until the chain closes, including the
-  // gaps between its turns where no seat is busy. A hop launches a new process
-  // in one of those gaps, so anything that must not change underneath a single
-  // exchange — the project folder — asks about this, not about `busy`.
-  room.exchanges++;
-  const hopRun = {
-    id: queueGroupId, rootN: userTurn.n, used: relayUsed(room, userTurn.n),
-    budget: relayPolicy.hopBudget, phase: "running",
-  };
-  room.hopRuns.set(queueGroupId, hopRun);
-  (async () => {
-   try {
-    // One entry, one coordinator, one delivery per addressed seat. A free seat
-    // starts now; an occupied one starts the moment its lane reaches it. Both
-    // kinds are awaited here, so the hop and lurk chain below still runs
-    // exactly once, after every addressed seat has had its say — or failed, or
-    // been stopped.
-    const results = await Promise.allSettled(agents.map((a) => {
-      if (deferred.has(a)) return deferDelivery(room, a, userTurn, scope, dispatch);
-      chain.delivered++;
-      return runAgentTurn(room, a, userTurn, scope, { queueGroupId, chain });
-    }));
-    if (gen !== room.generation) return;
-    await withRootRelay(room, userTurn.n, async () => {
-    if (gen !== room.generation) return;
-    // Every delivery this message owed was cancelled before it ran, so there is
-    // no exchange to continue: no hops, and no lurk check either — a lurker
-    // chiming in about a message the user cancelled is the whole bug. A split
-    // @both whose other half already ran keeps its chain.
-    if (chain.cancelled && !chain.delivered) {
-      for (const a of listeners) noteLurkOutcome(room, a, userTurn.n, "cancelled");
-      return;
-    }
-    if (chainHalted(room, chain)) {
-      for (const a of listeners) noteLurkOutcome(room, a, userTurn.n, "stopped");
-      return;
-    }
-    const localInitialReplies = results
-      .filter((r) => r.status === "fulfilled" && isEntryResult(r.value))
-      .map((r) => r.value)
-      .sort((a, b) => a.n - b.n);
-    // A same-root Retry/Wake may have produced the missing @both half while
-    // this coordinator was still awaiting its original provider. Reconcile
-    // exact direct-root entries at the serialized boundary; never infer a
-    // successful half from a high cursor or unrelated later traffic.
-    const initialReplies = userTurn.target === "both"
-      ? directRootReplies(room, userTurn) : localInitialReplies;
-    const successfulInitialAuthors = new Set(initialReplies.map((entry) => entry.author));
-    const coordinator = createCausalCoordinator(room, {
-      userTurn, scope, chain, gen, relayPolicy, hopRun,
-      invoked: new Set(agents),
-    });
-    coordinator.enqueueInitial(initialReplies, successfulInitialAuthors);
-    await coordinator.settle();
-    if (gen !== room.generation) return;
-    if (chainHalted(room, chain)) {
-      // A listener already invoked by causal routing has handled this root;
-      // don't also persist a contradictory "lurk stopped" outcome for it.
-      for (const a of listeners) {
-        if (!coordinator.invoked.has(a)) noteLurkOutcome(room, a, userTurn.n, "stopped");
-      }
-      return;
-    }
-
-    const lurkers = listeners.filter((a) => !coordinator.invoked.has(a)).filter((a) => {
-      // Asked before busy: a sleeping seat is not busy, and the busy path's
-      // "the delta catches it up later" is exactly what does not hold here.
-      if (isAsleep(room, a)) {
-        noteSleepSkip(room, a, "lurk", { sourceN: userTurn.n });
-        return false;
-      }
-      if (!room.cfg.agents[a].lurk) {
-        noteLurkOutcome(room, a, userTurn.n, "disabled");
-        return false;
-      }
-      if (seatOccupied(room, a)) {
-        const throughN = room.entries.length ? room.entries[room.entries.length - 1].n : userTurn.n;
-        queueLurkCatchUp(room, a, userTurn.n, throughN);
-        return false;
-      }
-      return true;
-    });
-    const chimeResults = lurkers.length
-      ? await Promise.allSettled(lurkers.map((a) => runListenerTurn(room, a, userTurn.n, scope, {
-        chain,
-        onTerminal: (reason, range) => persistLurkOutcome(room, a, range, reason),
-      })))
-      : [];
-    if (gen !== room.generation || chainHalted(room, chain)) return;
-
-    const chimes = chimeResults
-      .filter((r) => r.status === "fulfilled" && isEntryResult(r.value))
-      .map((r) => r.value);
-    if (chimes.length) {
-      coordinator.enqueueLurks(chimes);
-      await coordinator.settle();
-      if (gen !== room.generation) return;
-    }
-
-    coordinator.finishCaps();
-    drainLanes(room); // messages the user queued while the table was busy
-    });
-   } finally {
-     room.exchanges = Math.max(0, room.exchanges - 1);
-     room.hopRuns.delete(queueGroupId);
-     broadcast(room, { type: "room", room: roomSummary(room) });
-     scheduleCatchUps(room);
-   }
-  })();
-  // after kickoff, so the summary includes the now-busy agents
-  broadcast(room, { type: "room", room: roomSummary(room) });
-  return { target: effectiveTarget, explicit: plan.explicit, deferred: [...deferred] };
+  const { deferred: heldFor } = launchUserDispatch(room, userTurn, {
+    agents, deferred, listeners, scope, relayPolicy,
+  });
+  return { target: effectiveTarget, explicit: plan.explicit, deferred: heldFor };
 }
 
 // ---- guaranteed lurk catch-up ----
@@ -4629,7 +5419,10 @@ function maybeRunCatchUp(room, agent) {
       }
       broadcast(room, { type: "room", room: roomSummary(room) });
       scheduleCatchUps(room);
-    });
+    })
+    // The .catch above only guards the turn; this block does its own state
+    // writes, so it needs the same net as the other detached chains.
+    .catch((e) => noteChainFailure(room, "catch-up", e));
 }
 
 // ---- per-seat lanes ----
@@ -4668,6 +5461,8 @@ function queueSnapshot(room) {
       target: item.target || null,
       text: item.snippet || "",
       ts: item.ts || null,
+      // The one place lane order is not arrival order, so the card can say so.
+      head: !!item.head,
     };
   });
 }
@@ -4682,6 +5477,7 @@ function broadcastQueue(room) {
   broadcast(room, {
     type: "queue", size: queueSize(room),
     dispatches: queuedDispatchCount(room), items: queueSnapshot(room),
+    paused: !!room.queuePaused,
   });
 }
 
@@ -4700,8 +5496,33 @@ function seatOccupied(room, agent) {
   return room.busy.has(agent) || room.pending.some((p) => p.agents.includes(agent));
 }
 
+// The *scheduling* view of the same seat. A paused delivery keeps its place in
+// the user's arrival order — seatOccupied still reports it, which is what stops
+// a later message overtaking it — but it has stopped competing for the seat,
+// because the user asked for it to wait. Work that ranks below user deliveries
+// and would otherwise sit in a timed wait for a seat nobody is going to claim
+// asks this instead.
+function seatBlocked(room, agent) {
+  if (room.busy.has(agent)) return true;
+  if (room.queuePaused) return false;
+  return room.pending.some((p) => p.agents.includes(agent));
+}
+
 function enqueue(room, item) {
   room.pending.push({ seq: room.pendingSeq++, ...item });
+  broadcastQueue(room);
+}
+
+// Head-of-lane. `priority` is deliberately not a free parameter: the ONLY caller
+// allowed to reach this is the stop-and-ask variant of handleAsk, which has
+// already stopped the run the user was looking at. Retry is always tail and an
+// idle-seat ask is immediate anyway, so queue reasoning stays honest.
+// Two redirects in a row keep their own arrival order: insert after the last
+// item already marked head, never in front of it.
+function enqueueAhead(room, item) {
+  let at = 0;
+  while (at < room.pending.length && room.pending[at].head) at++;
+  room.pending.splice(at, 0, { seq: room.pendingSeq++, head: true, ...item });
   broadcastQueue(room);
 }
 
@@ -4709,23 +5530,32 @@ function enqueue(room, item) {
 // The entry is never appended twice; only its delivery is split. Resolves with
 // the reply entry, or null if the turn failed, was stopped or was abandoned —
 // so the single hop/lurk chain that awaits it always runs exactly once.
-function deferDelivery(room, agent, userTurn, scope, dispatch = {}) {
+function deferDelivery(room, agent, userTurn, scope, dispatch = {}, opts = {}) {
   let settle;
   const done = new Promise((resolve) => { settle = resolve; });
-  enqueue(room, {
+  const item = {
     kind: "delivery", agents: [agent], gen: room.generation,
     stopAt: dispatch.chain ? dispatch.chain.stopAt : room.stopEpoch,
     chain: dispatch.chain || null,
     queueGroupId: dispatch.queueGroupId || null,
     sourceN: userTurn.n, target: userTurn.target || null,
     snippet: entrySnippet(userTurn), ts: userTurn.ts || null,
+    // A stop-and-ask redirect is the user's most immediate intent, so it is the
+    // one dispatch a hold does not apply to — they just asked for it, now.
+    ...(opts.head ? { bypassPause: true } : {}),
     run() {
       // The badge means "the other seat answered this before me", so it belongs
       // to a split @both. A single-seat message simply waiting its turn in its
       // own lane is the ordinary case and needs no marking.
       const deferred = userTurn.target === "both";
       if (dispatch.chain) dispatch.chain.delivered++;
+      // A re-delivery clears its withheld marker here rather than at enqueue.
+      // Cleared early, the receipt dot would immediately fall through to the
+      // seat's cursor — long past this entry — and claim the seat has seen a
+      // message that is still sitting in the queue.
+      if (opts.onStart) opts.onStart(agent);
       runAgentTurn(room, agent, userTurn, scope, {
+        ...(opts.turnOptions || {}),
         deferred, queueGroupId: dispatch.queueGroupId || null, chain: dispatch.chain || null,
       }).then(settle, () => settle(null));
     },
@@ -4734,7 +5564,8 @@ function deferDelivery(room, agent, userTurn, scope, dispatch = {}) {
     // check, so cancelling a queued message could still make the *other* agent
     // chime in about it. The count is what lets the chain tell the difference.
     abandon() { if (dispatch.chain) dispatch.chain.cancelled++; settle(null); },
-  });
+  };
+  if (opts.head) enqueueAhead(room, item); else enqueue(room, item);
   // Normally the seat's own release drains this. If it is somehow already free,
   // drain anyway — a delivery nobody ever wakes would hang the chain.
   if (!room.busy.has(agent)) setImmediate(() => drainLanes(room));
@@ -4749,9 +5580,26 @@ function drainLanes(room) {
     scheduleCatchUps(room);
     return;
   }
+  // Pause is a hold, not a stop: checked before the claim loop, so nothing is
+  // started, dropped, reordered or abandoned while held. The queue the user sees
+  // is byte-for-byte the queue that was there when they pressed ⏸. The two
+  // things that can make a pending item stale — a generation bump (/new) and a
+  // stop-epoch bump (Stop everything) — both empty `pending` themselves, so
+  // skipping the drop pass here cannot leak a stale item.
+  // A stop-and-ask redirect is the single exception: the user just asked for
+  // that one, now. It is let through without releasing anything behind it.
+  const held = !!room.queuePaused;
+  if (held && !room.pending.some((p) => p.bypassPause)) return;
   const claimed = new Set([...room.busy.keys()]);
   const still = [], go = [], drop = [];
   for (const item of room.pending) {
+    // While held, everything except that one redirect keeps its exact place —
+    // including its claim on the seat, so nothing behind it can overtake it.
+    if (held && !item.bypassPause) {
+      item.agents.forEach((a) => claimed.add(a));
+      still.push(item);
+      continue;
+    }
     // A delivery belongs to one user turn in one generation; once that turn is
     // gone (reset, stop) there is nothing left to deliver.
     if (item.gen !== room.generation || chainStopped(room, item.stopAt)) {
@@ -4777,6 +5625,7 @@ function drainLanes(room) {
 }
 
 function releaseSeat(room, agent, run = null) {
+  endStream(room, agent);
   room.busy.delete(agent);
   if (run) endRun(room, agent, run); else room.runs.delete(agent);
   broadcast(room, { type: "status", agent, phase: "done", ...(run ? { runId: run.runId } : {}) });
@@ -4852,7 +5701,7 @@ function recordWithdrawals(room, dropped, cause = null) {
     kind: "system", author: "system",
     text: asleepSeat
       ? `⏹ ${asleepSeat} was put to sleep with work still queued — ${detail}.`
-      : `⏹ Cancelled before delivery — ${detail}.`,
+      : `⏹ Discarded before delivery — ${detail}.`,
     meta: { cancelledQueue: true, withdrawals, ...(asleepSeat ? { asleepSeat } : {}) },
   });
   // Receipt dots derive from the room summary. The queue event was emitted
@@ -4875,6 +5724,29 @@ function clearWithdrawals(room, n, seats) {
   // Retry changes the meaning of the receipt dot before the response finishes;
   // do not leave the browser showing a stale withheld state until releaseSeat.
   broadcast(room, { type: "room", room: roomSummary(room) });
+}
+
+// The one low-level re-dispatch primitive. It reuses the original bubble, joins
+// the tail of the seat's own lane, and clears the withheld markers for the seats
+// that never received it. `priority` is deliberately not a free parameter:
+// head-of-lane has exactly one producer in the system, and it is not this one.
+function dispatchFromSource(room, { sourceN, seats, instruction = null, priority = "tail", clearWithdrawal = true }) {
+  if (priority !== "tail") {
+    throw Object.assign(new Error(`unsupported dispatch priority: ${priority}`), { status: 400 });
+  }
+  if (instruction) {
+    throw Object.assign(new Error("instruction dispatch is not implemented yet"), { status: 400 });
+  }
+  const root = room.entries.find((e) => e.n === Number(sourceN) && e.kind === "user");
+  if (!root) throw Object.assign(new Error("that message isn't in this conversation any more"), { status: 400 });
+  // The boundary the original ran under, latched exactly as Retry does, so a
+  // Work→Talk flip since the discard cannot widen this delivery.
+  const scope = makeScope(room, root.n, root.target, rootDiscussion(room, root.n));
+  startRecoveredDelivery(room, root, seats, scope, null, {
+    viaQueue: true,
+    ...(clearWithdrawal ? { onStart: (agent) => clearWithdrawals(room, root.n, [agent]) } : {}),
+  });
+  return { n: root.n, agents: [...seats] };
 }
 
 // ---- sleep and wake ----
@@ -5050,6 +5922,38 @@ function asleepRefusal(room, agents, detail) {
     { status: 409 });
 }
 
+// Retry any message that was discarded before delivery. Eligibility comes from
+// `cancelledDeliveries`, not from `lastUser.done`: the durable record is per
+// message and per seat, it survives newer traffic replacing `lastUser`, and it
+// is what prevents re-delivering to a seat that already received this.
+function handleRetryDiscarded(room, sourceN, requested = null) {
+  const n = Number(sourceN);
+  if (!Number.isSafeInteger(n) || n <= 0) throw Object.assign(new Error("n must be a turn number"), { status: 400 });
+  const seats = seatIds(room);
+  const withheld = (room.state.cancelledDeliveries || {})[String(n)] || [];
+  let wanted = withheld.filter((a) => seats.includes(a));
+  if (Array.isArray(requested) && requested.length) {
+    const asked = requested.map((a) => String(a).toLowerCase());
+    for (const a of asked) {
+      if (!seats.includes(a)) throw Object.assign(new Error(`unknown agent: ${a}`), { status: 400 });
+    }
+    wanted = wanted.filter((a) => asked.includes(a));
+  }
+  if (!wanted.length) throw Object.assign(new Error("nothing was discarded for that message"), { status: 400 });
+  // Already waiting is not an error worth reporting, but it must not produce a
+  // second delivery of the same message to the same seat.
+  const already = wanted.filter((a) => room.pending.some((p) => p.sourceN === n && p.agents.includes(a)));
+  const dozing = wanted.filter((a) => isAsleep(room, a));
+  const targets = wanted.filter((a) => !already.includes(a) && !dozing.includes(a));
+  if (!targets.length) {
+    if (already.length) {
+      throw Object.assign(new Error(`that message is already queued for ${already.join(" and ")}`), { status: 409 });
+    }
+    throw asleepRefusal(room, dozing, (them) => `wake ${them} to retry that delivery.`);
+  }
+  return dispatchFromSource(room, { sourceN: n, seats: targets });
+}
+
 function handleRetry(room) {
   const lu = room.state.lastUser;
   if (!lu) throw Object.assign(new Error("nothing to retry"), { status: 400 });
@@ -5089,7 +5993,8 @@ function handleRetry(room) {
     // can still be carrying "this was withheld from you" for that message.
     clearWithdrawals(room, lu.n, seatIds(room));
     const gen = room.generation;
-    runPairCycle(room, userTurn, pair, gen, newChain(room));
+    runPairCycle(room, userTurn, pair, gen, newChain(room))
+      .catch((e) => noteChainFailure(room, "pair cycle", e));
     return;
   }
   const targets = retryTargets(room);
@@ -5105,6 +6010,140 @@ function handleRetry(room) {
   const scope = makeScope(room, lu.n, lu.target, lu.discussion);
   clearWithdrawals(room, lu.n, targets); // it is being delivered after all
   startRecoveredDelivery(room, userTurn, targets, scope);
+}
+
+// Ask again / Redirect. One primitive, three user-facing modes, and one
+// atomicity guarantee: stopping the visible run and asking again is a single
+// server request pinned to the runId the browser was showing — never a
+// client-side Stop followed by a Send, which leaves a window where the old run
+// finishes and the queue starts the next one before the ask arrives.
+//
+// Why the stop variant is atomic, since it is the crux of the feature:
+//   - Everything from the stop onward is one synchronous block inside one HTTP
+//     handler. Node does not yield inside it, so no drainLanes, no releaseSeat
+//     and no arriving message can interleave.
+//   - handleStop's `active` branch marks the run and killTrees synchronously;
+//     the stopped run's own ⏹ entry and releaseSeat can only run on a later
+//     tick. The seat is therefore still in room.busy when the redirect is
+//     placed, so seatOccupied is true and the redirect goes into the lane
+//     rather than launching. The stopped run's late output is ordered before
+//     the redirect by construction, not by timing.
+//   - run.chain.halted fences the stopped exchange's downstream, so no hop,
+//     sibling attention or lurk chime from it can land after the redirect.
+//   - room.stopEpoch is deliberately NOT bumped. drainLanes abandons every
+//     pending item whose stopAt no longer matches, so a bump would flush the
+//     whole queue and record withdrawals for it — the opposite of "existing
+//     queued work stays behind the redirect" — and would halt every unrelated
+//     chain in the room, including a concurrent exchange the user did not aim at.
+//   - A stale pin degrades, never escalates: handleStop returns
+//     { stale: true } having touched nothing, and the ask proceeds.
+function handleAsk(room, opts = {}) {
+  // ---- 1. validate everything before mutating anything ----
+  // Same discipline as wakeAndDeliver: a refusal must leave the run the user was
+  // looking at provably still running.
+  const mode = String(opts.mode || "now");
+  if (!ASK_MODES.has(mode)) throw Object.assign(new Error(`unknown ask mode: ${mode}`), { status: 400 });
+  const sourceN = Number(opts.sourceN);
+  const source = Number.isSafeInteger(sourceN)
+    ? room.entries.find((e) => e.n === sourceN) : null;
+  if (!source || (source.kind !== "user" && source.kind !== "agent")) {
+    throw Object.assign(new Error("that message can't be asked about"), { status: 400 });
+  }
+  const raw = String(opts.text || "").trim();
+  if (raw.length > MAX_MESSAGE_TEXT) {
+    throw Object.assign(new Error(`message text must be ${MAX_MESSAGE_TEXT.toLocaleString()} characters or shorter`), { status: 413 });
+  }
+  // Slash commands are composer-only. Letting one through here would route a
+  // redirect into parsePair and arm or end pair mode from a message button.
+  if (raw.startsWith("/")) {
+    throw Object.assign(new Error("slash commands go in the composer, not an ask"), { status: 400 });
+  }
+  const text = raw || ASK_AGAIN_TEXT;
+  const prepared = prepareAttachments(opts.images, opts.files);
+  // Routing comes from the button, never from the text. An @tag typed into an
+  // instruction about a quoted message must not re-route away from the seat the
+  // user pointed at, so resolveTarget/planMessage are deliberately not called.
+  const explicit = opts.target !== undefined && opts.target !== null && opts.target !== "";
+  const target = explicit ? String(opts.target).toLowerCase()
+    : source.kind === "agent" ? source.author
+      : (source.target === "both" ? "both" : source.target);
+  if (target !== "both" && !room.cfg.agents[target]) {
+    throw Object.assign(new Error(`unknown target: ${target}`), { status: 400 });
+  }
+  const hasHopOverride = Object.prototype.hasOwnProperty.call(opts, "hopBudget");
+  const solo = opts.solo === true;
+  if (solo && target === "both") {
+    throw Object.assign(new Error("Solo needs one ordinary addressee; it cannot be used with @both or a pair turn"), { status: 400 });
+  }
+  const relayPolicy = {
+    hopBudget: solo ? 0 : (hasHopOverride ? requireMessageHopBudget(opts.hopBudget) : normalizeHopBudget(room.cfg.hopBudget, -1)),
+    source: solo ? "solo" : (hasHopOverride ? "message" : "room"),
+    solo,
+  };
+  const allSeats = seatIds(room);
+  const requested = target === "both" ? [...allSeats] : [target];
+  const sleeping = requested.filter((a) => isAsleep(room, a));
+  const agents = requested.filter((a) => !sleeping.includes(a));
+  // Stopping a run and then holding the ask for a sleeping seat would leave the
+  // user with a killed response and nothing asked. Refuse before the stop.
+  if (mode === "stop" && !agents.length) {
+    throw asleepRefusal(room, sleeping, (them) => `wake ${them} before redirecting to ${them}.`);
+  }
+  const pins = Array.isArray(opts.runs) ? opts.runs : null;
+  if (mode === "stop" && !(pins && pins.length)) {
+    // An unpinned stop would kill whatever happens to be running when the
+    // request lands, which may be a response the user never saw.
+    throw Object.assign(new Error("stop-and-ask must name the responses it meant"), { status: 400 });
+  }
+
+  // ---- 2. the atomic half: stop, then append, then place, in ONE tick ----
+  const stop = mode === "stop" ? handleStop(room, { scope: "active", runs: pins }) : null;
+
+  const listeners = solo || !agents.length ? []
+    : allSeats.filter((a) => !agents.includes(a) && !sleeping.includes(a) && room.cfg.agents[a].lurk);
+  const attachments = persistAttachments(room, prepared);
+  let userTurn;
+  try {
+    userTurn = appendEntry(room, {
+      kind: "user", author: "user", target, text,
+      meta: {
+        audience: { addressed: agents, lurking: listeners, ...(sleeping.length ? { asleep: sleeping } : {}) },
+        relay: relayPolicy,
+        ...(attachments.length ? { attachments } : {}),
+        // The only thing distinguishing this bubble from something the user
+        // typed, and the join key the quote header renders from.
+        askFrom: {
+          sourceN: source.n,
+          kind: raw ? "redirect" : "ask-again",
+          ...(mode === "stop" ? { redirect: true } : {}),
+          ...(stop && stop.stopped ? { stoppedCount: stop.count } : {}),
+        },
+      },
+    });
+  } catch (e) { removeAttachments(room, attachments); throw e; }
+  // Only when the user picked a seat in the dialog. A target derived from the
+  // source message is not a fresh act of addressing someone, and rewriting
+  // lastAddressed would re-route their next untagged composer message.
+  if (explicit) room.state.lastAddressed = target;
+  room.state.lastUser = {
+    n: userTurn.n, text, target, done: {}, pair: false, discussion: false,
+    ...(attachments.length ? { attachments } : {}),
+  };
+  saveState(room);
+  for (const a of sleeping) noteSleepSkip(room, a, "turn", { sourceN: userTurn.n, held: true });
+  if (!agents.length) {
+    broadcast(room, { type: "room", room: roomSummary(room) });
+    return { n: userTurn.n, target, explicit, mode, held: sleeping, deferred: [], stop };
+  }
+  const scope = makeScope(room, userTurn.n, target, false);
+  const deferred = new Set(agents.filter((a) => seatOccupied(room, a)));
+  // Head-of-lane only for the stop variant. "now" on a seat that turned busy
+  // between the click and this request goes to the tail like any other message:
+  // the user chose it because the seat looked idle, not to jump the queue.
+  const { deferred: heldFor } = launchUserDispatch(room, userTurn, {
+    agents, deferred, listeners, scope, relayPolicy, head: mode === "stop",
+  });
+  return { n: userTurn.n, target, explicit, mode, held: sleeping, deferred: heldFor, stop };
 }
 
 // Stop is four different intentions, not one button with a guess attached:
@@ -5458,17 +6497,22 @@ function handleNewConversation(room) {
   // conversation, so archiving does not quietly make a rate-limited seat
   // invocable again. Everything else — cursors, sessions, pair — starts fresh.
   const stillAsleep = Object.fromEntries(seatIds(room).map((a) => [a, sleepState(room, a)]));
-  room.state = defaultState(seatIds(room));
+  room.state = defaultState(room.cfg.agents);
   for (const a of seatIds(room)) room.state.agents[a].asleep = stillAsleep[a];
   room.state.roomNoteValue = normalizeRoomNote(room.cfg.roomNote);
   room.state.roomNoteRevision = room.state.roomNoteValue === null ? 0 : 1;
-  if (room.state.agents.claude) {
-    room.state.agents.claude.permissionScope = effectiveClaudePermissionMode(
-      room.cfg.agents.claude, room.cfg.mode);
+  // The fresh state starts with no session, so the provenance it records must
+  // be the one the next session will be created under.
+  for (const a of seatIds(room)) {
+    const scope = capsOf(room, a).sessionScope;
+    if (scope) room.state.agents[a][scope.field] = scope.of(room.cfg.agents[a], room.cfg.mode);
   }
   room.entries = [];
   room.receipts = [];
   room.hopRuns.clear();
+  // A fresh conversation starts unheld; the queue this pause was holding is
+  // being archived with everything else.
+  room.queuePaused = false;
   // No withdrawal record here, unlike Stop-everything: the entry a held
   // delivery would have delivered is being archived along with the rest of the
   // conversation, and the fresh state has nothing to be truthful about.
@@ -5502,7 +6546,7 @@ function authorized(req, url, route) {
     : req.headers["x-parley-runtime-protocol"];
   if (protocol !== RUNTIME_PROTOCOL) return false;
   const given = req.headers["x-parley-token"] || queryToken || "";
-  if (given !== SESSION_TOKEN) return false;
+  if (!sameSecret(given, SESSION_TOKEN)) return false;
   const origin = req.headers.origin;
   if (origin) {
     const actualPort = server.address() && server.address().port;
@@ -5558,11 +6602,30 @@ function listRooms() {
   return names.sort((a, b) => (a === "default" ? -1 : b === "default" ? 1 : a.localeCompare(b)));
 }
 
+// The room picker needs three fields, all of which live in room.json. Calling
+// loadRoom for them read every room's entire events.jsonl into memory,
+// synchronously, and pinned it there for the life of the process — so merely
+// opening the UI blocked the event loop parsing history nobody asked for. Read
+// the config, and let an already-open room answer from memory.
 function roomsWithModes() {
   return listRooms().map((n) => {
     try {
-      const r = loadRoom(n);
-      return { name: n, mode: r.cfg.mode || "talk", linked: !!r.cfg.projectDir, seats: seatIds(r) };
+      const open = rooms.get(n);
+      const cfg = open ? open.cfg : readJSON(path.join(ROOT, n, "room.json"));
+      // Resolvability, not "the key is a provider name": a seat named `opus`
+      // running Claude is a real seat, and filtering on the key dropped it and
+      // fell back to the default pair — so the sidebar showed the wrong two
+      // avatars for every room whose seats had been named.
+      const seats = Object.keys(cfg.agents || {}).filter((k) => providerIdFor(cfg.agents[k], k));
+      return {
+        name: n,
+        mode: cfg.mode || "talk",
+        linked: !!cfg.projectDir,
+        seats: seats.length ? seats : [...DEFAULT_SEATS],
+        // The sidebar draws a seat avatar per room, and it has no summary to
+        // resolve a renamed seat against.
+        providers: Object.fromEntries(seats.map((k) => [k, providerIdFor(cfg.agents[k], k)])),
+      };
     } catch { return { name: n, mode: "talk", linked: false, seats: [...DEFAULT_SEATS] }; }
   });
 }
@@ -5615,9 +6678,25 @@ const server = http.createServer(async (req, res) => {
       }
       let picked;
       if (Array.isArray(seats)) {
-        picked = seats.map((s) => String(s).toLowerCase()).filter((s) => PROVIDERS[s]);
-        if (picked.length !== 2 || picked[0] === picked[1]) {
-          return json(res, 400, { error: "Pick two different seats from the available providers." });
+        // A seat is either a bare provider name (its id is that name, which is
+        // every room ever created before ids and providers were separate) or
+        // { id, provider } — which is what makes two seats of one provider
+        // possible, since only the ids have to differ.
+        picked = [];
+        for (const raw of seats) {
+          const spec = typeof raw === "string"
+            ? { id: String(raw).toLowerCase(), provider: String(raw).toLowerCase() }
+            : { id: String((raw && raw.id) || "").toLowerCase(), provider: String((raw && raw.provider) || (raw && raw.id) || "").toLowerCase() };
+          if (!PROVIDERS[spec.provider]) {
+            return json(res, 400, { error: `Unknown provider: ${spec.provider || "(none)"}` });
+          }
+          if (!validSeatId(spec.id)) {
+            return json(res, 400, { error: `Seat names: lowercase letters, numbers, dashes (max 20), and not ${[...RESERVED_SEAT_IDS].join(", ")}.` });
+          }
+          picked.push(spec);
+        }
+        if (picked.length !== 2 || picked[0].id === picked[1].id) {
+          return json(res, 400, { error: "Pick two seats with different names." });
         }
       }
       const created = loadRoom(roomName, picked, true);
@@ -5661,6 +6740,32 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, snapshot);
     }
 
+    // The summary alone, without the transcript. Refreshing the git branch on
+    // every window focus went through GET /api/room, which serialises the whole
+    // of a room's history to deliver one label — megabytes of work per alt-tab
+    // in a long-lived room.
+    // What a first run actually needs to know, per seat, before anything is
+    // spent: is the CLI there, is it signed in, and if not, what to do about it.
+    if (route === "GET /api/doctor") {
+      const room = loadRoom(url.searchParams.get("room") || "default", undefined, true);
+      return json(res, 200, {
+        node: process.version,
+        parley: packageVersion(),
+        seats: Object.fromEntries(seatIds(room).map((a) => [a, {
+          provider: providerIdOf(room, a),
+          label: providerOf(room, a).label,
+          command: room.cfg.agents[a].command,
+          ...seatHealth(room, a),
+        }])),
+      });
+    }
+
+    if (route === "GET /api/room/summary") {
+      const wanted = url.searchParams.get("name") || "default";
+      const room = loadRoom(wanted, undefined, wanted === "default");
+      return json(res, 200, { room: roomSummary(room) });
+    }
+
     if (route === "GET /api/attachment") {
       const room = loadRoom(url.searchParams.get("room") || "default");
       const id = String(url.searchParams.get("id") || "");
@@ -5682,7 +6787,15 @@ const server = http.createServer(async (req, res) => {
       };
       if (fileAttachment(ref)) headers["Content-Disposition"] = attachmentDisposition(ref.name);
       res.writeHead(200, headers);
-      return fs.createReadStream(file).pipe(res);
+      // pipe() does not forward read errors, and an unhandled stream 'error' is
+      // fatal to the process. The existsSync above cannot cover the file going
+      // away between the check and the open, nor a mid-stream read failure
+      // (antivirus locking a freshly written attachment is the common one). The
+      // headers are already sent, so all that is left is to end the response.
+      const body = fs.createReadStream(file);
+      body.on("error", () => { res.destroy(); });
+      res.on("close", () => body.destroy());
+      return body.pipe(res);
     }
 
     if (route === "GET /api/events") {
@@ -5694,6 +6807,7 @@ const server = http.createServer(async (req, res) => {
       });
       res.write(":connected\n\n");
       room.clients.add(res);
+      markStreamsForKeyframe(room);
       scheduleCatchUps(room);
       const ping = setInterval(() => { try { res.write(":ping\n\n"); } catch { /* closed */ } }, 20000);
       req.on("close", () => { clearInterval(ping); room.clients.delete(res); });
@@ -5737,6 +6851,26 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true });
     }
 
+    if (route === "POST /api/ask") {
+      // Attachments are accepted here as they are on /api/message, so the same
+      // body cap applies.
+      const body = await readBody(req, MAX_MESSAGE_BODY_BYTES);
+      const room = loadRoom(body.room || "default");
+      if (Object.prototype.hasOwnProperty.call(body, "solo") && typeof body.solo !== "boolean") {
+        return json(res, 400, { error: "solo must be true or false" });
+      }
+      // One request, not two. A client-side Stop followed by a Send leaves a
+      // window where the old run finishes and the queue starts the next one.
+      const outcome = handleAsk(room, {
+        sourceN: body.sourceN, text: body.text, target: body.target,
+        mode: body.mode, runs: Array.isArray(body.runs) ? body.runs : null,
+        images: body.images, files: body.files,
+        ...(Object.prototype.hasOwnProperty.call(body, "hopBudget") ? { hopBudget: body.hopBudget } : {}),
+        ...(Object.prototype.hasOwnProperty.call(body, "solo") ? { solo: body.solo } : {}),
+      });
+      return json(res, 200, { ok: true, ...outcome });
+    }
+
     if (route === "POST /api/stop") {
       const body = await readBody(req);
       const room = loadRoom(body.room || "default");
@@ -5778,7 +6912,40 @@ const server = http.createServer(async (req, res) => {
       // Cancelling a group that already drained is not a failure — the user
       // asked for it to be gone and it is gone.
       const cancelled = cancelQueued(room, body.groupId ? String(body.groupId) : null);
-      return json(res, 200, { ok: true, cancelled, queued: queueSize(room) });
+      return json(res, 200, { ok: true, cancelled, queued: queueSize(room), paused: !!room.queuePaused });
+    }
+
+    if (route === "POST /api/queue/pause") {
+      const body = await readBody(req);
+      const room = loadRoom(body.room || "default");
+      if (typeof body.paused !== "boolean") {
+        return json(res, 400, { error: "paused must be true or false" });
+      }
+      // Idempotent, like /api/seat/sleep: a second click, or a second tab,
+      // reports the state the user asked for rather than an error they would
+      // answer by clicking again.
+      const changed = room.queuePaused !== body.paused;
+      room.queuePaused = body.paused;
+      broadcastQueue(room);
+      broadcast(room, { type: "room", room: roomSummary(room) });
+      // Releasing the hold starts everything whose seat is already free.
+      if (changed && !body.paused) drainLanes(room);
+      return json(res, 200, {
+        ok: true, paused: room.queuePaused, changed,
+        queued: queueSize(room), dispatches: queuedDispatchCount(room),
+      });
+    }
+
+    if (route === "POST /api/queue/retry") {
+      const body = await readBody(req);
+      const room = loadRoom(body.room || "default");
+      // The deliveries themselves arrive over SSE, like every other dispatch.
+      const result = handleRetryDiscarded(room, body.n,
+        Array.isArray(body.agents) ? body.agents : null);
+      return json(res, 200, {
+        ok: true, ...result, queued: queueSize(room),
+        dispatches: queuedDispatchCount(room), paused: !!room.queuePaused,
+      });
     }
 
     if (route === "POST /api/new") {
@@ -5794,12 +6961,18 @@ const server = http.createServer(async (req, res) => {
       const prevProjectDir = room.cfg.projectDir || null;
       const prevRoomNote = normalizeRoomNote(room.cfg.roomNote);
       const prevLurk = Object.fromEntries(seatIds(room).map((id) => [id, !!room.cfg.agents[id].lurk]));
-      const prevClaudePermission = room.cfg.agents.claude
-        ? effectiveClaudePermissionMode(room.cfg.agents.claude, prevMode)
-        : null;
-      // Sandboxed seats (codex-style) fix their sandbox at session creation —
-      // track it per seat so a change can trigger a clean relink.
-      const sandboxSeats = seatIds(room).filter((id) => "sandbox" in providerOf(id).defaults);
+      // The permission provenance each seat's session was created under, for
+      // every provider whose sessions carry one — a change means that seat has
+      // to start a fresh session rather than reattach under new rules.
+      const scopeSeats = seatIds(room).filter((id) => capsOf(room, id).sessionScope);
+      const prevScopes = Object.fromEntries(scopeSeats.map((id) =>
+        [id, capsOf(room, id).sessionScope.of(room.cfg.agents[id], prevMode)]));
+      // Fields a provider bakes into a session at creation. Changing one has to
+      // start a fresh session, so track the previous values per seat.
+      const sandboxSeats = seatIds(room).filter((id) => (capsOf(room, id).sessionFixedFields || []).includes("sandbox"));
+      // Whether a Talk/Work flip alone invalidates a seat's session is the
+      // provider's call, not something to infer from having a sandbox.
+      const modeSensitiveSeats = seatIds(room).filter((id) => capsOf(room, id).resetOnRoomModeChange);
       const prevSandboxes = Object.fromEntries(sandboxSeats.map((id) => [id, room.cfg.agents[id].sandbox || "read-only"]));
       // Validate into a candidate first — a rejected patch must leave the
       // live room untouched.
@@ -5822,22 +6995,24 @@ const server = http.createServer(async (req, res) => {
       delete next.maxHops;
       next.pairRounds = Math.min(99, Math.max(0, Number(next.pairRounds) || 0));
       for (const [id, agentCfg] of Object.entries(next.agents)) {
-        const issue = extraArgsViolation(id, agentCfg.extraArgs || []);
+        const pid = providerIdFor(agentCfg, id);
+        const caps = pid ? (PROVIDERS[pid].capabilities || {}) : {};
+        const issue = extraArgsViolation(room, id, agentCfg.extraArgs || []);
         if (issue) return json(res, 400, { error: `Unsafe Extra CLI args for ${id}: ${issue}` });
-        if (id === "claude") {
-          const permissionMode = agentCfg.permissionMode ?? "auto";
-          if (!CLAUDE_PERMISSION_MODES.has(permissionMode)) {
-            return json(res, 400, {
-              error: `Unknown Claude permission mode: ${permissionMode}. Choose room default, plan, acceptEdits, or full access.`,
-            });
-          }
-          agentCfg.permissionMode = permissionMode;
+        // Which fields are enumerated, and what a bad value says, belongs to
+        // the provider — the API refuses it outright, while a hand-edited
+        // room.json falls back on load.
+        for (const [field, rule] of Object.entries(caps.enums || {})) {
+          const value = agentCfg[field] ?? rule.fallback;
+          if (!rule.values().has(value)) return json(res, 400, { error: rule.error(value) });
+          agentCfg[field] = value;
         }
       }
-      const nextClaudePermission = next.agents.claude
-        ? effectiveClaudePermissionMode(next.agents.claude, next.mode)
-        : null;
-      const claudePermissionChanged = prevClaudePermission !== nextClaudePermission;
+      const nextScopes = Object.fromEntries(scopeSeats
+        .filter((id) => next.agents[id])
+        .map((id) => [id, capsOf(room, id).sessionScope.of(next.agents[id], next.mode)]));
+      const scopeChangedSeats = scopeSeats.filter((id) => prevScopes[id] !== nextScopes[id]);
+      const claudePermissionChanged = scopeChangedSeats.length > 0;
       if (next.projectDir) {
         const pd = path.resolve(String(next.projectDir).trim());
         let isDir = false;
@@ -5853,8 +7028,8 @@ const server = http.createServer(async (req, res) => {
       // session. The same rule covers gaps inside an active pair cycle.
       const modeResetSeats = new Set();
       if (prevMode !== next.mode) {
-        for (const id of sandboxSeats) modeResetSeats.add(id);
-        if (claudePermissionChanged) modeResetSeats.add("claude");
+        for (const id of modeSensitiveSeats) modeResetSeats.add(id);
+        for (const id of scopeChangedSeats) modeResetSeats.add(id);
       }
       const sandboxChangedSeats = new Set(sandboxSeats.filter((id) =>
         prevSandboxes[id] !== (next.agents[id].sandbox || "read-only")));
@@ -5864,7 +7039,7 @@ const server = http.createServer(async (req, res) => {
       }
       for (const id of modeResetSeats) resetRequiredSeats.add(id);
       for (const id of sandboxChangedSeats) resetRequiredSeats.add(id);
-      if (claudePermissionChanged) resetRequiredSeats.add("claude");
+      for (const id of scopeChangedSeats) resetRequiredSeats.add(id);
 
       // Applying immediately is safe for permissions and sandboxes. The running
       // process keeps the flags it launched with (nothing can change those once
@@ -5923,10 +7098,10 @@ const server = http.createServer(async (req, res) => {
         // are bumped — an unaffected agent keeps its session.
         room.cfgEpoch[id] = seatEpoch(room, id) + 1;
       }
-      if (room.state.agents.claude) {
-        room.state.agents.claude.permissionScope = nextClaudePermission;
+      for (const id of scopeSeats) {
+        if (room.state.agents[id]) room.state.agents[id][capsOf(room, id).sessionScope.field] = nextScopes[id];
       }
-      if (resetRequiredSeats.size || room.state.agents.claude || roomNoteChanged) saveState(room);
+      if (resetRequiredSeats.size || scopeSeats.length || roomNoteChanged) saveState(room);
       // A room-sourced mode follows Settings for its next cycle. An in-flight
       // cycle keeps the snapshot exposed as `workingPair`; explicit
       // `/pair start 2 ...` overrides remain pinned to their command value.
@@ -5981,18 +7156,20 @@ const server = http.createServer(async (req, res) => {
           }
         }
       }
-      if (claudePermissionChanged) {
+      for (const id of scopeChangedSeats) {
+        const was = prevScopes[id], now = nextScopes[id];
+        // Which value counts as host-level trust is the provider's to name.
+        const full = capsOf(room, id).fullAccessScope || "bypassPermissions";
         // Mode flips already carry a general permission note. Full-access
         // transitions always get their own durable audit line as well.
-        if (prevMode === room.cfg.mode ||
-            prevClaudePermission === "bypassPermissions" || nextClaudePermission === "bypassPermissions") {
-          const text = nextClaudePermission === "bypassPermissions"
-            ? "⚠ Claude Full access enabled — ordinary Claude turns bypass ordinary permission prompts and checks. Claude starts a fresh session; Parley requests isolated Plan invocations for protected discussion, review and listener turns."
-            : prevClaudePermission === "bypassPermissions"
-              ? `🔒 Claude Full access disabled — Claude starts a fresh session in ${nextClaudePermission} mode.`
-              : `Claude permission mode changed to ${nextClaudePermission} — Claude starts a fresh session so it applies cleanly.`;
-          appendEntry(room, { kind: "system", author: "system", text });
-        }
+        if (prevMode !== room.cfg.mode && was !== full && now !== full) continue;
+        const label = titleCase(id);
+        const text = now === full
+          ? `⚠ ${label} Full access enabled — ordinary ${id} turns bypass ordinary permission prompts and checks. ${label} starts a fresh session; Parley requests isolated read-only invocations for protected discussion, review and listener turns.`
+          : was === full
+            ? `🔒 ${label} Full access disabled — ${label} starts a fresh session in ${now} mode.`
+            : `${label} permission mode changed to ${now} — ${label} starts a fresh session so it applies cleanly.`;
+        appendEntry(room, { kind: "system", author: "system", text });
       }
       // Settings show the new permission the moment it is saved, while the live
       // process is still running under the old one. Saying so is not a nicety:
@@ -6081,12 +7258,35 @@ function openBrowser(u) {
   launched.catch(() => { /* user can open manually */ });
 }
 
+function killAllChildren() {
+  for (const room of rooms.values()) {
+    for (const [, child] of room.procs) { try { killTree(child); } catch { /* best effort */ } }
+  }
+}
+
 function shutdown() {
-  for (const room of rooms.values()) for (const [, child] of room.procs) killTree(child);
+  killAllChildren();
   process.exit(0);
 }
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
+// Cleanup used to run only for a polite Ctrl+C. Every other way out — a fatal
+// error, a closed console window — left the agent CLIs running unsupervised,
+// still spending the user's subscription quota and, in a work room, still
+// writing into the linked project with nobody able to stop them. killTree is
+// synchronous on both platforms, so it is safe from here.
+process.on("exit", killAllChildren);
+
+// Last line of defence. The detached exchange chains each carry their own
+// catch, so anything arriving here is genuinely unexpected — and the server is
+// far more useful alive (rooms reachable, transcripts intact, agents killable)
+// than dead. Node's default would take down every room over one bad stream.
+process.on("unhandledRejection", (reason) => {
+  console.error("parley: unhandled rejection —", (reason && reason.stack) || reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("parley: uncaught exception —", (err && err.stack) || err);
+});
 
 let port = PORT_WANTED;
 function listen(attempt = 0) {
@@ -6097,7 +7297,7 @@ function listen(attempt = 0) {
   server.listen(port, "127.0.0.1", () => {
     const u = `http://127.0.0.1:${server.address().port}`;
     loadRoom("default", undefined, true); // bootstrap: always somewhere to land
-    console.log(`\n  Parley is running\n\n  UI:     ${u}\n  Rooms:  ${ROOT}\n\n  Ctrl+C to quit.\n`);
+    console.log(`\n  Parley ${packageVersion()} is running\n\n  UI:     ${u}\n  Rooms:  ${ROOT}\n\n  Ctrl+C to quit.\n`);
     if (!NO_OPEN) openBrowser(u);
   });
 }

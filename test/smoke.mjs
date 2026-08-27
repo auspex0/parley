@@ -34,7 +34,7 @@ function ok(name, cond, detail) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 let TOKEN = ""; // read out of the served page, exactly as the browser does
-const RUNTIME_PROTOCOL = "9";
+const RUNTIME_PROTOCOL = "10";
 
 async function api(method, route, body) {
   const res = await fetch(base + route, method === "GET"
@@ -98,7 +98,18 @@ async function idle(name, ms = 30000) {
   const until = Date.now() + ms;
   for (;;) {
     const d = await room(name);
-    if (d.room.busy.length === 0 && !d.room.queued && !d.room.working) return d;
+    // A pending catch-up obligation is invisible to busy/queued/working during
+    // the tick between an exchange finishing and the scheduler launching it —
+    // `exchanges` only rises when maybeRunCatchUp actually starts, one
+    // setImmediate later. A poll landing in that window read the room as idle
+    // and every assertion after it saw a half-finished conversation, which is
+    // what produced the macOS-only CI failures on PR #5. An obligation parked
+    // behind a sleeping seat is genuinely not in flight, so it does not count.
+    const owed = (d.room.seats || []).some((a) => {
+      const seat = (d.room.agents || {})[a] || {};
+      return !!seat.catchUp && !seat.asleep;
+    });
+    if (d.room.busy.length === 0 && !d.room.queued && !d.room.working && !owed) return d;
     if (Date.now() > until) throw new Error("timed out waiting for " + name);
     await sleep(120);
   }
@@ -129,6 +140,7 @@ async function watchRoomSummaries(name) {
   });
   if (res.status !== 200) throw new Error(`could not watch ${name}: HTTP ${res.status}`);
   const seen = [];
+  const streamed = [];
   let readError = null;
   const done = (async () => {
     const reader = res.body.getReader();
@@ -149,12 +161,17 @@ async function watchRoomSummaries(name) {
         try {
           const event = JSON.parse(raw);
           if (event.type === "room") seen.push(event.room);
+          // Streaming is a progressive enhancement, so nothing else in the
+          // suite would notice if it broke entirely. Capture the raw events so
+          // one test can assert the increment/keyframe protocol directly.
+          else if (event.type === "stream") streamed.push(event);
         } catch { /* a malformed frame is not a room summary */ }
       }
     }
   })().catch((e) => { if (!controller.signal.aborted) readError = e; });
   return {
     seen,
+    streamed,
     async stop() {
       controller.abort();
       await done;
@@ -194,6 +211,14 @@ const server = spawn(process.execPath, [SERVER, "--no-open", "--port", "0", "--r
 let serverLog = "";
 server.stdout.on("data", (d) => { serverLog += d.toString(); });
 server.stderr.on("data", (d) => { serverLog += d.toString(); });
+// Interrupting the runner used to leak the server and its fake-CLI children,
+// which then sat holding a temp root nobody would clean up.
+for (const sig of ["SIGINT", "SIGTERM"]) {
+  process.once(sig, () => {
+    try { server.kill(); } catch { /* already gone */ }
+    process.exit(130);
+  });
+}
 
 base = await new Promise((resolve, reject) => {
   const t = setTimeout(() => reject(new Error("server never reported a URL:\n" + serverLog)), 15000);
@@ -766,6 +791,11 @@ async function checkFolderPickerUi() {
     const entry = state.entries.find((candidate) => candidate.n === n);
     return entry ? computeHeard(agent, entry) : null;
   },
+  statusChip(n) {
+    const entry = state.entries.find((candidate) => candidate.n === n);
+    return entry ? statusChipHTML(entry) : null;
+  },
+  hiddenEntry(entry) { return hiddenEntry(entry); },
   setWithdrawals(map) {
     state.summary.cancelledDeliveries = map;
     refreshHeard(0, Infinity);
@@ -780,6 +810,10 @@ async function checkFolderPickerUi() {
   queuePop() { renderQueuePop(); return $("queuePop").innerHTML; },
   queueBadgeText() { setQueue(state.summary.queued, state.summary.queue, state.summary.queuedDispatches); return $("queueBadge").textContent; },
   stopMenu() { updateBusyUI(); return $("stopMenu").innerHTML; },
+  stopClick() { updateBusyUI(); return $("stopBtn").onclick(); },
+  stopCaretClick() { updateBusyUI(); return $("stopMore").onclick(); },
+  get stopMenuOpen() { return $("stopWrap").classList.contains("open"); },
+  get stopMenuHTML() { return $("stopMenu").innerHTML; },
   entryQuote(entry) { return entryQuoteHTML(entry); },
   gitLine(git) {
     renderGitId(git);
@@ -879,9 +913,45 @@ async function checkFolderPickerUi() {
   const menu = probe.stopMenu();
   ok("the Stop menu names each scope and counts messages, not deliveries",
     /data-stop-scope="seat" /.test(menu) && /data-stop-scope="active"/.test(menu) &&
-    /Cancel 2 queued messages/.test(menu) && /data-stop-scope="all"/.test(menu), menu);
+    /Discard 2 queued messages/.test(menu) && /data-stop-scope="all"/.test(menu), menu);
+
   ok("a reply that directly follows its source still carries the quote",
     /data-jump-n="4"/.test(probe.entryQuote({ n: 5, kind: "agent", author: "claude", meta: { replyTo: 4 } })));
+
+  // Stop's primary click. Queued work is a question one click cannot answer, so
+  // this room — two queued dispatches — must still open the chooser and send
+  // nothing.
+  let stopBody = null;
+  nextFetch = async (_url, opts) => { stopBody = JSON.parse(opts.body); return ok200({ ok: true }); };
+  await probe.stopClick();
+  ok("Stop opens the chooser while work is queued, and sends nothing",
+    probe.stopMenuOpen === true && stopBody === null, JSON.stringify(stopBody));
+  await probe.stopCaretClick(); // close it again
+  // The commonest case — one seat replying, nothing queued — stops that run
+  // directly instead, pinned to its runId on the `active` scope so the hop the
+  // reply would have triggered dies with it. A `seat` stop deliberately would
+  // not, which is why the primary is not scoped that way.
+  probe.seedRoom({
+    ...uiSummary, queued: 0, queue: [], queuedDispatches: 0, workingPair: null,
+    busy: ["claude"], busyInfo: [{ agent: "claude", runId: "r7", phase: "start" }],
+  }, []);
+  stopBody = null;
+  await probe.stopClick();
+  ok("one response and an empty queue: the primary click stops that run directly",
+    probe.stopMenuOpen === false && !!stopBody && stopBody.scope === "active" &&
+    JSON.stringify(stopBody.runs) === JSON.stringify([{ agent: "claude", runId: "r7" }]),
+    JSON.stringify(stopBody));
+  // The caret is what keeps seat-only reachable now that the primary acts.
+  await probe.stopCaretClick();
+  ok("the caret still opens every deliberate scope",
+    probe.stopMenuOpen === true && /data-stop-scope="seat" /.test(probe.stopMenuHTML),
+    probe.stopMenuHTML);
+  await probe.stopCaretClick();
+  nextFetch = () => new Promise(() => {});
+  probe.seedRoom(uiSummary, [
+    { n: 4, kind: "user", author: "user", target: "claude", ts: "2026-08-05T02:02:00", text: "the original ask", meta: {} },
+    { n: 5, kind: "agent", author: "claude", ts: "2026-08-05T02:03:00", text: "answer", meta: { replyTo: 4 } },
+  ]);
 
   // A long room must remain windowed after one reveal. The old implementation
   // dropped renderFrom to null on the first click/scroll, making every later
@@ -923,6 +993,73 @@ async function checkFolderPickerUi() {
   probe.setWithdrawals({});
   ok("clearing the withdrawal immediately restores the ordinary receipt dot",
     probe.heard("claude", 4)?.cls === "live", JSON.stringify(probe.heard("claude", 4)));
+
+  // Amber. The seat DID receive this one — that is the whole difference from
+  // red — so a spanning receipt and an advanced cursor must not be allowed to
+  // report it as heard-and-answered. Every later turn carries the message in
+  // context, so anything reading a receipt first would quietly erase the fact
+  // that the user cut the answer short.
+  uiSummary.interruptedResponses = { "4": ["claude"] };
+  probe.seedRoom(uiSummary, [
+    { n: 4, kind: "user", author: "user", target: "claude", ts: "2026-08-05T02:02:00", text: "the original ask", meta: {} },
+  ], [{ agent: "claude", from: 0, upTo: 9, turn: 4, mode: "turn", spoke: true, ts: "2026-08-05T02:03:00" }]);
+  ok("a stopped response dot beats a spanning receipt and an advanced cursor",
+    probe.heard("claude", 4)?.cls === "interrupted" &&
+    /stopped its response/.test(probe.heard("claude", 4)?.title || ""),
+    JSON.stringify(probe.heard("claude", 4)));
+  // Red outranks amber: never-delivered is the stronger claim, and the two are
+  // disjoint per seat in practice because a relaunch clears the withdrawal.
+  uiSummary.cancelledDeliveries = { "4": ["claude"] };
+  probe.seedRoom(uiSummary, [
+    { n: 4, kind: "user", author: "user", target: "claude", ts: "2026-08-05T02:02:00", text: "the original ask", meta: {} },
+  ], []);
+  ok("a withheld message still outranks a stopped response",
+    probe.heard("claude", 4)?.cls === "withheld", JSON.stringify(probe.heard("claude", 4)));
+  uiSummary.cancelledDeliveries = {};
+  uiSummary.interruptedResponses = {};
+
+  // The message carries its own delivery state, in chronological place, instead
+  // of a pill floating further down the timeline. An ordinary message stays
+  // clean; a half-cancelled @both names which seat got what.
+  const bothEntry = {
+    n: 4, kind: "user", author: "user", target: "both", ts: "2026-08-05T02:02:00",
+    text: "the original ask", meta: { audience: { addressed: ["claude", "codex"] } },
+  };
+  probe.seedRoom(uiSummary, [bothEntry], []);
+  ok("an ordinary message carries no delivery chip at all",
+    probe.statusChip(4) === "", probe.statusChip(4));
+  uiSummary.cancelledDeliveries = { "4": ["claude", "codex"] };
+  probe.seedRoom(uiSummary, [bothEntry], []);
+  ok("when every addressed seat shared one outcome the chip says it once",
+    /^<div class="dstatus"><span class="dchip cancelled">Discarded before delivery<\/span>/.test(probe.statusChip(4)),
+    probe.statusChip(4));
+  uiSummary.cancelledDeliveries = { "4": ["codex"] };
+  uiSummary.interruptedResponses = {};
+  probe.seedRoom(uiSummary, [bothEntry],
+    [{ agent: "claude", from: 0, upTo: 4, turn: 4, mode: "turn", spoke: true, ts: "2026-08-05T02:03:00" }]);
+  const split = probe.statusChip(4);
+  ok("a split outcome names each seat and what it actually got",
+    /Delivered to Claude/.test(split) && /Discarded for Codex/.test(split), split);
+  // The undo lives with the fact it undoes, and only for the seat that missed
+  // it — the half that was delivered must not be offered a second copy.
+  ok("only the discarded half of a split @both offers a retry",
+    (split.match(/data-retry-discarded/g) || []).length === 1 &&
+    /data-retry-seats="codex"/.test(split) && !/data-retry-seats="claude"/.test(split), split);
+  uiSummary.cancelledDeliveries = {};
+  uiSummary.interruptedResponses = { "4": ["claude"] };
+  probe.seedRoom(uiSummary, [bothEntry], []);
+  ok("a stopped response says so on the message it was answering",
+    /dchip interrupted/.test(probe.statusChip(4)) &&
+    /Response stopped/.test(probe.statusChip(4)), probe.statusChip(4));
+  // The notice stays in events.jsonl, the transcript and the agent's delta —
+  // it just stops being timeline furniture. The sleep variant is the exception:
+  // it is the only thing explaining why a seat went quiet with work owed.
+  ok("the floating cancellation pill is hidden, but the sleep notice is not",
+    probe.hiddenEntry({ kind: "system", meta: { cancelledQueue: true } }) === true &&
+    probe.hiddenEntry({ kind: "system", meta: { cancelledQueue: true, asleepSeat: "codex" } }) === false &&
+    probe.hiddenEntry({ kind: "system", meta: { agent: "claude", stopped: true } }) === false &&
+    probe.hiddenEntry({ kind: "user", meta: {} }) === false);
+  uiSummary.interruptedResponses = {};
 
   uiSummary.busy = [];
   uiSummary.cancelledDeliveries = {};
@@ -1493,11 +1630,42 @@ async function main() {
   console.log("api access");
   const page = await fetch(base + "/").then((r) => r.text());
   const markdownSource = (page.match(/const SENT_A[\s\S]*?\r?\n}\r?\n(?=document\.addEventListener)/) || [])[0];
+  // renderMD calls the highlighter, which lives above it, so the slice has to
+  // carry both or the extracted function throws on the first code block.
+  const highlightSource = (page.match(/\/\/ ---- syntax highlighting ----[\s\S]*?\r?\n}\r?\n(?=\r?\n\/\/ -+ markdown)/) || [])[0];
   let renderMarkdown = null;
+  let highlight = null;
+  const escapeHTML = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
   try {
-    const escapeHTML = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
-    renderMarkdown = markdownSource ? Function("esc", `${markdownSource}; return renderMD;`)(escapeHTML) : null;
+    renderMarkdown = markdownSource
+      ? Function("esc", `${highlightSource || ""}; ${markdownSource}; return renderMD;`)(escapeHTML)
+      : null;
+    highlight = highlightSource ? Function(`${highlightSource}; return highlightCode;`)() : null;
   } catch { /* reported below */ }
+  // The highlighter runs on already-escaped text and may only ever wrap what is
+  // there in spans. Anything else — dropping characters, or emitting a tag —
+  // would mean it had become a second, weaker escaper.
+  const hlCases = [
+    ["js", 'const x = 1; // note\nif (true) return "hi";'],
+    // Literal " 12 " in a string used to be swapped for a highlighted token by
+    // the placeholder scheme this replaced.
+    ["js", 'const s = " 12 "; const n = 12;'],
+    ["python", "def f():\n    return None  # done"],
+    ["js", "</script><img src=x onerror=alert(1)>"],
+    ["html", '<div class="a">hi</div>'],
+    ["bash", 'echo "hi" # comment'],
+    ["rustlang", "fn main() {}"],
+  ];
+  const hlBroken = !highlight ? ["extraction failed"] : hlCases.filter(([lang, code]) => {
+    const input = escapeHTML(code);
+    const out = highlight(input, lang);
+    const stripped = out.replace(/<span class="tok-[a-z]+">/g, "").replace(/<\/span>/g, "");
+    return stripped !== input || /<(?!\/?span)/.test(out);
+  }).map(([lang]) => lang);
+  ok("syntax highlighting only wraps escaped text and never reintroduces markup",
+    !!highlight && hlBroken.length === 0, JSON.stringify(hlBroken));
+  ok("…and an unfamiliar language is left plain rather than guessed at",
+    !!highlight && highlight(escapeHTML("fn main() {}"), "rustlang") === escapeHTML("fn main() {}"));
   const tableHTML = renderMarkdown && renderMarkdown(
     "| Checkpoint | What must be true | If not |\n|:---|:---:|---:|\n| Day 30 | 8 conversations | Change course |",
   );
@@ -1542,20 +1710,41 @@ async function main() {
     page.includes('setFreeComboOpen(combo, opening, "")'));
   ok("Claude Full access is a warned structured setting",
     page.includes('<option value="bypassPermissions">full access') &&
-    page.includes("Give Claude Full access in this room?") &&
+    page.includes("Give ${who} Full access in this room?") &&
     page.includes("Full access includes protected paths such as .git"));
   const stopChoiceSource = (page.match(/const stopIsChoice = [\s\S]*?;\r?\n/) || [])[0];
   let stopChoice = null;
   try { stopChoice = stopChoiceSource ? Function(`${stopChoiceSource}; return stopIsChoice;`)() : null; }
   catch { /* reported below */ }
-  // `working` covers ordinary exchanges too, so the remaining half of @both
-  // still opens a per-seat chooser; `workingPair` is only wording.
-  ok("Stop treats a pair cycle and an ordinary exchange differently",
+  // The commonest case in the room — one seat replying, nothing queued — is a
+  // direct stop, not a chooser. `working` is true for every ordinary exchange,
+  // so including it made a single click cost two and let its blast radius flip
+  // on sub-second timing. The chooser is for the questions one click genuinely
+  // cannot answer: a second seat, queued work, or a pair cycle.
+  ok("Stop's primary click is direct for one response and a chooser only when ambiguous",
     typeof stopChoice === "function" &&
-    stopChoice({ busy: ["claude"], queued: 0, working: true, workingPair: null }) === true &&
-    stopChoice({ busy: [], queued: 0, working: false, workingPair: null }) === false &&
-    page.includes('summary.workingPair ? "Stop the pair cycle" : "Stop the exchange"') &&
+    stopChoice({ busy: ["claude"], queued: 0, working: true, workingPair: null }) === false &&
+    stopChoice({ busy: ["claude", "codex"], queued: 0, working: true, workingPair: null }) === true &&
+    stopChoice({ busy: ["claude"], queued: 2, working: true, workingPair: null }) === true &&
+    stopChoice({ busy: ["claude"], queued: 0, working: true, workingPair: true }) === true &&
+    stopChoice({ busy: [], queued: 0, working: false, workingPair: null }) === false,
+    stopChoiceSource);
+  // The unambiguous click is run-pinned `active`, never `seat`: it must also end
+  // the chain the killed reply would have continued into. A `seat` stop
+  // deliberately does not, which would leave the hop running after the user
+  // stopped the reply that triggered it.
+  ok("the direct stop is a run-pinned active stop, and the caret keeps every scope reachable",
+    page.includes('return active.length === 1 ? stopResponses("active", null) : stopResponses("all", null);') &&
+    page.includes('$("stopMore").onclick = () => { if (state.summary) toggleStopMenu(); };') &&
     !/const choose = active\.length > 1 \|\| state\.summary\.queued > 0/.test(page));
+  // Status events land several times a second while agents work. Rebuilding the
+  // open menu moved the row out from under an aiming cursor.
+  ok("an open stop menu is a frozen snapshot: rows never move, ended work goes disabled in place",
+    page.includes("let stopMenuShown = null;") &&
+    /if \(stopMenuShown && \$\("stopWrap"\)\.classList\.contains\("open"\)\)/.test(page) &&
+    page.includes("return next ? { ...next, gone: false } : { ...row, gone: true };") &&
+    page.includes("if (menu.dataset.sig === html) return;") &&
+    page.includes("if (!choice || choice.disabled) return;"));
   // The jump is useless precisely when the target sits in collapsed
   // scrollback, but revealing the whole transcript makes one quote click scale
   // with the lifetime of the room. Widen only to the target before lookup.
@@ -1610,8 +1799,28 @@ async function main() {
     page.includes('for (const el of frag.children) el.classList.add("norise")') &&
     page.includes("@media (prefers-reduced-motion: reduce)"));
   ok("both surfaces render the same provenance rather than duplicating state",
-    page.includes("function quoteRefHTML(src)") && page.includes("busyInfoFor(agent)") &&
-    page.includes("entryQuoteHTML(e)"));
+    page.includes('function quoteRefHTML(src, label = "↩ replying to")') &&
+    page.includes("busyInfoFor(agent)") && page.includes("entryQuoteHTML(e)"));
+  // An auto-composed "Continue responding to this message." must be visibly an
+  // ask, not something the user appears to have typed — the quote header and
+  // the badge are the whole of that evidence.
+  // The new-room form has no submit button by default and relied on implicit
+  // submission, which the HTML spec only performs when the form has exactly one
+  // field that blocks it. Adding the seat-name inputs made three, and Enter
+  // silently stopped creating rooms at all. The button is the fix, and this
+  // pins it: any future field added to that form is harmless with it there.
+  const newRoomForm = (page.match(/<form id="newRoomForm">[\s\S]*?<\/form>/) || [""])[0];
+  ok("the new-room form has a real submit button, so Enter still creates a room",
+    /type="submit"/.test(newRoomForm),
+    newRoomForm.slice(0, 200));
+
+  // In a room with two Claude seats, labelling both "Claude" would make the
+  // pills, dots and quote headers indistinguishable.
+  ok("a seat whose name differs from its provider labels itself by name",
+    page.includes("if (meta.provider && meta.provider !== a) return titleCaseSeat(a);"));
+  ok("an ask bubble is marked as one, and says which message it is about",
+    page.includes('quoteRefHTML(refFromN(e.meta.askFrom.sourceN), "↪ asking about")') &&
+    page.includes("· ↪ redirect") && page.includes("· ↪ ask again"));
   // Agreed explicitly: a finished reply keeps the reference in scrollback.
   ok("a finished reply keeps its quote unconditionally",
     !page.includes("answersPrecedingEntry"));
@@ -1641,7 +1850,7 @@ async function main() {
     page.includes("if (r && r.stale) return;"));
   ok("queue cards group by dispatch, not by source message",
     page.includes("item.queueGroupId || `seq:${item.seq}`") &&
-    page.includes("data-cancel-group") && page.includes("Cancel all queued"));
+    page.includes("data-cancel-group") && page.includes("Discard all queued"));
   ok("a historical Pair Continue button pins the exact cap it represents",
     page.includes('api("/api/pair/continue", { room: state.room, capN: e.n })'));
   ok("folder picker UI names the taskbar fallback that now exists",
@@ -2806,6 +3015,9 @@ async function main() {
   ok("an explicit call waits for a busy target instead of being dropped",
     waitedHop.entries.some((e) => e.author === "codex" && e.meta && e.meta.hop));
 
+  // New rooms are bounded by default now, so "until settled" is set explicitly
+  // here — this is a test about the emergency ceiling, not about the default.
+  await cfg("hoproom", { hopBudget: -1 });
   beforeHop = d.entries.length;
   await say("hoproom", "@claude PINGPONG");
   d = await idle("hoproom");
@@ -2831,8 +3043,8 @@ async function main() {
   // once so a genuine hopBudget:0 can survive every later reload.
   await api("POST", "/api/rooms", { name: "hop-default" });
   let hopPolicyRoom = await room("hop-default");
-  ok("new rooms default to hopBudget -1 (until settled)",
-    hopPolicyRoom.room.cfg.hopBudget === -1 && !("maxHops" in hopPolicyRoom.room.cfg),
+  ok("new rooms default to a bounded hop budget rather than until-settled",
+    hopPolicyRoom.room.cfg.hopBudget === 3 && !("maxHops" in hopPolicyRoom.room.cfg),
     JSON.stringify(hopPolicyRoom.room.cfg));
 
   const legacyHopDir = path.join(ROOT, "legacy-hop-budget");
@@ -4811,6 +5023,167 @@ async function main() {
   ok("cancelling an already-drained dispatch is not an error",
     cancelGone.status === 200 && cancelGone.data.cancelled === 0);
 
+  // A hold, not a stop. Nothing starts while it is armed — including work sent
+  // afterwards, which is the whole point of pause-then-compose — and nothing is
+  // dropped, reordered or abandoned. Releasing it runs everything in order.
+  await api("POST", "/api/rooms", { name: "queuehold" });
+  await useFakes("queuehold");
+  const holdOn = await api("POST", "/api/queue/pause", { room: "queuehold", paused: true });
+  ok("pausing an empty queue is allowed and arms the hold",
+    holdOn.status === 200 && holdOn.data.paused === true && holdOn.data.changed === true,
+    JSON.stringify(holdOn.data));
+  ok("a second pause is idempotent rather than an error",
+    (await api("POST", "/api/queue/pause", { room: "queuehold", paused: true })).data.changed === false);
+  ok("the pause must be a boolean",
+    (await api("POST", "/api/queue/pause", { room: "queuehold", paused: "yes" })).status === 400);
+  await say("queuehold", "@claude SAY:HELD_ONE");
+  await say("queuehold", "@claude SAY:HELD_TWO");
+  const heldRoom = await waitRoom("queuehold", (d) => d.room.queued === 2, "both messages held");
+  ok("a held queue accepts new work and starts none of it",
+    heldRoom.room.queuePaused === true && heldRoom.room.busy.length === 0 &&
+    heldRoom.room.queued === 2 && !texts(heldRoom).includes("HELD_ONE"),
+    JSON.stringify({ paused: heldRoom.room.queuePaused, busy: heldRoom.room.busy, queued: heldRoom.room.queued }));
+  const holdOff = await api("POST", "/api/queue/pause", { room: "queuehold", paused: false });
+  ok("resuming reports the release", holdOff.status === 200 && holdOff.data.paused === false);
+  d = await idle("queuehold");
+  const heldTexts = texts(d);
+  ok("…and everything held runs, in the order it was sent",
+    heldTexts.includes("HELD_ONE") && heldTexts.includes("HELD_TWO") &&
+    heldTexts.indexOf("HELD_ONE") < heldTexts.indexOf("HELD_TWO"),
+    JSON.stringify(heldTexts));
+
+  // Retrying a discarded delivery is an ordinary enqueue at the tail of the
+  // seat's own lane: it needs no idle seat, and it cannot overtake newer work.
+  await api("POST", "/api/rooms", { name: "queueretry" });
+  await useFakes("queueretry");
+  await say("queueretry", "@claude SLEEP:1500 SAY:BLOCKER");
+  await waitRoom("queueretry", (d) => d.room.busy.includes("claude"), "claude busy");
+  await say("queueretry", "@claude SAY:DISCARDED_ONE");
+  const qr = await waitRoom("queueretry", (d) => (d.room.queue || []).length === 1, "one queued");
+  const discardN = (qr.room.queue || [])[0].sourceN;
+  await api("POST", "/api/queue/cancel", { room: "queueretry", groupId: (qr.room.queue || [])[0].queueGroupId });
+  const discarded = await waitRoom("queueretry",
+    (d) => ((d.room.cancelledDeliveries || {})[String(discardN)] || []).includes("claude"),
+    "the discard is durably recorded");
+  ok("a discarded delivery is recorded against the message, per seat",
+    (discarded.room.cancelledDeliveries[String(discardN)] || []).includes("claude"),
+    JSON.stringify(discarded.room.cancelledDeliveries));
+  const badRetry = await api("POST", "/api/queue/retry", { room: "queueretry", n: 99999 });
+  ok("retrying a message that was never discarded is refused",
+    badRetry.status === 400, JSON.stringify(badRetry.data));
+  const discardRetry = await api("POST", "/api/queue/retry", { room: "queueretry", n: discardN });
+  ok("retrying a discarded delivery is accepted while the seat is still busy",
+    discardRetry.status === 200 && discardRetry.data.n === discardN &&
+    JSON.stringify(discardRetry.data.agents) === JSON.stringify(["claude"]),
+    JSON.stringify(discardRetry.data));
+  d = await idle("queueretry");
+  const retryTexts = texts(d);
+  ok("…and it runs after the response that was already going, not before it",
+    retryTexts.includes("DISCARDED_ONE") && retryTexts.includes("BLOCKER") &&
+    retryTexts.indexOf("BLOCKER") < retryTexts.indexOf("DISCARDED_ONE"),
+    JSON.stringify(retryTexts));
+  ok("…and the withheld marker is cleared once it is actually delivered",
+    !((d.room.cancelledDeliveries || {})[String(discardN)] || []).includes("claude"),
+    JSON.stringify(d.room.cancelledDeliveries));
+  ok("retrying the same message twice is refused once nothing is discarded",
+    (await api("POST", "/api/queue/retry", { room: "queueretry", n: discardN })).status === 400);
+
+  // Live streaming. The final entry has always been authoritative, so nothing
+  // else in the suite notices if the streaming path breaks entirely — which is
+  // how both adapters' delta parsing stayed dead code under test.
+  for (const [streamRoom, seat, marker] of [["streamclaude", "claude", "CLAUDE_STREAMED"], ["streamcodex", "codex", "CODEX_STREAMED"]]) {
+    await api("POST", "/api/rooms", { name: streamRoom });
+    await useFakes(streamRoom);
+    const tap = await watchRoomSummaries(streamRoom);
+    await say(streamRoom, `@${seat} STREAM SAY:${marker}`);
+    await idle(streamRoom);
+    await tap.stop();
+    const evts = tap.streamed.filter((e) => e.agent === seat);
+    const keyframes = evts.filter((e) => typeof e.text === "string");
+    const increments = evts.filter((e) => typeof e.delta === "string");
+    ok(`${seat}: the live reply is streamed as increments with a full keyframe first`,
+      evts.length > 0 && keyframes.length >= 1 && increments.length >= 1 &&
+      keyframes[0].text !== undefined && increments.every((e) => Number.isSafeInteger(e.from)),
+      JSON.stringify({ total: evts.length, keyframes: keyframes.length, increments: increments.length }));
+    // The whole point of the change: replaying the events must reconstruct the
+    // text exactly, without any single event carrying the entire reply twice.
+    let rebuilt = "";
+    for (const e of evts) {
+      if (typeof e.text === "string") rebuilt = e.text;
+      else if (e.from === rebuilt.length) rebuilt += e.delta;
+    }
+    ok(`${seat}: replaying the increments reconstructs the reply exactly`,
+      rebuilt.includes(marker), JSON.stringify({ rebuilt: rebuilt.slice(0, 120) }));
+  }
+
+  // Ask again / Redirect. The new turn is a real user entry that says what it is
+  // about, the quoted message is restaged into the prompt so the seat can answer
+  // even after a session reset, and stop-and-ask is one request.
+  await api("POST", "/api/rooms", { name: "askroom" });
+  await useFakes("askroom");
+  await say("askroom", "@claude SAY:ORIGINAL_ANSWER");
+  let askD = await idle("askroom");
+  const askSourceN = askD.entries.find((e) => e.kind === "user").n;
+  const askBad = await api("POST", "/api/ask", { room: "askroom", sourceN: 99999, mode: "now" });
+  ok("asking about a message that isn't there is refused", askBad.status === 400);
+  ok("a slash command cannot ride in through an ask",
+    (await api("POST", "/api/ask", { room: "askroom", sourceN: askSourceN, mode: "now", text: "/pair end" })).status === 400);
+  ok("stop-and-ask must name the runs it meant",
+    (await api("POST", "/api/ask", { room: "askroom", sourceN: askSourceN, mode: "stop" })).status === 400);
+  const askAgain = await api("POST", "/api/ask", { room: "askroom", sourceN: askSourceN, mode: "now", text: "SAWWHAT" });
+  ok("ask again is accepted and reports the turn it created",
+    askAgain.status === 200 && Number.isSafeInteger(askAgain.data.n) && askAgain.data.mode === "now",
+    JSON.stringify(askAgain.data));
+  askD = await idle("askroom");
+  const askEntry = askD.entries.find((e) => e.n === askAgain.data.n);
+  ok("…as a real user entry marked with the message it is about",
+    askEntry && askEntry.kind === "user" && askEntry.meta.askFrom &&
+    askEntry.meta.askFrom.sourceN === askSourceN && askEntry.meta.askFrom.kind === "redirect",
+    JSON.stringify(askEntry && askEntry.meta));
+  const askSaw = askD.entries.filter((e) => e.kind === "agent").pop();
+  ok("…and the quoted message is restaged into that turn's prompt",
+    /quoted message #/.test(askSaw.text) && /ORIGINAL_ANSWER/.test(askSaw.text),
+    (askSaw.text || "").slice(0, 400));
+  // An empty instruction becomes real text, so the transcript never carries an
+  // empty user bubble whose cause cannot be audited.
+  const askEmpty = await api("POST", "/api/ask", { room: "askroom", sourceN: askSourceN, mode: "now" });
+  askD = await idle("askroom");
+  const emptyEntry = askD.entries.find((e) => e.n === askEmpty.data.n);
+  ok("an ask with no instruction gets real text and is marked ask-again",
+    emptyEntry && emptyEntry.text === "Continue responding to this message." &&
+    emptyEntry.meta.askFrom.kind === "ask-again",
+    JSON.stringify(emptyEntry && { text: emptyEntry.text, meta: emptyEntry.meta.askFrom }));
+
+  // Stop-and-ask: one request that ends the visible run and places the redirect
+  // at the head of the lane, ahead of work queued earlier but behind nothing.
+  await api("POST", "/api/rooms", { name: "askstop" });
+  await useFakes("askstop");
+  await say("askstop", "@claude SAY:ASK_ROOT");
+  await idle("askstop");
+  await say("askstop", "@claude SLEEP:2500 SAY:LONG_RUN");
+  const running = await waitRoom("askstop", (d) => (d.room.busyInfo || []).some((b) => b.runId), "claude running");
+  await say("askstop", "@claude SAY:QUEUED_EARLIER");
+  await waitRoom("askstop", (d) => d.room.queued === 1, "one queued behind the run");
+  const pins = (running.room.busyInfo || []).filter((b) => b.runId).map((b) => ({ agent: b.agent, runId: b.runId }));
+  const rootN = (await room("askstop")).entries.find((e) => e.kind === "user").n;
+  const redirect = await api("POST", "/api/ask", {
+    room: "askstop", sourceN: rootN, mode: "stop", runs: pins, text: "SAY:REDIRECTED",
+  });
+  ok("stop-and-ask is accepted as one request", redirect.status === 200 && redirect.data.mode === "stop",
+    JSON.stringify(redirect.data));
+  ok("…and it does not flush the queue behind it",
+    (await room("askstop")).room.queued >= 1, JSON.stringify((await room("askstop")).room.queued));
+  d = await idle("askstop");
+  const stopTexts = texts(d);
+  ok("…the redirect runs before the message queued earlier",
+    stopTexts.includes("REDIRECTED") && stopTexts.includes("QUEUED_EARLIER") &&
+    stopTexts.indexOf("REDIRECTED") < stopTexts.indexOf("QUEUED_EARLIER"),
+    JSON.stringify(stopTexts));
+  ok("…and the response it stopped never finished",
+    !stopTexts.includes("LONG_RUN"), JSON.stringify(stopTexts));
+  ok("…while the work queued earlier still ran, rather than being discarded",
+    stopTexts.includes("QUEUED_EARLIER"));
+
   // The contract behind "Stop everything": one press, and nothing this exchange
   // would still have spawned — the hop the reply earns, the lurk check after it
   // — ever starts. The reply is allowed to land first and the hop target is held
@@ -6199,8 +6572,109 @@ async function main() {
   d = await room("swapped");
   ok("seat order is preserved", JSON.stringify(d.room.seats) === '["codex","claude"]', JSON.stringify(d.room.seats));
   ok("default agent follows seat 1", d.room.cfg.defaultAgent === "codex");
+  // Two bare provider names are two seats with the same id, which is still
+  // ambiguous — the id is the @mention, the config key and the lane name.
   const dup = await api("POST", "/api/rooms", { name: "dupe", seats: ["claude", "claude"] });
-  ok("same-provider pairs rejected", dup.status === 400);
+  ok("two seats with the same name are rejected", dup.status === 400);
+  // …but two seats of the same provider, named apart, are a real room now.
+  const twins = await api("POST", "/api/rooms", {
+    name: "twins", seats: [{ id: "alpha", provider: "claude" }, { id: "beta", provider: "claude" }],
+  });
+  ok("two seats can share a provider when their names differ", twins.status === 200,
+    JSON.stringify(twins.data));
+  const twinRoom = await room("twins");
+  ok("…and each is its own seat, driven by the same provider",
+    JSON.stringify(twinRoom.room.seats) === JSON.stringify(["alpha", "beta"]) &&
+    twinRoom.room.cfg.agents.alpha.provider === "claude" &&
+    twinRoom.room.cfg.agents.beta.provider === "claude",
+    JSON.stringify(twinRoom.room.cfg.agents));
+  // The sidebar reads the listing, not the open room's summary — it used to
+  // filter seat keys against the provider registry, so a renamed seat was
+  // dropped and every such room showed the default pair instead.
+  const listedTwins = (await api("GET", "/api/rooms")).data.rooms.find((r) => r.name === "twins");
+  ok("the room listing reports renamed seats rather than falling back to the defaults",
+    listedTwins && JSON.stringify(listedTwins.seats) === JSON.stringify(["alpha", "beta"]) &&
+    listedTwins.providers.alpha === "claude" && listedTwins.providers.beta === "claude",
+    JSON.stringify(listedTwins));
+  // Colour is what the receipt dots, avatars and busy pills are keyed on, so
+  // two seats sharing a provider must not share a colour.
+  ok("two seats on one provider are given different colours",
+    twinRoom.room.seatInfo.alpha.color !== twinRoom.room.seatInfo.beta.color,
+    JSON.stringify([twinRoom.room.seatInfo.alpha.color, twinRoom.room.seatInfo.beta.color]));
+  ok("…while an ordinary two-provider room keeps each provider's own colour",
+    (await room("default")).room.seatInfo.claude.color === "#e8845c" &&
+    (await room("default")).room.seatInfo.codex.color === "#2fd6a8");
+  ok("…with the provider's own look and settings resolved per seat",
+    twinRoom.room.seatInfo.alpha.provider === "claude" &&
+    twinRoom.room.seatInfo.alpha.label === "Claude" &&
+    twinRoom.room.seatInfo.beta.avatar === "C",
+    JSON.stringify(twinRoom.room.seatInfo));
+  ok("a seat name that would collide with routing or Parley's own voices is refused",
+    (await api("POST", "/api/rooms", { name: "bad1", seats: [{ id: "both", provider: "claude" }, "codex"] })).status === 400 &&
+    (await api("POST", "/api/rooms", { name: "bad2", seats: [{ id: "system", provider: "claude" }, "codex"] })).status === 400 &&
+    (await api("POST", "/api/rooms", { name: "bad3", seats: [{ id: "has space", provider: "claude" }, "codex"] })).status === 400);
+  // Case is normalised rather than refused: @Alpha and @alpha are one seat.
+  const cased = await api("POST", "/api/rooms", { name: "cased", seats: [{ id: "Alpha", provider: "claude" }, "codex"] });
+  ok("a seat name is lowercased rather than rejected",
+    cased.status === 200 && (await room("cased")).room.seats.includes("alpha"),
+    JSON.stringify(cased.data));
+  ok("an unknown provider is refused rather than silently defaulted",
+    (await api("POST", "/api/rooms", { name: "bad4", seats: [{ id: "x", provider: "nosuch" }, "codex"] })).status === 400);
+  // Routing, sessions and receipts all key on the seat id, so two seats of one
+  // provider must stay completely independent.
+  await cfg("twins", { agents: { alpha: { command: FAKE }, beta: { command: FAKE } } });
+  await say("twins", "@alpha SAY:FROM_ALPHA");
+  await idle("twins");
+  await say("twins", "@beta SAY:FROM_BETA");
+  const twinD = await idle("twins");
+  ok("…each seat answers only when it is the one addressed",
+    (twinD.entries.find((e) => e.text === "FROM_ALPHA") || {}).author === "alpha" &&
+    (twinD.entries.find((e) => e.text === "FROM_BETA") || {}).author === "beta",
+    JSON.stringify(twinD.entries.filter((e) => e.kind === "agent").map((e) => [e.author, e.text])));
+  const twinState = JSON.parse(fs.readFileSync(path.join(ROOT, "twins", "state.json"), "utf8"));
+  ok("…and they hold separate sessions",
+    !!twinState.agents.alpha.sessionRef && !!twinState.agents.beta.sessionRef &&
+    twinState.agents.alpha.sessionRef !== twinState.agents.beta.sessionRef,
+    JSON.stringify([twinState.agents.alpha.sessionRef, twinState.agents.beta.sessionRef]));
+
+  // Migration: a room written before seats and providers were separate must
+  // gain one field and rename nothing — its sessions, cursors and receipts are
+  // all keyed by seat id, so a rename would orphan every one of them.
+  const legacyDir = path.join(ROOT, "legacyseats");
+  fs.mkdirSync(legacyDir, { recursive: true });
+  fs.writeFileSync(path.join(legacyDir, "room.json"), JSON.stringify({
+    defaultAgent: "claude", mode: "talk", hopBudget: -1, pairRounds: 0,
+    projectDir: null, roomNote: null, timeoutMs: 900000,
+    agents: { claude: { command: FAKE, permissionMode: "auto" }, codex: { command: FAKE, sandbox: "read-only" } },
+  }, null, 2), "utf8");
+  fs.writeFileSync(path.join(legacyDir, "state.json"), JSON.stringify({
+    nextTurn: 3, lastAddressed: "claude",
+    agents: {
+      claude: { sessionRef: "legacy-session-abc", cursor: 2, asleep: null, permissionScope: "default" },
+      codex: { sessionRef: "legacy-thread-xyz", cursor: 2, asleep: null },
+    },
+  }, null, 2), "utf8");
+  // Real history to match, or the cursor clamp correctly rewinds a cursor that
+  // points past the end of the log.
+  fs.writeFileSync(path.join(legacyDir, "events.jsonl"),
+    [{ n: 1, kind: "user", author: "user", target: "claude", ts: "2026-08-05T01:00:00", text: "hello" },
+      { n: 2, kind: "agent", author: "claude", ts: "2026-08-05T01:00:05", text: "hi" }]
+      .map((e) => JSON.stringify(e)).join("\n") + "\n", "utf8");
+  const migrated = await room("legacyseats");
+  ok("a pre-decoupling room gains an explicit provider per seat",
+    migrated.room.cfg.agents.claude.provider === "claude" &&
+    migrated.room.cfg.agents.codex.provider === "codex",
+    JSON.stringify(migrated.room.cfg.agents));
+  const legacySeatState = JSON.parse(fs.readFileSync(path.join(legacyDir, "state.json"), "utf8"));
+  ok("…while its seat ids, sessions and cursors are untouched",
+    JSON.stringify(migrated.room.seats) === JSON.stringify(["claude", "codex"]) &&
+    legacySeatState.agents.claude.sessionRef === "legacy-session-abc" &&
+    legacySeatState.agents.codex.sessionRef === "legacy-thread-xyz" &&
+    legacySeatState.agents.codex.cursor === 2 && migrated.room.nextTurn !== 0,
+    JSON.stringify(legacySeatState.agents));
+  const migratedOnDisk = JSON.parse(fs.readFileSync(path.join(legacyDir, "room.json"), "utf8"));
+  ok("…and the migration is written once, not re-derived on every load",
+    migratedOnDisk.agents.claude.provider === "claude", JSON.stringify(migratedOnDisk.agents.claude));
 
   await useFakes("swapped");
   await cfg("swapped", { roomNote: "The room codeword is TANGERINE." });
@@ -7275,9 +7749,28 @@ try {
   await main();
 } catch (e) {
   failures.push("threw: " + e.message);
-  console.log("\n✗ " + e.message);
+  console.log("\n✗ " + (e.stack || e.message));
 }
 try { server.kill(); } catch { /* already gone */ }
+
+// A CI-only failure used to be diagnosable from one assertion line: the room
+// state was deleted unconditionally and the server log was only ever printed if
+// boot itself failed. Keep both when something went wrong.
+if (failures.length) {
+  const bundle = path.join(here, "..", "smoke-failure");
+  try {
+    fs.rmSync(bundle, { recursive: true, force: true });
+    fs.mkdirSync(bundle, { recursive: true });
+    fs.cpSync(ROOT, path.join(bundle, "rooms"), { recursive: true });
+    fs.writeFileSync(path.join(bundle, "server.log"), serverLog, "utf8");
+    fs.writeFileSync(path.join(bundle, "failures.txt"), failures.join("\n"), "utf8");
+    console.log(`\nkept the room state and server log in ${bundle}`);
+  } catch (e) {
+    console.log(`\ncould not save the failure bundle (${e.message}); room state is at ${ROOT}`);
+  }
+  console.log("\n--- last 60 lines of the server log ---\n" +
+    serverLog.split(/\r?\n/).slice(-60).join("\n"));
+}
 try { fs.rmSync(ROOT, { recursive: true, force: true }); } catch { /* windows may hold a handle */ }
 
 console.log(`\n${pass} passed, ${failures.length} failed`);

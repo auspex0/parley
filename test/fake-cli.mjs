@@ -477,6 +477,15 @@ const reviewDelay = isReview && has("SLOWREVIEW", prompt) ? 5000 : 0;
 await new Promise((r) => setTimeout(r, Number(slept || reviewDelay || process.env.FAKE_DELAY_MS || 250) + orderDelay));
 
 const out = (o) => process.stdout.write(JSON.stringify(o) + "\n");
+// Small pieces, spread over time, so one reply crosses several server-side
+// coalescing windows — which is what makes the increment/keyframe protocol
+// observable at all. Emitted in a burst they would all land inside a single
+// window and the run would end before it ever flushed, exactly as a real CLI
+// never behaves.
+function* chunks(text, size = 4) {
+  for (let i = 0; i < text.length; i += size) yield text.slice(i, i + size);
+}
+const pace = () => new Promise((r) => setTimeout(r, 120));
 
 if (codexMode) {
   const resuming = argv[execIndex + 1] === "resume" && argv[execIndex + 2] && argv[execIndex + 2] !== "--last";
@@ -492,6 +501,15 @@ if (codexMode) {
     out({ type: "item.started", item: { id: "i1", type: "file_change", changes: [{ path: p, kind: "add" }], status: "in_progress" } });
     out({ type: "item.completed", item: { id: "i1", type: "file_change", changes: [{ path: p, kind: "add" }], status: "completed" } });
   }
+  // Incremental deltas before the authoritative item, so the adapter's live
+  // streaming path is actually executed by the suite rather than being dead code
+  // a regression could break with every assertion still green.
+  if (has("STREAM")) {
+    for (const piece of chunks(reply)) {
+      out({ msg: { type: "agent_message_delta", delta: piece } });
+      await pace();
+    }
+  }
   out({ type: "item.completed", item: { id: "i2", type: "agent_message", text: reply } });
   out({ type: "turn.completed", usage: { input_tokens: 10, output_tokens: 7, reasoning_output_tokens: 3 } });
   const lastMsgFile = arg("--output-last-message") || arg("-o");
@@ -504,6 +522,12 @@ if (codexMode) {
       type: "assistant", session_id: sessionId,
       message: { content: [{ type: "tool_use", id: "toolu_fake1", name: "Write", input: { file_path: path.resolve(process.cwd(), wroteFile) } }] },
     });
+  }
+  if (has("STREAM")) {
+    for (const piece of chunks(reply)) {
+      out({ type: "stream_event", session_id: sessionId, event: { type: "content_block_delta", delta: { type: "text_delta", text: piece } } });
+      await pace();
+    }
   }
   out({ type: "assistant", session_id: sessionId, message: { content: [{ type: "text", text: reply }] } });
   out({ type: "result", subtype: "success", result: reply, session_id: sessionId, is_error: false, usage: { input_tokens: 10, output_tokens: 7 } });
