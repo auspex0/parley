@@ -819,7 +819,8 @@
               <button type="button" role="menuitemradio" aria-checked="false" data-hop-choice="solo">
                 <b>Solo</b><span class="hm-sub">One selected seat responds until you choose another policy. The other cannot lurk or react, but can read the transcript later.</span>
               </button>
-              <div class="hm-label">Shortcut · remembered for this room and browser session</div>
+              <div class="hm-label">Shortcut · remembered for this room and browser session<br>
+                Each hop that gets an answer can mean up to two provider calls — the ask and its free return.</div>
               <div class="hm-grid">
                 <button type="button" role="menuitemradio" aria-label="Unlimited hops" aria-checked="false" data-hop-choice="-1" title="Follow up until settled; the safety stop still applies">∞</button>
                 <button type="button" role="menuitemradio" aria-label="No hops" aria-checked="false" data-hop-choice="0" title="No agent-to-agent follow-ups; a lurker may still react">0</button>
@@ -1457,10 +1458,53 @@ function interruptedFrom(a, n) {
   const seats = map[String(n)];
   return Array.isArray(seats) && seats.includes(a);
 }
+// ---- receipt & relay-cap indexes ----
+// computeHeard used to scan all of state.receipts per dot and cappedFrom all of
+// state.entries per unresolved dot, on every SSE room event, for every rendered
+// row — a multi-second sweep in a fully revealed 10k room. Both lookups are now
+// O(1) against indexes that rebuild lazily whenever the backing array is
+// REPLACED (identity check covers loads, reconnect merges and resets in one
+// rule) and extend incrementally when it is appended to in place.
+//
+// First-match-wins matters: overlapping receipt ranges must resolve to the
+// receipt that arrived first, exactly as the old linear .find did. Filling
+// only-still-uncovered slots in arrival order reproduces that, including for
+// closure/attention receipts that span ranges live receipts already cover.
+let receiptIndexSource = null;
+const receiptCover = new Map(); // agent -> Map(n -> receipt)
+function indexReceipt(r) {
+  if (!r || !Number.isFinite(r.from) || !Number.isFinite(r.upTo)) return;
+  let m = receiptCover.get(r.agent);
+  if (!m) { m = new Map(); receiptCover.set(r.agent, m); }
+  for (let n = r.from + 1; n <= r.upTo; n++) if (!m.has(n)) m.set(n, r);
+}
+function receiptFor(a, n) {
+  if (receiptIndexSource !== state.receipts) {
+    receiptCover.clear();
+    for (const r of state.receipts) indexReceipt(r);
+    receiptIndexSource = state.receipts;
+  }
+  const m = receiptCover.get(a);
+  return (m && m.get(n)) || null;
+}
+
+let capIndexSource = null;
+const capIndex = new Map(); // `${target}:${n}` -> the relayCap system entry
+function indexCapEntry(entry) {
+  if (!(entry && entry.kind === "system" && entry.meta && entry.meta.relayCap &&
+      Array.isArray(entry.meta.relayCap.dropped))) return;
+  for (const item of entry.meta.relayCap.dropped) {
+    const key = `${item.target}:${Number(item.n)}`;
+    if (!capIndex.has(key)) capIndex.set(key, entry);
+  }
+}
 function cappedFrom(a, n) {
-  return state.entries.find((entry) => entry.kind === "system" && entry.meta &&
-    entry.meta.relayCap && Array.isArray(entry.meta.relayCap.dropped) &&
-    entry.meta.relayCap.dropped.some((item) => Number(item.n) === Number(n) && item.target === a)) || null;
+  if (capIndexSource !== state.entries) {
+    capIndex.clear();
+    for (const entry of state.entries) indexCapEntry(entry);
+    capIndexSource = state.entries;
+  }
+  return capIndex.get(`${a}:${Number(n)}`) || null;
 }
 function computeHeard(a, e) {
   if (withheldFrom(a, e.n)) {
@@ -1476,7 +1520,7 @@ function computeHeard(a, e) {
     return { cls: "interrupted",
       title: `${a} · received this, but you stopped its response — nothing is retried automatically` };
   }
-  const r = state.receipts.find((x) => x.agent === a && x.from < e.n && e.n <= x.upTo);
+  const r = receiptFor(a, e.n);
   if (r) {
     if (r.mode === "closure") return r.spoke
       ? { cls: "late", title: `${a} · causal answer delivered — replied` }
@@ -1570,7 +1614,7 @@ const STATUS_CHIP = {
   interrupted: { all: "Response stopped before it finished", one: (s) => `Response stopped for ${s}` },
 };
 function receivedBy(a, e) {
-  if (state.receipts.some((x) => x.agent === a && x.from < e.n && e.n <= x.upTo)) return true;
+  if (receiptFor(a, e.n)) return true;
   const agent = state.summary && state.summary.agents && state.summary.agents[a];
   return !!agent && agent.cursor >= e.n;
 }
@@ -1590,12 +1634,11 @@ function deliveryStatus(e) {
         : receivedBy(seat, e) ? "delivered" : "pending",
   }));
 }
-function statusDimmed(e) {
-  return deliveryStatus(e).some((s) => s.kind === "cancelled" || s.kind === "interrupted");
+function statusDimmed(e, parts = deliveryStatus(e)) {
+  return parts.some((s) => s.kind === "cancelled" || s.kind === "interrupted");
 }
-function statusChipHTML(e) {
-  const parts = deliveryStatus(e);
-  if (!statusDimmed(e)) return ""; // an ordinary message stays clean
+function statusChipHTML(e, parts = deliveryStatus(e)) {
+  if (!statusDimmed(e, parts)) return ""; // an ordinary message stays clean
   const kinds = new Set(parts.map((s) => s.kind));
   // Every addressed seat shared one outcome: say it once, without naming them.
   const chips = kinds.size === 1 && STATUS_CHIP[parts[0].kind]
@@ -1632,24 +1675,32 @@ function hiddenEntry(e) {
 // has to leave untouched rows alone: replacing one restarts the pulse on a
 // pending dot, inside a message the reader may be part-way through.
 const heardSig = new Map();
+// n -> the entry's row element, maintained where rows are created and cleared
+// where they are all destroyed. Purely a lookup cache for refreshHeard.
+const rowByN = new Map();
 function refreshHeard(fromN, upToN) {
   for (const e of state.entries) {
     if (e.n <= fromN || e.n > upToN) continue;
     if (state.renderFromN !== null && e.n < state.renderFromN) continue; // not rendered
     const html = heardHTML(e);
-    // The chip and the dots are one fact seen two ways, so they refresh in the
-    // same pass and share a signature — they can never disagree on screen.
-    const chip = statusChipHTML(e);
+    // One fact read three ways — the chip, the dim and the retry footer all
+    // derive from deliveryStatus, so it is computed once per row, not three
+    // times. The chip and the dots share a signature so they can never
+    // disagree on screen.
+    const parts = deliveryStatus(e);
+    const chip = statusChipHTML(e, parts);
     const sig = `${chip}${html}`;
     if (!html || heardSig.get(e.n) === sig) continue;
-    const row = chat.querySelector(`[data-n="${e.n}"]`);
+    // rowByN replaces a per-row querySelector that was O(children) — O(rows²)
+    // across a cold sweep of a fully revealed window.
+    const row = rowByN.get(e.n) || chat.querySelector(`[data-n="${e.n}"]`);
     const el = row && row.querySelector(".heard");
     if (!el) continue;
     const cur = row.querySelector(".dstatus"); // before el.outerHTML invalidates el
     if (chip) { if (cur) cur.outerHTML = chip; else el.insertAdjacentHTML("beforebegin", chip); }
     else if (cur) cur.remove();
     const bub = row.querySelector(".bubble");
-    if (bub) bub.classList.toggle("dimmed", statusDimmed(e));
+    if (bub) bub.classList.toggle("dimmed", statusDimmed(e, parts));
     el.outerHTML = html;
     heardSig.set(e.n, sig);
   }
@@ -1900,7 +1951,12 @@ function appendEntryRange(parent, entries) {
     if (e.kind !== "activity") {
       // Filtered at render time only — never removed from state.entries, which
       // every index, jump and quote lookup walks.
-      if (!hiddenEntry(e)) { dayDivider(e); parent.appendChild(entryEl(e)); }
+      if (!hiddenEntry(e)) {
+        dayDivider(e);
+        const rowEl = entryEl(e);
+        if (e.n !== undefined && e.n !== null) rowByN.set(e.n, rowEl);
+        parent.appendChild(rowEl);
+      }
       i++;
       continue;
     }
@@ -1922,13 +1978,62 @@ function renderedStartIndex() {
 // Widen the rendered window, keeping the reader on the entry they were looking
 // at. The anchor correction must be instant: #chatWrap scrolls smoothly, and
 // animating it fights an in-flight scroll and reads as a lurch.
+// Widening used to be a full renderAll: every rendered row rebuilt from
+// scratch, so each successive "Show earlier" cost more than the last (322ms at
+// a 600-row window, seconds for a quote-jump deep into a 10k room) — and the
+// rebuild cleared heardSig, so the NEXT room event paid a cold full sweep too.
+// Newly revealed history is now prepended; the rows already on screen stay put.
 function renderPreservingAnchor(nextFromN) {
+  const prevStart = renderedStartIndex();
+  const kids = chat.children || [];
+  const btn = chat.firstElementChild !== undefined ? chat.firstElementChild : kids[0];
+  // The seam cases fall back to the full rebuild rather than being hand-stitched:
+  // no button to anchor the prepend on, nothing actually revealed, or the old
+  // window opening mid-activity-run (the prepended chunk would end with a run
+  // that must merge into the run element already on screen).
+  const seamRun = state.entries[prevStart] && state.entries[prevStart].kind === "activity" &&
+    state.entries[prevStart - 1] && state.entries[prevStart - 1].kind === "activity" &&
+    state.entries[prevStart - 1].author === state.entries[prevStart].author;
+  const canPrepend = btn && btn.classList && btn.classList.contains &&
+    btn.classList.contains("history-more") && prevStart > 0 && !seamRun &&
+    typeof btn.after === "function";
   const beforeHeight = chatWrap.scrollHeight;
   const beforeTop = chatWrap.scrollTop;
   const behavior = chatWrap.style.scrollBehavior;
   chatWrap.style.scrollBehavior = "auto";
   state.renderFromN = nextFromN;
-  renderAll({ stickToBottom: false });
+  const newStart = renderedStartIndex();
+  if (!canPrepend || newStart >= prevStart) {
+    renderAll({ stickToBottom: false });
+    chatWrap.scrollTop = beforeTop + chatWrap.scrollHeight - beforeHeight;
+    chatWrap.style.scrollBehavior = behavior;
+    return;
+  }
+  const revealed = state.entries.slice(newStart, prevStart);
+  const frag = document.createDocumentFragment();
+  appendEntryRange(frag, revealed);
+  // appendEntryRange suppresses a leading divider and knows nothing about what
+  // follows the chunk, so the one divider it cannot place is the seam: when the
+  // day changes between the chunk's last visible entry and the old first row.
+  const lastNew = [...revealed].reverse().find((x) => !hiddenEntry(x));
+  const firstOld = state.entries[prevStart];
+  if (lastNew && firstOld && dayOf(lastNew.ts) && dayOf(firstOld.ts) &&
+      dayOf(lastNew.ts) !== dayOf(firstOld.ts)) {
+    const sep = document.createElement("div");
+    sep.className = "daysep";
+    sep.setAttribute("role", "separator");
+    sep.innerHTML = `<span>${esc(dayLabel(firstOld.ts))}</span>`;
+    frag.appendChild(sep);
+  }
+  // Nothing here is new to the reader in the animated sense — it is scrollback.
+  for (const el of frag.children) el.classList.add("norise");
+  btn.after(frag);
+  if (newStart <= 0) btn.remove();
+  else {
+    btn.title = newStart > HISTORY_PAGE
+      ? `${newStart} earlier entries — shows ${HISTORY_PAGE} more`
+      : `${newStart} earlier entr${newStart === 1 ? "y" : "ies"}`;
+  }
   chatWrap.scrollTop = beforeTop + chatWrap.scrollHeight - beforeHeight;
   chatWrap.style.scrollBehavior = behavior;
 }
@@ -2083,6 +2188,7 @@ function renderAll({ stickToBottom = true, preserveTransient = true, anchor = fa
     : [];
   chat.innerHTML = "";
   heardSig.clear(); // the rebuild below re-reads them, so nothing cached survives it
+  rowByN.clear();
   const start = renderedStartIndex();
   const frag = document.createDocumentFragment();
   if (start > 0) {
@@ -2132,15 +2238,27 @@ function addReceipt(receipt) {
   const key = receiptKey(receipt);
   if (state.receipts.some((r) => receiptKey(r) === key)) return;
   state.receipts.push(receipt);
+  // In-place append: extend the coverage index rather than invalidating it.
+  if (receiptIndexSource === state.receipts) indexReceipt(receipt);
   refreshHeard(receipt.from, receipt.upTo);
 }
 
 function addEntry(e) {
-  if (state.entries.some((cur) => cur.n === e.n)) return;
+  // The array is sorted by construction, so dedup is a binary search, and an
+  // in-order arrival — the overwhelmingly common case — is a push rather than
+  // the full Map-rebuild-and-sort mergeEntries does. That rebuild allocated a
+  // 10k-element array plus a 10k-key Map per arriving entry in a long room,
+  // several times a second during an active work turn.
+  if (entryIndexOf(e.n) >= 0) return;
   const wasAtBottom = nearBottom();
   const last = state.entries[state.entries.length - 1];
   const inOrder = !last || e.n > last.n;
-  state.entries = mergeEntries(state.entries, [e]);
+  if (inOrder) {
+    state.entries.push(e);
+    if (capIndexSource === state.entries) indexCapEntry(e);
+  } else {
+    state.entries = mergeEntries(state.entries, [e]);
+  }
   // Kept in state (it is real history and the transcript replays it) but never
   // drawn: the message it is about now carries its own status, and the room
   // summary that follows this entry repaints that chip.
@@ -2166,7 +2284,9 @@ function addEntry(e) {
     else renderAll({ stickToBottom: wasAtBottom, anchor: true });
     return;
   }
-  chat.appendChild(entryEl(e));
+  const rowEl = entryEl(e);
+  if (e.n !== undefined && e.n !== null) rowByN.set(e.n, rowEl);
+  chat.appendChild(rowEl);
   // Keep any live bubbles after the durable transcript entry.
   for (const live of Object.values(state.live)) chat.appendChild(live.el);
   if (document.hidden && e.kind !== "activity") { document.title = "● Parley"; notifyForEntry(e); }
@@ -2389,15 +2509,27 @@ function liveStream(agent, msg) {
   else if (msg.from === l.text.length) l.text += msg.delta;
   else return;
   if (state.streamTimer[agent]) return;
+  // The repaint cost is not the markdown (0.26ms at 20KB) — it is the layout of
+  // the destroyed-and-recreated bubble subtree, which grows with reply length:
+  // ~20ms per flush at 20KB, every 90ms, ~22% of the main thread for the whole
+  // tail of a long reply, felt as keystroke stalls while composing. Text
+  // accumulation happens above, outside the timer, so coalescing more per
+  // repaint loses nothing — the flush interval simply grows with the reply.
+  const flushDelay = l.text.length < 4096 ? 90 : l.text.length < 16384 ? 250 : 500;
   state.streamTimer[agent] = setTimeout(() => {
     delete state.streamTimer[agent];
     const cur = state.live[agent];
     if (!cur) return;
-    cur.mode = "stream";
-    cur.el.querySelector(".live-label").innerHTML = 'is replying <span class="elapsed"></span>';
+    // The label is written once, on the think→stream transition. Rewriting it
+    // every flush recreated an empty .elapsed span, so the "· 12s" counter was
+    // blank ~90% of the time during streaming — exactly when it matters.
+    if (cur.mode !== "stream") {
+      cur.mode = "stream";
+      cur.el.querySelector(".live-label").innerHTML = 'is replying <span class="elapsed"></span>';
+    }
     cur.el.querySelector(".bubble").innerHTML = renderMD(cur.text) + '<span class="caret"></span>';
     scrollBottom();
-  }, 90);
+  }, flushDelay);
 }
 function whisper(agent, error, hop, skipped, asleep, held, queued, attention) {
   const d = document.createElement("div");
@@ -3531,6 +3663,10 @@ function connect(resyncOnOpen = false) {
       else if (msg.phase === "retrying") {
         const l = ensureLive(msg.agent);
         l.el.querySelector(".live-label").innerHTML = 'is restoring its session <span class="elapsed"></span>';
+        // The stream flush only rewrites the label on the think→stream
+        // transition now, so reset the mode or the retry label would stick
+        // through the restored session's whole streamed reply.
+        l.mode = "think";
       } else if (msg.phase === "done") removeLive(msg.agent);
       applyLiveRef(msg.agent);
       renderBusyStrip();

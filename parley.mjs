@@ -202,6 +202,9 @@ const PROVIDERS = {
       // in the file is fine — they are evaluated at call time, not at load.
       sessionScope: { field: "permissionScope", of: (seatCfg, roomMode) => effectiveClaudePermissionMode(seatCfg, roomMode) },
       isolateProtectedTurn: (seatCfg, roomMode) => effectiveClaudePermissionMode(seatCfg, roomMode) === "bypassPermissions",
+      // Protected turns run under --permission-mode plan — the read-only
+      // boundary is enforced by the CLI, not only described by the prompt.
+      protectedTurnEnforced: true,
       nativeImageBytes: CLAUDE_NATIVE_IMAGE_BYTES,
       // Room Settings is the supported, warned route to Full access; these are
       // the raw argument shapes that would reach it without the warning.
@@ -289,6 +292,8 @@ const PROVIDERS = {
       // delta protocol works here exactly as it does for the other two.
       sessions: "resume",
       sessionScope: { field: "approvalScope", of: (seatCfg, roomMode) => effectiveGeminiApprovalMode(seatCfg, roomMode) },
+      // Protected turns run under --approval-mode plan — enforced, not prose.
+      protectedTurnEnforced: true,
       fullAccessScope: "yolo",
       resumeLostPatterns: [
         /\bsession not found\b/i,
@@ -722,6 +727,13 @@ function stampPromptDelivery(room, agent, res, epoch, delivery) {
   seat.briefingVersion = delivery.version;
   seat.briefingFingerprint = delivery.fingerprint;
   seat.roomNoteRevision = delivery.roomNoteRevision;
+  // Static instruction blocks this session has durably received. A different
+  // session identity starts a clean ledger — stamps from a dead session must
+  // not vouch for a new one.
+  seat.staticBlocks = {
+    ...((delivery.sameSession && seat.staticBlocks) || {}),
+    ...(delivery.blocksSent || {}),
+  };
 }
 
 // Extra args are an advanced escape hatch. Direct dangerous flags and direct
@@ -1086,6 +1098,14 @@ function composePromptDelivery(room, agent, fresh, isolated = false) {
     roomNoteRevision,
     expectedSessionRef: stableSessionRef(sessionRef) ? sessionRef : null,
     contractDelivered: fresh || !contractCurrent,
+    // For the static-block dedup below: whether this turn resumes the session
+    // the stamps describe, whether the note is already in it, and a ledger of
+    // the block fingerprints this delivery carried (in full or as a reminder),
+    // stamped only after durable success like everything else here.
+    sameSession,
+    fresh,
+    noteCurrent,
+    blocksSent: {},
   };
 }
 
@@ -1152,8 +1172,11 @@ function resetRecoveryBriefing(room, agent) {
   return makeBriefing(agent, room) +
     "\n\nNote: this is a fresh native session (the prior session was reset or this turn was deliberately isolated)." +
     (tail ? ` Recent room history, so you can pick up where things left off:\n[Recent room history]\n${tail}\n[End of history] This is a bounded excerpt, not proof that omitted matters were undecided. Do not reopen an earlier decision merely because it is absent here; when an omitted decision is consequential, consult the transcript or ask the user.` : "") +
-    pairRecoveryBlock(room) +
-    `\nThe full transcript is at ${room.transcriptFile} if you need older context.`;
+    pairRecoveryBlock(room);
+  // No trailing transcript pointer: the composed contract two lines up already
+  // says "The full transcript is at <the same path>", and the [End of history]
+  // guard already directs the agent there for omitted decisions. The briefing
+  // was stating the identical path twice, ~90 bytes per session reset per seat.
 }
 
 // Deterministic pair state for a fresh session, composed at call time from
@@ -1841,6 +1864,21 @@ function loadRoom(name, seatChoice, create = false) {
       seat.cursor = maxEntryN;
       counterMigrated = true;
     }
+    // The opposite loss is far more expensive. A reset or restored state.json
+    // comes back with cursor 0, and the delta has no size cap — the seat's next
+    // turn would carry the ENTIRE history as one prompt (measured: ~3.1 MB for
+    // a 10k-entry room, ~775k input tokens, in a single invocation). Receipts
+    // are written to events.jsonl only after a completed delivery, so a seat's
+    // receipt high-water mark is a floor it genuinely heard; rebound to it.
+    // Deliberately not from lurkOutcomes or cancelledDeliveries — those record
+    // non-delivery.
+    const heard = receipts.reduce((m, r) =>
+      r.agent === id && Number.isSafeInteger(r.upTo) ? Math.max(m, r.upTo) : m, 0);
+    const floor = Math.min(heard, maxEntryN);
+    if ((Number.isSafeInteger(seat.cursor) ? seat.cursor : 0) < floor) {
+      seat.cursor = floor;
+      counterMigrated = true;
+    }
   }
   if (counterMigrated) writeJSON(stateFile, state);
 
@@ -1854,6 +1892,12 @@ function loadRoom(name, seatChoice, create = false) {
     cfgEpoch: {},
     busy: new Map(),      // agent -> { startedAt, runId }
     streams: new Map(),   // agent -> coalesced live-reply state, see streamText
+    // agent -> Set<resolve>. Hops, causal returns, catch-up returns and pair
+    // steps used to poll for a free seat on 150/500ms timers, adding up to half
+    // a second of dead air per contended handoff. They now sleep here and are
+    // woken by the events that can change the answer. Purely a wake-up: every
+    // waiter still re-validates its own predicate and deadline on wake.
+    seatWaiters: new Map(),
     // A deliberate hold on the queue, not a property of the conversation. In
     // memory beside `pending` for the same reason `pending` is: a restart has no
     // queue to hold, so a persisted flag would come back armed with nothing
@@ -2260,7 +2304,13 @@ function appendEntry(room, { kind, author, target = null, text, meta = null }, o
   const attachmentMd = transcriptAttachmentMarkdown(entry);
   if (opts.md !== false) fs.appendFileSync(room.transcriptFile,
     `${transcriptHeader(entry)}\n${text}${attachmentMd ? `\n\n${attachmentMd}` : ""}\n\n`, "utf8");
-  saveState(room);
+  // `state: false` is for activity entries only: their sole state delta is the
+  // nextTurn counter, which loadRoom already reconciles from events.jsonl, and
+  // they are the highest-frequency write in work mode — a 20-tool turn was
+  // rewriting state.json 20 extra times for a counter the log already proves.
+  // Every other entry kind keeps the save: their appendEntry is the commit
+  // point for cursors and session refs mutated just before the call.
+  if (opts.state !== false) saveState(room);
   broadcast(room, { type: "entry", entry });
   return entry;
 }
@@ -2664,11 +2714,26 @@ function buildDelta(room, agent, excludeTurn, entries = deltaEntries(room, agent
       ? ` · catch-up eligible root #${rootN}`
       : rootN ? ` · context-only root #${rootN}` : " · context only";
   };
-  for (const e of entries) {
+  for (let idx = 0; idx < entries.length; idx++) {
+    const e = entries[idx];
     if (e.kind === "activity") {
       // Activity entries predate root provenance, so an unrooted one is context
       // only in catch-up mode rather than an ambiguous invitation to react.
-      lines.push(relayMessage(`system activity (${e.author})${catchUpScopeFor(e)}`, e.text));
+      // A tool sequence within one provider turn is strictly consecutive in the
+      // entry log, and each line used to carry its own full speaker framing —
+      // 25 bytes of "system activity (codex): " per tool call, so a 50-tool
+      // work turn cost the peer's next delta ~1.1KB of pure repetition. A
+      // consecutive same-author, same-scope run now rides under one header,
+      // every label delivered verbatim as continuation lines — which also
+      // keeps the "| " anti-spoofing framing, because the grouping goes
+      // through relayMessage rather than string concatenation.
+      const scopeTag = catchUpScopeFor(e);
+      const rest = [];
+      while (idx + 1 < entries.length && entries[idx + 1].kind === "activity" &&
+          entries[idx + 1].author === e.author && catchUpScopeFor(entries[idx + 1]) === scopeTag) {
+        rest.push(entries[++idx].text);
+      }
+      lines.push(relayMessage(`system activity (${e.author})${scopeTag}`, e.text, rest));
     } else if (isCancellationNotice(e)) {
       lines.push(...cancellationNoticeLines(room, agent, e, explained));
     } else if (isSleepNotice(e)) {
@@ -2711,19 +2776,72 @@ function notePrefix(room) {
   return `[Current room note from the user — supersedes earlier room notes]\n${relayMessage("user room note", note)}\n[End current room note]\n\n`;
 }
 
+// ---- session-scoped static blocks ----
+// The lurk criteria, the hop ground rules, the @both discussion note and a long
+// room note are byte-identical on every turn of a resumed session — measured at
+// ~915B, ~340B, ~550B and framing+note respectively, re-sent dozens of times a
+// day on the highest-frequency invocation types. A session that has already
+// received one durably keeps its fingerprint (stamped through the same
+// success-only, sentinel-aware path as the contract), and while the fingerprint
+// matches, a one-line reminder that PRESERVES THE CONTROL TOKENS replaces the
+// full text. Fresh sessions, sentinel sessions, failed turns and any config
+// change that alters the composed text all fall back to the full block.
+const blockFp = (text) => crypto.createHash("sha256").update(text, "utf8").digest("base64url").slice(0, 12);
+// Reminders are not paraphrases: each keeps the exact phrases downstream code
+// and the fake CLI key on ("not addressed in this exchange", "addressed
+// directly by the other agent") and the exact [pass] contract, because a
+// degraded sentinel costs whole extra invocations — far more than the savings.
+const BLOCK_REMINDERS = {
+  lurk: "(You are lurking again — not addressed in this exchange. The same interjection criteria from your earlier briefing apply. If they do not call for an interjection, reply with exactly: [pass]. Do not add any other text.)",
+  hop: "(You were addressed directly by the other agent — the same peer-contribution ground rules from your earlier briefing apply. Answer the concrete point briefly; if you truly have nothing to add, reply with exactly: [pass])",
+  discussion: "(This message went to both agents — a table discussion, same ground rules as before: form your own view, do not modify files or run mutating commands this turn, and tag the other agent explicitly only if you want them to answer.)",
+};
+function staticBlock(room, agent, delivery, key, fullText, dedupAllowed = true) {
+  const fp = blockFp(fullText);
+  const seat = room.state.agents[agent];
+  const current = dedupAllowed && !delivery.fresh && delivery.sameSession &&
+    seat.staticBlocks && seat.staticBlocks[key] === fp;
+  // Recorded either way: a reminder is only ever chosen because the session
+  // already holds the full text, so the stamp stays valid.
+  if (delivery.blocksSent) delivery.blocksSent[key] = fp;
+  return current ? BLOCK_REMINDERS[key] : fullText;
+}
+// The room note has its own revision machinery, so its currency check is the
+// one composePromptDelivery already computes. Short notes are always sent in
+// full — the dedup is for long ones, where the cost is real, and a note the
+// user just wrote should stay in the model's face for a while regardless.
+function noteBlock(room, agent, delivery) {
+  const full = notePrefix(room);
+  if (!full || full.length < 340 || !delivery.noteCurrent || delivery.fresh) return full;
+  return "[The user's standing room note from your earlier briefing still applies — follow it.]\n\n";
+}
+// Whether a protected turn's read-only boundary is enforced by the provider
+// (flags/modes) or only by the prose of the discussion note. Where it is only
+// prose, the full note IS the enforcement and is never shortened.
+function discussionBlock(room, agent, delivery) {
+  return staticBlock(room, agent, delivery, "discussion", DISCUSSION_NOTE,
+    !!capsOf(room, agent).protectedTurnEnforced);
+}
+
 // `heldCount` marks a wake & deliver: this message was addressed to the seat
 // while it slept, and everything that arrived afterwards sits above it in the
 // delta at its real position. Said for a single held message too — staleness
 // comes from the elapsed gap, not the count, and sleep here is quota-shaped, so
 // it is measured in hours.
-function buildPrompt(room, deltaLines, userTurn, attachmentContext = null, heldCount = 0, askBlock = "") {
-  const head = notePrefix(room);
+function buildPrompt(room, deltaLines, userTurn, attachmentContext = null, heldCount = 0, askBlock = "", noteText = null, heldReason = "sleep") {
+  const head = noteText !== null ? noteText : notePrefix(room);
   const many = heldCount > 1;
+  // Two ways messages pile up for one seat: held while it slept (hours), or
+  // queued while it was busy (minutes). The framing differs — a busy burst is
+  // recent thoughts to answer together, not stale requests to triage.
+  const heldHow = heldReason === "busy"
+    ? `${many ? `${heldCount} messages were` : "This message was"} sent while you were busy`
+    : `${many ? `${heldCount} messages were` : "This message was"} held for you while you slept`;
   const held = heldCount >= 1
-    ? `[${many ? `${heldCount} messages were` : "This message was"} held for you while you slept` +
+    ? `[${heldHow}` +
       `${many ? "; the earlier ones appear above in the order they arrived" : ""}. ` +
       `Room activity after ${many ? "them" : "it"} may have superseded ${many ? "parts of them" : "it"}. ` +
-      `Address what is still relevant, and say so where later context overtook ${many ? "a request" : "it"}.]\n\n`
+      `Address ${many ? "all of them together in this one reply — everything" : "what is"} still relevant, and say so where later context overtook ${many ? "a request" : "it"}.]\n\n`
     : "";
   const current = relayMessage("user (to you)", userTurn.text,
     attachmentPromptLines(room, [userTurn], attachmentContext));
@@ -2890,7 +3008,7 @@ async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) 
   });
   const onStream = (text) => streamText(room, agent, text);
   const onActivity = (label) => {
-    if (gen === room.generation) appendEntry(room, { kind: "activity", author: agent, text: label }, { md: false });
+    if (gen === room.generation) appendEntry(room, { kind: "activity", author: agent, text: label }, { md: false, state: false });
   };
 
   let providerInputs = null;
@@ -2922,10 +3040,12 @@ async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) 
       ? askSourceBlock(room, agent, askSource, providerInputs,
         unseen.some((e) => e.n === askSource.n))
       : "";
-    const basePrompt = buildPrompt(room, delta, userTurn, providerInputs, opts.heldCount || 0, askBlock);
     // Scope, prompt note and Claude isolation are all derived together, per
     // attempt: the recovery retry below launches a second process that may
-    // start under a mode the first one never saw.
+    // start under a mode the first one never saw. The prompt is assembled per
+    // attempt too, because the static blocks (note, discussion) depend on the
+    // delivery — a retry runs against a fresh session and must get full text
+    // where the first attempt was allowed a reminder.
     const scopeNow = () => {
       const d = scope.now();
       return { discussion: d, readOnly: d };
@@ -2934,14 +3054,19 @@ async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) 
     // discussion note does: appended to the prompt, never baked into the
     // briefing, so it applies to exactly this turn.
     const noted = (p) => opts.instruction ? `${p}\n\n${opts.instruction}` : p;
+    const attemptPrompt = (dlv, ts) => {
+      const base = buildPrompt(room, delta, userTurn, providerInputs,
+        opts.heldCount || 0, askBlock, noteBlock(room, agent, dlv), opts.heldReason || "sleep");
+      return dlv.prefix + noted(ts.discussion
+        ? `${base}\n\n${discussionBlock(room, agent, dlv)}` : base);
+    };
     let turnScope = scopeNow();
-    let prompt = noted(turnScope.discussion ? `${basePrompt}\n\n${DISCUSSION_NOTE}` : basePrompt);
     retireOutdatedSession(room, agent);
     const isolated = isolatedProtectedTurn(room, agent, turnScope);
     const fresh = !room.state.agents[agent].sessionRef || isolated;
     let delivery = composePromptDelivery(room, agent, fresh, isolated);
     const briefing = delivery.briefing;
-    prompt = delivery.prefix + prompt;
+    let prompt = attemptPrompt(delivery, turnScope);
 
     let res;
     // Stamped per attempt, not per turn: a retry that starts after a settings
@@ -2960,9 +3085,13 @@ async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) 
         saveState(room);
         broadcast(room, { type: "status", agent, phase: "retrying", startedAt, runId: run.runId, ...runProvenance(room, run) });
         turnScope = scopeNow();
-        prompt = noted(turnScope.discussion ? `${basePrompt}\n\n${DISCUSSION_NOTE}` : basePrompt);
+        // Recomposed, not patched: the retry runs against a brand-new session,
+        // so fresh=true naturally yields contractDelivered, no expected
+        // identity, an empty prefix — and full static blocks where the first
+        // attempt may have sent reminders the dead session had earned.
         const b2 = resetRecoveryBriefing(room, agent);
-        delivery = { ...delivery, contractDelivered: true, expectedSessionRef: null };
+        delivery = composePromptDelivery(room, agent, true);
+        prompt = attemptPrompt(delivery, turnScope);
         epoch = seatEpoch(room, agent);
         res = await adapters[providerIdOf(room, agent)](room, {
         seat: agent,
@@ -3032,7 +3161,10 @@ async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) 
     // recorded for a provider failure: a failure already renders an error entry
     // with its own Retry button, while "stopped" is the vocabulary for a run the
     // user ended. A timeout is not `stopped` and correctly stays a failure.
-    if (e.stopped) recordInterrupted(room, agent, userTurn.n);
+    if (e.stopped) {
+      recordInterrupted(room, agent, userTurn.n);
+      if (opts.chain) opts.chain.stopped++;
+    }
     const icon = e.stopped ? "⏹" : "⚠";
     appendEntry(room, {
       kind: "system", author: "system",
@@ -3112,7 +3244,7 @@ async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE, opts = 
   });
   const onStream = (text) => streamText(room, agent, text);
   const onActivity = (label) => {
-    if (gen === room.generation) appendEntry(room, { kind: "activity", author: agent, text: label }, { md: false });
+    if (gen === room.generation) appendEntry(room, { kind: "activity", author: agent, text: label }, { md: false, state: false });
   };
 
   let providerInputs = null;
@@ -3143,17 +3275,26 @@ async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE, opts = 
         "Never interject solely about context-only traffic. Interject only if an eligible issue remains actionable now; " +
         `otherwise reply exactly [pass].)${priorRootBlock}`
       : "";
-    const head = `${notePrefix(room)}[Room activity since your last turn]\n${delta.join("\n")}\n[End of room activity]\n\n${lurkInstruction(room.cfg.agents[agent])}${catchUp}${workHint}`;
+    // The full lurk instruction is ~915 bytes and a pure function of the seat's
+    // lurkStyle/lurkPrompt — byte-identical on every listener turn of a resumed
+    // session, and the listener turn is the highest-frequency invocation Parley
+    // generates. A session that has durably received it gets the short reminder
+    // instead; any criteria change flips the fingerprint and re-sends in full.
+    const lurkFull = lurkInstruction(room.cfg.agents[agent]);
+    const attemptPrompt = (dlv, ts) => {
+      const head = `${noteBlock(room, agent, dlv)}[Room activity since your last turn]\n${delta.join("\n")}\n[End of room activity]\n\n` +
+        `${staticBlock(room, agent, dlv, "lurk", lurkFull)}${catchUp}${workHint}`;
+      return dlv.prefix + head + (ts.discussion ? `\n${discussionBlock(room, agent, dlv)}` : "");
+    };
     // Re-derived per attempt — see makeScope.
     const scopeNow = () => ({ discussion: scope.now(), readOnly: true });
     let turnScope = scopeNow();
-    let prompt = head + (turnScope.discussion ? `\n${DISCUSSION_NOTE}` : "");
     retireOutdatedSession(room, agent);
     const isolated = isolatedProtectedTurn(room, agent, turnScope);
     const fresh = !room.state.agents[agent].sessionRef || isolated;
     let delivery = composePromptDelivery(room, agent, fresh, isolated);
     const briefing = delivery.briefing;
-    prompt = delivery.prefix + prompt;
+    let prompt = attemptPrompt(delivery, turnScope);
 
     let res;
     let epoch = seatEpoch(room, agent); // per attempt — see applyAdapterSession
@@ -3167,9 +3308,11 @@ async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE, opts = 
         room.state.agents[agent].sessionRef = null;
         saveState(room);
         const b2 = resetRecoveryBriefing(room, agent);
-        delivery = { ...delivery, contractDelivered: true, expectedSessionRef: null };
+        // Recomposed so the fresh session gets the full lurk criteria and note,
+        // not the reminders the dead session had earned.
+        delivery = composePromptDelivery(room, agent, true);
         turnScope = scopeNow();
-        prompt = head + (turnScope.discussion ? `\n${DISCUSSION_NOTE}` : "");
+        prompt = attemptPrompt(delivery, turnScope);
         epoch = seatEpoch(room, agent);
         res = await adapters[providerIdOf(room, agent)](room, {
         seat: agent,
@@ -3347,12 +3490,38 @@ function findHopTarget(room, entry, opts = {}) {
 // and this wait has a deadline (seatTimeout + 5s) — so leaving it in would spend
 // that whole deadline and then record the request as `wait-aborted`, silently
 // losing an agent follow-up because the user pressed ⏸.
+// Wake everything waiting on this seat (or on any seat, for room-wide events
+// like a queue-pause flip). Resolving is all this does — the waiters' own loops
+// re-check seatBlocked/busy, generation, chains and deadlines.
+function wakeSeatWaiters(room, agent = null) {
+  const wake = (set) => { if (set) for (const resolve of [...set]) resolve(); };
+  if (agent !== null) wake(room.seatWaiters.get(agent));
+  else for (const set of room.seatWaiters.values()) wake(set);
+}
+
+// Sleep until something touches the seat, with a coarse fallback timer so a
+// missed wake degrades to the old polling cadence instead of a hang.
+function seatNap(room, agent, fallbackMs) {
+  return new Promise((resolve) => {
+    let set = room.seatWaiters.get(agent);
+    if (!set) { set = new Set(); room.seatWaiters.set(agent, set); }
+    let timer = null;
+    const settle = () => {
+      set.delete(settle);
+      if (timer) clearTimeout(timer);
+      resolve();
+    };
+    set.add(settle);
+    timer = setTimeout(settle, fallbackMs);
+  });
+}
+
 async function waitForHopSeat(room, agent, gen, chain) {
   const deadline = Date.now() + seatTimeout(room, agent) + 5000;
   while (seatBlocked(room, agent)) {
     if (gen !== room.generation || chainHalted(room, chain)) return false;
     if (Date.now() > deadline) return false;
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    await seatNap(room, agent, 1000);
   }
   return gen === room.generation && !chainHalted(room, chain);
 }
@@ -3367,7 +3536,11 @@ function chainStopped(room, stopAt) { return room.stopEpoch !== stopAt; }
 // the exchanges it actually named and must leave the rest — including a
 // replacement response that started a moment ago — completely alone.
 function newChain(room) {
-  return { stopAt: room.stopEpoch, halted: false, delivered: 0, cancelled: 0 };
+  // `stopped` counts deliveries that launched and were then killed by a
+  // per-seat Stop — which does not halt the chain (the other lane and the
+  // queue live on), but an exchange where EVERY delivery was stopped has no
+  // answer for a lurker to react to.
+  return { stopAt: room.stopEpoch, halted: false, delivered: 0, cancelled: 0, stopped: 0 };
 }
 function chainHalted(room, chain) {
   return !!chain.halted || room.stopEpoch !== chain.stopAt;
@@ -3437,7 +3610,7 @@ async function runHopTurn(room, agent, triggerEntry, rootN, scope = NO_SCOPE, op
   });
   const onStream = (text) => streamText(room, agent, text);
   const onActivity = (label) => {
-    if (gen === room.generation) appendEntry(room, { kind: "activity", author: agent, text: label }, { md: false });
+    if (gen === room.generation) appendEntry(room, { kind: "activity", author: agent, text: label }, { md: false, state: false });
   };
 
   let providerInputs = null;
@@ -3464,21 +3637,27 @@ async function runHopTurn(room, agent, triggerEntry, rootN, scope = NO_SCOPE, op
     const trigger = relayMessage(`${triggerEntry.author} (to you)`, triggerEntry.text);
     const rootAttachmentContext = rootAttachments.length
       ? `\n${relayMessage("Parley root attachment context", rootAttachments.join("\n"))}` : "";
-    const body = `${notePrefix(room)}${head}${trigger}${rootAttachmentContext}` +
-      `\n\n${opts.instruction || HOP_INSTRUCTION}`;
+    // A caller-supplied instruction (pair notes, sibling attention, budgeted
+    // hop text) is opaque and never shortened — the pair sentinels in
+    // particular fail closed, and a degraded instruction costs whole extra
+    // rounds. Only the bare hop ground rules are session-deduplicated.
+    const attemptPrompt = (dlv, ts) => {
+      const instruction = opts.instruction || staticBlock(room, agent, dlv, "hop", HOP_INSTRUCTION);
+      const body = `${noteBlock(room, agent, dlv)}${head}${trigger}${rootAttachmentContext}\n\n${instruction}`;
+      return dlv.prefix + body + (ts.discussion ? `\n${discussionBlock(room, agent, dlv)}` : "");
+    };
     // Re-derived per attempt — see makeScope.
     const scopeNow = () => {
       const d = scope.now();
       return { discussion: d, readOnly: !!(d || opts.readOnly) };
     };
     let turnScope = scopeNow();
-    let prompt = body + (turnScope.discussion ? `\n${DISCUSSION_NOTE}` : "");
     retireOutdatedSession(room, agent);
     const isolated = isolatedProtectedTurn(room, agent, turnScope);
     const fresh = !room.state.agents[agent].sessionRef || isolated;
     let delivery = composePromptDelivery(room, agent, fresh, isolated);
     const briefing = delivery.briefing;
-    prompt = delivery.prefix + prompt;
+    let prompt = attemptPrompt(delivery, turnScope);
 
     let res;
     let epoch = seatEpoch(room, agent); // per attempt — see applyAdapterSession
@@ -3497,9 +3676,11 @@ async function runHopTurn(room, agent, triggerEntry, rootN, scope = NO_SCOPE, op
         room.state.agents[agent].sessionRef = null;
         saveState(room);
         const b2 = resetRecoveryBriefing(room, agent);
-        delivery = { ...delivery, contractDelivered: true, expectedSessionRef: null };
+        // Recomposed: the fresh session gets full blocks, not the reminders the
+        // dead session had earned.
+        delivery = composePromptDelivery(room, agent, true);
         turnScope = scopeNow();
-        prompt = body + (turnScope.discussion ? `\n${DISCUSSION_NOTE}` : "");
+        prompt = attemptPrompt(delivery, turnScope);
         epoch = seatEpoch(room, agent);
         res = await adapters[providerIdOf(room, agent)](room, {
         seat: agent,
@@ -3710,7 +3891,10 @@ function makePairRetryable(room, rootN, pair) {
   // reconstruct that original turn from the transcript's authoritative entry.
   room.state.lastUser = {
     n: root.n,
-    text: root.text,
+    // A snapshot, not the record: the transcript entry holds the full text, and
+    // Retry only falls back to this copy for state written by old builds. The
+    // full copy meant a 200KB paste rode along in every state.json rewrite.
+    text: truncate(root.text, 2000),
     target: pair.worker,
     done: { [pair.worker]: false },
     pair: true,
@@ -3841,7 +4025,7 @@ async function awaitSeat(room, agent, pair, rootN, gen, step, chain) {
       drainLanes(room);
       return false;
     }
-    await new Promise((r) => setTimeout(r, 500));
+    await seatNap(room, agent, 2000);
   }
   if (gen !== room.generation) return false;
   if (chainHalted(room, chain)) return false;
@@ -4620,6 +4804,15 @@ function launchUserDispatch(room, userTurn, {
       for (const a of listeners) noteLurkOutcome(room, a, userTurn.n, "stopped");
       return;
     }
+    // A per-seat Stop kills the run without halting the chain, so the lurk
+    // pass used to fire anyway — a full extra invocation asking the listener
+    // to react to an exchange whose only answer the user visibly killed, at
+    // exactly the moment they are quota-anxious. Same treatment scope
+    // "active" already gets via chainHalted.
+    if (chain.delivered > 0 && chain.stopped >= chain.delivered) {
+      for (const a of listeners) noteLurkOutcome(room, a, userTurn.n, "stopped");
+      return;
+    }
     const localInitialReplies = results
       .filter((r) => r.status === "fulfilled" && isEntryResult(r.value))
       .map((r) => r.value)
@@ -4659,6 +4852,18 @@ function launchUserDispatch(room, userTurn, {
         return false;
       }
       if (seatOccupied(room, a)) {
+        const throughN = room.entries.length ? room.entries[room.entries.length - 1].n : userTurn.n;
+        queueLurkCatchUp(room, a, userTurn.n, throughN);
+        return false;
+      }
+      // A seat whose protected turns must run isolated (a bypass-enabled
+      // Claude seat) pays the worst possible price for live lurking: every
+      // overheard exchange discards its session, so the NEXT ordinary turn
+      // re-briefs from scratch — steady state is a full fresh briefing on
+      // every single invocation. Route its lurks through the catch-up
+      // machinery instead: N overheard exchanges coalesce into one isolated
+      // invocation, and the pending-attention semantics are identical.
+      if (isolatedProtectedTurn(room, a, { readOnly: true })) {
         const throughN = room.entries.length ? room.entries[room.entries.length - 1].n : userTurn.n;
         queueLurkCatchUp(room, a, userTurn.n, throughN);
         return false;
@@ -4873,7 +5078,7 @@ function handleUserMessage(room, rawText, targetSel, rawImages, rawFiles, rawRel
   }
   room.state.lastAddressed = effectiveTarget;
   room.state.lastUser = {
-    n: userTurn.n, text, target: effectiveTarget, done: {},
+    n: userTurn.n, text: truncate(text, 2000), target: effectiveTarget, done: {},
     pair: asPairTurn, discussion,
     ...(attachments.length ? { attachments } : {}),
   };
@@ -5565,11 +5770,49 @@ function deferDelivery(room, agent, userTurn, scope, dispatch = {}, opts = {}) {
     // chime in about it. The count is what lets the chain tell the difference.
     abandon() { if (dispatch.chain) dispatch.chain.cancelled++; settle(null); },
   };
+  // What the drain needs to merge a burst of same-seat deliveries into ONE
+  // provider turn. Only plain single-seat user messages are eligible: an @both
+  // half carries per-item deferred/discussion semantics, a redirect restages
+  // its quoted source from ITS root, and anything with per-item options
+  // (retry-of-discarded, head placement) has behavior tied to running alone.
+  if (userTurn.target === agent && !opts.head && !opts.onStart &&
+      !(opts.turnOptions && Object.keys(opts.turnOptions).length) &&
+      !(userTurn.meta && userTurn.meta.askFrom)) {
+    item.mergeInfo = { userTurn, scope, dispatch, settle };
+  }
   if (opts.head) enqueueAhead(room, item); else enqueue(room, item);
   // Normally the seat's own release drains this. If it is somehow already free,
   // drain anyway — a delivery nobody ever wakes would hang the chain.
   if (!room.busy.has(agent)) setImmediate(() => drainLanes(room));
   return done;
+}
+
+// One provider turn answering a whole burst. The newest message is the root —
+// exactly the shape Wake & deliver produces — with the earlier ones riding
+// above it in the delta at their real positions, flagged by the held-count
+// note so the model answers them all in this reply. Every merged dispatch's
+// chain and coordinator settles with the same result; the cursor gates in the
+// causal scheduler already make the extra coordinators no-ops (verified: they
+// cannot double-hop, and their lurk passes coalesce into one catch-up).
+function runMergedDeliveries(room, seat, batch) {
+  const newest = batch[batch.length - 1].mergeInfo;
+  for (const it of batch) {
+    const chain = it.mergeInfo.dispatch.chain;
+    if (chain) chain.delivered++;
+  }
+  runAgentTurn(room, seat, newest.userTurn, newest.scope, {
+    heldCount: batch.length, heldReason: "busy",
+    queueGroupId: newest.dispatch.queueGroupId || null,
+    chain: newest.dispatch.chain || null,
+  }).then((result) => {
+    // Delivered means delivered: an earlier message in the batch whose response
+    // the user had stopped is superseded by this completed run the same way a
+    // Retry supersedes it.
+    if (result) for (const it of batch) resolveInterrupted(room, seat, it.mergeInfo.userTurn.n);
+    for (const it of batch) it.mergeInfo.settle(result);
+  }, () => {
+    for (const it of batch) it.mergeInfo.settle(null);
+  });
 }
 
 // Start everything whose seats are free, oldest first. An item that must wait
@@ -5592,7 +5835,11 @@ function drainLanes(room) {
   if (held && !room.pending.some((p) => p.bypassPause)) return;
   const claimed = new Set([...room.busy.keys()]);
   const still = [], go = [], drop = [];
-  for (const item of room.pending) {
+  const absorbed = new Set();
+  const pending = room.pending;
+  for (let i = 0; i < pending.length; i++) {
+    const item = pending[i];
+    if (absorbed.has(item)) continue;
     // While held, everything except that one redirect keeps its exact place —
     // including its claim on the seat, so nothing behind it can overtake it.
     if (held && !item.bypassPause) {
@@ -5613,6 +5860,31 @@ function drainLanes(room) {
       continue;
     }
     item.agents.forEach((a) => claimed.add(a));
+    // A burst: the user sent several messages while this seat was busy, and
+    // each queued as its own delivery. Run serially, every one after the first
+    // is a near-pure re-ask — the previous turn's delta already delivered the
+    // later messages, so the seat answers K times about the same few thoughts,
+    // K provider invocations where one honest merged turn (the exact shape
+    // Wake & deliver already produces) answers them all. Absorb the CONTIGUOUS
+    // run of mergeable same-seat deliveries that are ready at THIS drain;
+    // stopping at the first non-mergeable same-seat item keeps arrival order,
+    // and items not yet ready keep their own cancel window untouched.
+    if (item.mergeInfo) {
+      const seat = item.agents[0];
+      const batch = [item];
+      for (let j = i + 1; j < pending.length; j++) {
+        const cand = pending[j];
+        if (absorbed.has(cand) || !cand.agents.includes(seat)) continue;
+        if (!cand.mergeInfo || cand.gen !== room.generation ||
+            chainStopped(room, cand.stopAt) || (held && !cand.bypassPause)) break;
+        batch.push(cand);
+        absorbed.add(cand);
+      }
+      if (batch.length > 1) {
+        go.push({ run: () => runMergedDeliveries(room, seat, batch) });
+        continue;
+      }
+    }
     go.push(item);
   }
   room.pending = still;
@@ -5621,12 +5893,16 @@ function drainLanes(room) {
   // Both runners mark the seat busy synchronously, so nothing can slip into the
   // gap between leaving this queue and the seat being claimed.
   for (const item of go) item.run();
+  // The pending list was rewritten, which can flip seatBlocked for waiters even
+  // when nothing started (an item was dropped as stale, say).
+  wakeSeatWaiters(room);
   scheduleCatchUps(room);
 }
 
 function releaseSeat(room, agent, run = null) {
   endStream(room, agent);
   room.busy.delete(agent);
+  wakeSeatWaiters(room, agent);
   if (run) endRun(room, agent, run); else room.runs.delete(agent);
   broadcast(room, { type: "status", agent, phase: "done", ...(run ? { runId: run.runId } : {}) });
   broadcast(room, { type: "room", room: roomSummary(room) });
@@ -5641,6 +5917,7 @@ function clearPending(room) {
   const held = room.pending;
   room.pending = [];
   for (const item of held) item.abandon();
+  wakeSeatWaiters(room);
 }
 
 // Drop still-pending deliveries without touching anything already running.
@@ -5658,6 +5935,7 @@ function cancelQueued(room, groupId = null) {
   room.pending = keep;
   broadcastQueue(room);
   for (const item of drop) item.abandon();
+  wakeSeatWaiters(room);
   // Cancelling stops the work, not the record: the message was accepted and
   // has been in the transcript since the user sent it, so it cannot quietly
   // vanish. Say what happened instead — both the user and the agents reading
@@ -5865,7 +6143,7 @@ function wakeAndDeliver(room, agent) {
   // path consults the scope would add up to a Retry running with write access.
   const boundary = rootDiscussion(room, root.n) || (root.target === "both" && room.cfg.mode === "work");
   room.state.lastUser = {
-    n: root.n, text: root.text || "", target: agent, done: {},
+    n: root.n, text: truncate(root.text || "", 2000), target: agent, done: {},
     pair: false, discussion: boundary,
     ...(root.meta && Array.isArray(root.meta.attachments) && root.meta.attachments.length
       ? { attachments: root.meta.attachments } : {}),
@@ -6126,7 +6404,7 @@ function handleAsk(room, opts = {}) {
   // lastAddressed would re-route their next untagged composer message.
   if (explicit) room.state.lastAddressed = target;
   room.state.lastUser = {
-    n: userTurn.n, text, target, done: {}, pair: false, discussion: false,
+    n: userTurn.n, text: truncate(text, 2000), target, done: {}, pair: false, discussion: false,
     ...(attachments.length ? { attachments } : {}),
   };
   saveState(room);
@@ -6926,6 +7204,9 @@ const server = http.createServer(async (req, res) => {
       // answer by clicking again.
       const changed = room.queuePaused !== body.paused;
       room.queuePaused = body.paused;
+      // The pause changes seatBlocked's answer in BOTH directions — a paused
+      // delivery stops blocking a hop, and a resumed one blocks it again.
+      if (changed) wakeSeatWaiters(room);
       broadcastQueue(room);
       broadcast(room, { type: "room", room: roomSummary(room) });
       // Releasing the hold starts everything whose seat is already free.
@@ -7170,6 +7451,23 @@ const server = http.createServer(async (req, res) => {
             ? `🔒 ${label} Full access disabled — ${label} starts a fresh session in ${now} mode.`
             : `${label} permission mode changed to ${now} — ${label} starts a fresh session so it applies cleanly.`;
         appendEntry(room, { kind: "system", author: "system", text });
+      }
+      // Full access plus lurking is the most expensive combination a seat can
+      // be in: every overheard exchange runs isolated and discards the session,
+      // so the next ordinary turn re-briefs from scratch. Parley now coalesces
+      // those lurks into catch-ups, but the user should still know what the
+      // combo costs — once, when it comes into being, not on every save.
+      for (const id of seatIds(room)) {
+        const full = capsOf(room, id).fullAccessScope;
+        if (!full || !capsOf(room, id).isolateProtectedTurn) continue;
+        const comboNow = nextScopes[id] === full && !!next.agents[id].lurk;
+        const comboBefore = prevScopes[id] === full && prevLurk[id];
+        if (comboNow && !comboBefore) {
+          appendEntry(room, {
+            kind: "system", author: "system",
+            text: `ℹ️ ${titleCase(id)} is lurking with Full access. Protected listener turns run isolated from its session, so its overheard reactions arrive as coalesced catch-ups rather than live interjections, and each one re-briefs from room history. Disable lurk or Full access on this seat if that cost isn't worth it.`,
+          });
+        }
       }
       // Settings show the new permission the moment it is saved, while the live
       // process is still running under the old one. Saying so is not a nicety:

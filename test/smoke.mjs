@@ -2440,10 +2440,14 @@ async function main() {
 
   await api("POST", "/api/rooms", { name: "lurk-closure-readonly" });
   await useFakes("lurk-closure-readonly");
+  // The lurker deliberately has NO bypass here: a Full-access lurker's
+  // reactions now arrive as coalesced catch-ups (tested separately below), so
+  // the live closure leg is exercised with an ordinary seat — where the
+  // read-only forcing is just as observable (plan vs the Work-room default).
   await cfg("lurk-closure-readonly", {
     mode: "work", hopBudget: 0,
     agents: {
-      claude: { lurk: true, permissionMode: "bypassPermissions" },
+      claude: { lurk: true },
       codex: { lurk: false },
     },
   });
@@ -2454,8 +2458,101 @@ async function main() {
   const readOnlyClosureArgv = argvFrom(readOnlyClosure);
   ok("the causal closure leg is forced read-only in a Work room",
     !!readOnlyClosure && hasArg(readOnlyClosureArgv, "--permission-mode", "plan") &&
-    !hasArg(readOnlyClosureArgv, "--permission-mode", "bypassPermissions"),
+    !hasArg(readOnlyClosureArgv, "--permission-mode", "acceptEdits"),
     JSON.stringify({ entry: readOnlyClosure, argv: readOnlyClosureArgv }));
+
+  // Full access + lurk used to run every overheard exchange as a live isolated
+  // turn that discarded the session — steady state was a full re-brief on every
+  // invocation of that seat. Those lurks now ride the catch-up machinery, so N
+  // overheard exchanges coalesce into one isolated invocation.
+  await api("POST", "/api/rooms", { name: "bypass-lurk" });
+  await useFakes("bypass-lurk");
+  await cfg("bypass-lurk", {
+    mode: "work", hopBudget: 0,
+    agents: { claude: { lurk: true, permissionMode: "bypassPermissions" }, codex: { lurk: false } },
+  });
+  await say("bypass-lurk", "@codex SAY:BL_ONE");
+  const blRoom = await idle("bypass-lurk", 30000);
+  ok("a Full-access lurker reacts via a coalesced catch-up, never a live isolated turn",
+    blRoom.receipts.some((r) => r.agent === "claude" && r.mode === "lurk-catchup") &&
+    !blRoom.receipts.some((r) => r.agent === "claude" && r.mode === "lurk"),
+    JSON.stringify(blRoom.receipts));
+
+  // A per-seat Stop kills the only answer an exchange had; the peer's lurk pass
+  // used to fire anyway — a full extra invocation asking it to react to a
+  // response the user visibly killed, at exactly the quota-anxious moment.
+  await api("POST", "/api/rooms", { name: "stoplurk" });
+  await useFakes("stoplurk");
+  await cfg("stoplurk", { agents: { claude: { lurk: false }, codex: { lurk: true } } });
+  await say("stoplurk", "@claude SLEEP:2500 SAY:STOPLURK_BODY");
+  await waitRoom("stoplurk", (x) => x.room.busy.includes("claude"), "claude running");
+  await api("POST", "/api/stop", { room: "stoplurk", scope: "seat", agent: "claude" });
+  const stopLurkRoom = await idle("stoplurk", 30000);
+  ok("a per-seat Stop suppresses the lurk pass on the killed exchange",
+    !stopLurkRoom.entries.some((e) => e.author === "codex") &&
+    stopLurkRoom.room.lurkOutcomes.some((o) => o.agent === "codex" && o.reason === "stopped"),
+    JSON.stringify({ entries: stopLurkRoom.entries.map((e) => [e.author, e.kind]), outcomes: stopLurkRoom.room.lurkOutcomes }));
+
+  // The ~915B lurk instruction is a pure function of lurkStyle/lurkPrompt and
+  // used to be re-sent verbatim on every listener turn of a resumed session —
+  // the highest-frequency invocation Parley generates. A session that has
+  // durably received it now gets a one-line reminder that keeps the control
+  // tokens; any criteria change or session reset re-sends the full text.
+  await api("POST", "/api/rooms", { name: "lurkdiet" });
+  await useFakes("lurkdiet");
+  await cfg("lurkdiet", { hopBudget: 0, agents: { claude: { lurk: false }, codex: { lurk: true } } });
+  await say("lurkdiet", "@claude SAY_LDONE LURKWHAT");
+  await idle("lurkdiet", 30000);
+  await say("lurkdiet", "@claude SAY_LDTWO LURKWHAT");
+  const lurkDietRoom = await idle("lurkdiet", 30000);
+  // Only the listener turns themselves: the chime spawns right-of-reply and
+  // closure legs that also echo (LURKWHAT rides in their deltas), and those
+  // carry different instructions by design.
+  const lurkEchoes = lurkDietRoom.entries.filter((e) =>
+    e.author === "codex" && e.meta && e.meta.lurk && /^LURKJSON /.test(e.text || ""));
+  // The second turn's delta QUOTES the first chime, which contains the full
+  // instruction as nested text — so the discriminator is the occurrence count,
+  // not mere presence: a live re-send adds one more on top of the quoted one.
+  const criteriaCount = (t) => ((t || "").match(/Interjection criteria:/g) || []).length;
+  ok("the first listener turn of a session carries the full lurk criteria",
+    lurkEchoes.length >= 2 && criteriaCount(lurkEchoes[0].text) === 1,
+    JSON.stringify(lurkEchoes.map((e) => e.text.slice(0, 120))));
+  ok("…and the next listener turn of the SAME session gets the reminder instead",
+    lurkEchoes.length >= 2 && criteriaCount(lurkEchoes[1].text) === 1 &&
+    /same interjection criteria from your earlier briefing/.test(lurkEchoes[1].text) &&
+    /reply with exactly: \[pass\]/.test(lurkEchoes[1].text),
+    (lurkEchoes[1] || { text: "" }).text.slice(-500));
+  // A criteria change must flip the fingerprint and re-send in full.
+  await cfg("lurkdiet", { agents: { codex: { lurkStyle: "vocal" } } });
+  await say("lurkdiet", "@claude SAY_LDTHREE LURKWHAT");
+  const lurkDietRoom2 = await idle("lurkdiet", 30000);
+  const lurkEchoes2 = lurkDietRoom2.entries.filter((e) =>
+    e.author === "codex" && e.meta && e.meta.lurk && /^LURKJSON /.test(e.text || ""));
+  // The vocal criteria text is distinct from balanced, so plain presence works
+  // here: the nested quotes carry only the OLD criteria.
+  ok("…while a criteria change re-sends the full instruction",
+    /sharp senior colleague/.test((lurkEchoes2[lurkEchoes2.length - 1] || { text: "" }).text),
+    (lurkEchoes2[lurkEchoes2.length - 1] || { text: "" }).text.slice(-300));
+
+  // The room note rode in EVERY prompt of every turn type. A long note on a
+  // session that durably received it is now a one-line reminder; short notes
+  // always go in full (salience is worth more than a few bytes).
+  await api("POST", "/api/rooms", { name: "notediet" });
+  await useFakes("notediet");
+  const longNote = "Project context: " + "the answer must stay grounded in the shipped API surface. ".repeat(8);
+  await cfg("notediet", { roomNote: longNote, agents: { claude: {}, codex: {} } });
+  await say("notediet", "@claude SAWWHAT");
+  await idle("notediet", 30000);
+  await say("notediet", "@claude SAWWHAT");
+  const noteDietRoom = await idle("notediet", 30000);
+  const noteEchoes = noteDietRoom.entries.filter((e) => e.author === "claude" && /^SAWJSON /.test(e.text || ""));
+  ok("a long room note goes in full on the session's first turn",
+    noteEchoes.length >= 2 && /Current room note from the user/.test(noteEchoes[0].text),
+    (noteEchoes[0] || { text: "" }).text.slice(0, 200));
+  ok("…and as a one-line reminder on the next turn of the same session",
+    noteEchoes.length >= 2 && !/Current room note from the user/.test(noteEchoes[1].text) &&
+    /standing room note from your earlier briefing still applies/.test(noteEchoes[1].text),
+    (noteEchoes[1] || { text: "" }).text.slice(0, 300));
 
   console.log("\ngeneral causal attention");
   await api("POST", "/api/rooms", { name: "causal-pass" });
@@ -5037,7 +5134,7 @@ async function main() {
   ok("the pause must be a boolean",
     (await api("POST", "/api/queue/pause", { room: "queuehold", paused: "yes" })).status === 400);
   await say("queuehold", "@claude SAY:HELD_ONE");
-  await say("queuehold", "@claude SAY:HELD_TWO");
+  await say("queuehold", "@claude SAWWHAT");
   const heldRoom = await waitRoom("queuehold", (d) => d.room.queued === 2, "both messages held");
   ok("a held queue accepts new work and starts none of it",
     heldRoom.room.queuePaused === true && heldRoom.room.busy.length === 0 &&
@@ -5046,11 +5143,26 @@ async function main() {
   const holdOff = await api("POST", "/api/queue/pause", { room: "queuehold", paused: false });
   ok("resuming reports the release", holdOff.status === 200 && holdOff.data.paused === false);
   d = await idle("queuehold");
-  const heldTexts = texts(d);
-  ok("…and everything held runs, in the order it was sent",
-    heldTexts.includes("HELD_ONE") && heldTexts.includes("HELD_TWO") &&
-    heldTexts.indexOf("HELD_ONE") < heldTexts.indexOf("HELD_TWO"),
-    JSON.stringify(heldTexts));
+  // A burst for one seat used to run K serial invocations, every one after the
+  // first a near-pure re-ask — the previous turn's delta had already delivered
+  // the later messages. The release now merges the ready burst into ONE turn,
+  // the exact shape Wake & deliver produces: newest message as root, earlier
+  // ones above it in the delta, and the held-count note asking for one reply
+  // covering all of them.
+  const burstReplies = d.entries.filter((e) => e.kind === "agent");
+  ok("…and releasing delivers the whole burst as one merged turn",
+    burstReplies.length === 1, JSON.stringify(burstReplies.map((e) => e.text.slice(0, 60))));
+  const burstDump = (burstReplies[0] || { text: "" }).text;
+  ok("…whose prompt carried the earlier message, in order, with the burst framing",
+    /^SAWJSON /.test(burstDump) &&
+    /2 messages were sent while you were busy/.test(burstDump) &&
+    burstDump.includes("SAY:HELD_ONE") &&
+    burstDump.indexOf("SAY:HELD_ONE") < burstDump.indexOf("sent while you were busy"),
+    burstDump.slice(0, 400));
+  const lastHeldUser = d.entries.filter((e) => e.kind === "user").pop();
+  ok("…and both messages are durably delivered to the seat",
+    d.room.agents.claude.cursor >= lastHeldUser.n,
+    JSON.stringify({ cursor: d.room.agents.claude.cursor, lastUser: lastHeldUser.n }));
 
   // Retrying a discarded delivery is an ordinary enqueue at the tail of the
   // seat's own lane: it needs no idle seat, and it cannot overtake newer work.
@@ -6675,6 +6787,37 @@ async function main() {
   const migratedOnDisk = JSON.parse(fs.readFileSync(path.join(legacyDir, "room.json"), "utf8"));
   ok("…and the migration is written once, not re-derived on every load",
     migratedOnDisk.agents.claude.provider === "claude", JSON.stringify(migratedOnDisk.agents.claude));
+
+  // A reset or restored state.json comes back with cursor 0, and the delta has
+  // no size cap — without the receipt rebound, the seat's next turn would carry
+  // the ENTIRE room history as one prompt. Receipts are written only after a
+  // completed delivery, so their high-water mark is a floor the seat genuinely
+  // heard, and events.jsonl (which holds them) survives what state.json doesn't.
+  const reboundDir = path.join(ROOT, "cursorrebound");
+  fs.mkdirSync(path.join(reboundDir, "workspace"), { recursive: true });
+  fs.writeFileSync(path.join(reboundDir, "room.json"), JSON.stringify({
+    defaultAgent: "claude", mode: "talk", hopBudget: 3, pairRounds: 0,
+    projectDir: null, roomNote: null, timeoutMs: 900000,
+    agents: { claude: { provider: "claude", command: FAKE }, codex: { provider: "codex", command: FAKE } },
+  }), "utf8");
+  fs.writeFileSync(path.join(reboundDir, "events.jsonl"), [
+    { n: 1, kind: "user", author: "user", target: "claude", ts: "2026-08-20T10:00:00", text: "one" },
+    { n: 2, kind: "agent", author: "claude", ts: "2026-08-20T10:00:05", text: "reply one" },
+    { kind: "receipt", agent: "claude", from: 0, upTo: 2, turn: 1, mode: "turn", spoke: true, ts: "2026-08-20T10:00:05" },
+    { n: 3, kind: "user", author: "user", target: "claude", ts: "2026-08-20T10:01:00", text: "two" },
+    { n: 4, kind: "agent", author: "claude", ts: "2026-08-20T10:01:05", text: "reply two" },
+    { kind: "receipt", agent: "claude", from: 2, upTo: 4, turn: 3, mode: "turn", spoke: true, ts: "2026-08-20T10:01:05" },
+    { kind: "receipt", agent: "codex", from: 0, upTo: 3, turn: 3, mode: "lurk", spoke: false, ts: "2026-08-20T10:01:06" },
+  ].map((e) => JSON.stringify(e)).join("\n") + "\n", "utf8");
+  // state.json corrupt: the crash-recovery path resets it to defaults (cursor 0)
+  fs.writeFileSync(path.join(reboundDir, "state.json"), "{ this is not json", "utf8");
+  await room("cursorrebound");
+  const reboundState = JSON.parse(fs.readFileSync(path.join(reboundDir, "state.json"), "utf8"));
+  ok("a reset cursor rebounds to the seat's receipt high-water mark, not zero",
+    reboundState.agents.claude.cursor === 4 && reboundState.agents.codex.cursor === 3,
+    JSON.stringify({ claude: reboundState.agents.claude.cursor, codex: reboundState.agents.codex.cursor }));
+  ok("…and the turn counter still reconciles from the log",
+    reboundState.nextTurn === 5, String(reboundState.nextTurn));
 
   await useFakes("swapped");
   await cfg("swapped", { roomNote: "The room codeword is TANGERINE." });
