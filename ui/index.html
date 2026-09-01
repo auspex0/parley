@@ -949,6 +949,7 @@ const state = {
   es: null,
   live: {},          // agent -> { el, mode:"think"|"stream", startedAt, text }
   streamTimer: {},   // agent -> throttle timer
+  statusSeq: {},     // agent -> count of status events heard (resync staleness check)
   queue: [],         // queue snapshot rows: one per still-pending delivery
   // agent -> is its live bubble considered on screen. Undefined until the
   // observer has measured it; only an explicit false shows the composer strip.
@@ -2336,6 +2337,24 @@ function notifyForEntry(e) {
 }
 
 // live (thinking / streaming) bubbles
+// What a run's phase reads as while it is live. Shared by the status stream
+// and the summary path, so a tab that loads mid-run gets the same words a tab
+// that watched the run start did.
+function liveLabelFor(phase) {
+  return ({
+    listening: "is listening 👂",
+    "catching-up": "is catching up 👂",
+    review: "is reviewing 🔁",
+    fix: "is fixing 🔁",
+    attention: "is receiving an answer ↩",
+    closure: "is closing the exchange 🔒",
+    hop: "is following up ⛓",
+    retrying: "is restoring its session",
+  })[phase];
+}
+function elapsedLabel(l) {
+  return "· " + Math.floor((Date.now() - l.startedAt) / 1000) + "s";
+}
 function ensureLive(agent, startedAt, label) {
   if (state.live[agent]) return state.live[agent];
   const div = document.createElement("div");
@@ -2504,7 +2523,7 @@ function clearLive() {
 // splicing text at the wrong offset. The finished entry is authoritative either
 // way, so the worst case is a briefly stale bubble.
 function liveStream(agent, msg) {
-  const l = ensureLive(agent);
+  const l = ensureLive(agent, (busyInfoFor(agent) || {}).startedAt);
   if (typeof msg.text === "string") l.text = msg.text;
   else if (msg.from === l.text.length) l.text += msg.delta;
   else return;
@@ -2525,7 +2544,7 @@ function liveStream(agent, msg) {
     // blank ~90% of the time during streaming — exactly when it matters.
     if (cur.mode !== "stream") {
       cur.mode = "stream";
-      cur.el.querySelector(".live-label").innerHTML = 'is replying <span class="elapsed"></span>';
+      cur.el.querySelector(".live-label").innerHTML = `is replying <span class="elapsed">${elapsedLabel(cur)}</span>`;
     }
     cur.el.querySelector(".bubble").innerHTML = renderMD(cur.text) + '<span class="caret"></span>';
     scrollBottom();
@@ -2561,7 +2580,7 @@ setInterval(() => {
   for (const a of Object.keys(state.live)) {
     const l = state.live[a];
     const el = l.el.querySelector(".elapsed");
-    if (el) el.textContent = "· " + Math.floor((Date.now() - l.startedAt) / 1000) + "s";
+    if (el) el.textContent = elapsedLabel(l);
   }
 }, 1000);
 
@@ -2850,6 +2869,10 @@ function applySummary(s) {
     ? `Linked project — open ${s.cfg.projectDir}`
     : `This room's own scratch folder — open ${s.workspace}`;
   renderGitId(s.git);
+  // A tab that loads mid-run knows each run's phase and start time from
+  // busyInfo; without them every bubble read "is thinking · 0s" — for a
+  // four-minute work turn, or a lurker that had been deciding for a while.
+  for (const b of s.busyInfo || []) ensureLive(b.agent, b.startedAt, liveLabelFor(b.phase));
   for (const a of s.busy) ensureLive(a);
   applyLiveRefs();
   renderBusyStrip();
@@ -3628,6 +3651,7 @@ function connect(resyncOnOpen = false) {
     }
     else if (msg.type === "lurk") whisper(msg.agent, msg.error, msg.hop, msg.skipped, msg.asleep, msg.held, msg.queued, msg.attention);
     else if (msg.type === "status") {
+      state.statusSeq[msg.agent] = (state.statusSeq[msg.agent] || 0) + 1;
       if (state.summary) { // keep busy state truthful between room summaries
         const b = state.summary.busy || [];
         if (msg.phase === "done") state.summary.busy = b.filter((x) => x !== msg.agent);
@@ -3652,22 +3676,15 @@ function connect(resyncOnOpen = false) {
         if (pill) pill.classList.toggle("busy", state.summary.busy.includes(msg.agent));
         updateBusyUI();
       }
-      if (msg.phase === "start") ensureLive(msg.agent, msg.startedAt);
-      else if (msg.phase === "listening") ensureLive(msg.agent, msg.startedAt, "is listening 👂");
-      else if (msg.phase === "catching-up") ensureLive(msg.agent, msg.startedAt, "is catching up 👂");
-      else if (msg.phase === "review") ensureLive(msg.agent, msg.startedAt, "is reviewing 🔁");
-      else if (msg.phase === "fix") ensureLive(msg.agent, msg.startedAt, "is fixing 🔁");
-      else if (msg.phase === "attention") ensureLive(msg.agent, msg.startedAt, "is receiving an answer ↩");
-      else if (msg.phase === "closure") ensureLive(msg.agent, msg.startedAt, "is closing the exchange 🔒");
-      else if (msg.phase === "hop") ensureLive(msg.agent, msg.startedAt, "is following up ⛓");
-      else if (msg.phase === "retrying") {
-        const l = ensureLive(msg.agent);
-        l.el.querySelector(".live-label").innerHTML = 'is restoring its session <span class="elapsed"></span>';
+      if (msg.phase === "retrying") {
+        const l = ensureLive(msg.agent, msg.startedAt);
+        l.el.querySelector(".live-label").innerHTML = `is restoring its session <span class="elapsed">${elapsedLabel(l)}</span>`;
         // The stream flush only rewrites the label on the think→stream
         // transition now, so reset the mode or the retry label would stick
         // through the restored session's whole streamed reply.
         l.mode = "think";
       } else if (msg.phase === "done") removeLive(msg.agent);
+      else ensureLive(msg.agent, msg.startedAt, liveLabelFor(msg.phase));
       applyLiveRef(msg.agent);
       renderBusyStrip();
       if ($("queueWrap").classList.contains("open")) renderQueuePop();
@@ -3783,6 +3800,7 @@ async function refreshAfterGap() {
   const room = state.room;
   const eventVersion = state.eventVersion;
   const resyncVersion = ++state.resyncVersion;
+  const seqBefore = { ...state.statusSeq };
   try {
     const data = await api("/api/room?name=" + encodeURIComponent(room));
     if (state.room !== room || state.resyncVersion !== resyncVersion) return;
@@ -3791,6 +3809,26 @@ async function refreshAfterGap() {
     state.entries = mergeEntries(data.entries, state.entries);
     state.receipts = mergeReceipts(data.receipts, state.receipts);
     renderAll({ stickToBottom: nearBottom(), anchor: true });
+    // A seat that finished during the outage: its reply is in the snapshot
+    // but its "done" was never heard, so its live bubble would sit right
+    // below its own finished reply — ticking "is replying · 4m32s" — until
+    // the next room summary, which arrives when the OTHER seat finishes,
+    // minutes later in a work turn. If no status event for that seat has
+    // arrived since this fetch began, the snapshot is the freshest word on it.
+    const busyNow = new Set(data.room.busy || []);
+    let pruned = false;
+    for (const a of Object.keys(state.live)) {
+      if (busyNow.has(a) || (state.statusSeq[a] || 0) !== (seqBefore[a] || 0)) continue;
+      removeLive(a);
+      pruned = true;
+      if (state.summary) {
+        state.summary.busy = (state.summary.busy || []).filter((x) => x !== a);
+        state.summary.busyInfo = (state.summary.busyInfo || []).filter((x) => x.agent !== a);
+      }
+      const pill = $("pill_" + a);
+      if (pill) pill.classList.remove("busy");
+    }
+    if (pruned) updateBusyUI();
     // Any SSE message is newer live evidence: status, queue, stream, whisper,
     // entry, receipt, reset and rename alike. Never replace it with this fetch.
     if (state.eventVersion === eventVersion) applySummary(data.room);

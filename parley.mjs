@@ -721,18 +721,20 @@ function stampPromptDelivery(room, agent, res, epoch, delivery) {
   // surfacing a resume error. If this invocation did not itself carry the
   // complete contract, do not bless that unexpected identity as briefed; the
   // identity mismatch makes the next turn send the full update.
-  if (delivery.expectedSessionRef && sessionRef !== delivery.expectedSessionRef &&
-      !delivery.contractDelivered) return;
+  const unexpected = !!delivery.expectedSessionRef && sessionRef !== delivery.expectedSessionRef;
+  if (unexpected && !delivery.contractDelivered) return;
   seat.promptSessionRef = String(sessionRef);
   seat.briefingVersion = delivery.version;
   seat.briefingFingerprint = delivery.fingerprint;
-  seat.roomNoteRevision = delivery.roomNoteRevision;
+  // An unexpected identity received only what went in full this turn: a note
+  // reminder or a block reminder was written for the session that died.
+  seat.roomNoteRevision = unexpected && !delivery.noteFull ? null : delivery.roomNoteRevision;
   // Static instruction blocks this session has durably received. A different
   // session identity starts a clean ledger — stamps from a dead session must
   // not vouch for a new one.
   seat.staticBlocks = {
-    ...((delivery.sameSession && seat.staticBlocks) || {}),
-    ...(delivery.blocksSent || {}),
+    ...((delivery.sameSession && !unexpected && seat.staticBlocks) || {}),
+    ...((unexpected ? delivery.blocksFull : delivery.blocksSent) || {}),
   };
 }
 
@@ -1105,7 +1107,7 @@ function composePromptDelivery(room, agent, fresh, isolated = false) {
     sameSession,
     fresh,
     noteCurrent,
-    blocksSent: {},
+    blocksSent: {}, blocksFull: {}, noteFull: false,
   };
 }
 
@@ -1963,9 +1965,16 @@ const STREAM_KEYFRAME_MS = 2000;
 function streamText(room, agent, text) {
   let st = room.streams.get(agent);
   if (!st) {
-    st = { text: "", sent: 0, timer: null, keyframeAt: 0, needKeyframe: true };
+    st = { text: "", sent: 0, sentText: "", timer: null, keyframeAt: 0, needKeyframe: true };
     room.streams.set(agent, st);
   }
+  // The delta path assumes the reply so far only ever grows at the end. Claude
+  // and Gemini honour that; Codex hands over each agent_message's OWN text, so
+  // a second message is a replacement, not an extension — and a delta cut at
+  // the old offset would splice "…config.rs now.ere is the summary" into the
+  // bubble until the entry replaced it. Anything that does not extend what was
+  // already sent is re-sent whole.
+  if (st.sent && (text.length < st.sent || !text.startsWith(st.sentText))) st.needKeyframe = true;
   st.text = text;
   if (!st.timer) st.timer = setTimeout(() => flushStream(room, agent), STREAM_FLUSH_MS);
 }
@@ -1979,12 +1988,14 @@ function flushStream(room, agent) {
     st.needKeyframe = false;
     st.keyframeAt = now;
     st.sent = st.text.length;
+    st.sentText = st.text;
     broadcast(room, { type: "stream", agent, text: st.text });
     return;
   }
   if (st.text.length <= st.sent) return;
   broadcast(room, { type: "stream", agent, from: st.sent, delta: st.text.slice(st.sent) });
   st.sent = st.text.length;
+  st.sentText = st.text;
 }
 
 // The run is over. Whatever was still coalescing is superseded by the durable
@@ -2795,6 +2806,8 @@ const BLOCK_REMINDERS = {
   lurk: "(You are lurking again — not addressed in this exchange. The same interjection criteria from your earlier briefing apply. If they do not call for an interjection, reply with exactly: [pass]. Do not add any other text.)",
   hop: "(You were addressed directly by the other agent — the same peer-contribution ground rules from your earlier briefing apply. Answer the concrete point briefly; if you truly have nothing to add, reply with exactly: [pass])",
   discussion: "(This message went to both agents — a table discussion, same ground rules as before: form your own view, do not modify files or run mutating commands this turn, and tag the other agent explicitly only if you want them to answer.)",
+  sibling: "(The other agent's reply from the same @both exchange arrived after your snapshot — same rules as before: respond only if it materially changes the result or asks something of you; otherwise reply exactly [pass].)",
+  lurkReturn: "(A lurking agent just chimed in — your one guaranteed right of reply, same rules as before: address only what materially needs a response; otherwise reply exactly [pass].)",
 };
 function staticBlock(room, agent, delivery, key, fullText, dedupAllowed = true) {
   const fp = blockFp(fullText);
@@ -2802,8 +2815,11 @@ function staticBlock(room, agent, delivery, key, fullText, dedupAllowed = true) 
   const current = dedupAllowed && !delivery.fresh && delivery.sameSession &&
     seat.staticBlocks && seat.staticBlocks[key] === fp;
   // Recorded either way: a reminder is only ever chosen because the session
-  // already holds the full text, so the stamp stays valid.
+  // already holds the full text, so the stamp stays valid — for THIS session.
+  // blocksFull is what the stamp falls back to if the provider answers from an
+  // unexpected new session, which never received the reminded text.
   if (delivery.blocksSent) delivery.blocksSent[key] = fp;
+  if (!current && delivery.blocksFull) delivery.blocksFull[key] = fp;
   return current ? BLOCK_REMINDERS[key] : fullText;
 }
 // The room note has its own revision machinery, so its currency check is the
@@ -2812,7 +2828,10 @@ function staticBlock(room, agent, delivery, key, fullText, dedupAllowed = true) 
 // user just wrote should stay in the model's face for a while regardless.
 function noteBlock(room, agent, delivery) {
   const full = notePrefix(room);
-  if (!full || full.length < 340 || !delivery.noteCurrent || delivery.fresh) return full;
+  if (!full || full.length < 340 || !delivery.noteCurrent || delivery.fresh) {
+    delivery.noteFull = true;
+    return full;
+  }
   return "[The user's standing room note from your earlier briefing still applies — follow it.]\n\n";
 }
 // Whether a protected turn's read-only boundary is enforced by the provider
@@ -3006,7 +3025,7 @@ async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) 
     phase: "start", startedAt, rootN: userTurn.n, sourceN: userTurn.n,
     queueGroupId: opts.queueGroupId || null, chain: opts.chain || null,
   });
-  const onStream = (text) => streamText(room, agent, text);
+  const onStream = (text) => { if (gen === room.generation) streamText(room, agent, text); };
   const onActivity = (label) => {
     if (gen === room.generation) appendEntry(room, { kind: "activity", author: agent, text: label }, { md: false, state: false });
   };
@@ -3117,7 +3136,7 @@ async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) 
     if (res.emptyReply) {
       appendReceipt(room, {
         agent, from: heardFrom, upTo: Math.max(userTurn.n, heardThrough),
-        turn: userTurn.n, mode: "turn",
+        turn: opts.receiptTurn || userTurn.n, mode: "turn",
       });
       saveState(room);
       return STEP_INCOMPLETE;
@@ -3138,7 +3157,7 @@ async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) 
     });
     appendReceipt(room, {
       agent, from: heardFrom, upTo: Math.max(userTurn.n, heardThrough),
-      turn: userTurn.n, mode: "turn",
+      turn: opts.receiptTurn || userTurn.n, mode: "turn",
     });
 
     // Some providers can fall back to a session ref that is not a durable
@@ -3163,6 +3182,7 @@ async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) 
     // user ended. A timeout is not `stopped` and correctly stays a failure.
     if (e.stopped) {
       recordInterrupted(room, agent, userTurn.n);
+      for (const n of opts.mergedNs || []) recordInterrupted(room, agent, n);
       if (opts.chain) opts.chain.stopped++;
     }
     const icon = e.stopped ? "⏹" : "⚠";
@@ -3242,7 +3262,7 @@ async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE, opts = 
     sourceN: (catchUpSource || ordinarySource || catchUpRootEntries[catchUpRootEntries.length - 1]).n,
     chain: opts.chain || null,
   });
-  const onStream = (text) => streamText(room, agent, text);
+  const onStream = (text) => { if (gen === room.generation) streamText(room, agent, text); };
   const onActivity = (label) => {
     if (gen === room.generation) appendEntry(room, { kind: "activity", author: agent, text: label }, { md: false, state: false });
   };
@@ -3307,6 +3327,7 @@ async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE, opts = 
       if (e.resumeFailed && !e.stopped) {
         room.state.agents[agent].sessionRef = null;
         saveState(room);
+        broadcast(room, { type: "status", agent, phase: "retrying", startedAt, runId: run.runId, ...runProvenance(room, run) });
         const b2 = resetRecoveryBriefing(room, agent);
         // Recomposed so the fresh session gets the full lurk criteria and note,
         // not the reminders the dead session had earned.
@@ -3400,19 +3421,30 @@ const LURK_RETURN_INSTRUCTION = "(A lurking agent just chimed in. You have one s
   "Parley returns that answer once to the lurker, then any further continuation is governed by the hop budget.)";
 const HOP_SAFETY_HOPS = Math.max(2, Number(process.env.PARLEY_HOP_SAFETY) || 25);
 
-function hopInstructionForBudget(policy, usedBefore) {
+// The countdown is the only part of a charged hop's instruction that changes
+// from leg to leg. It is kept apart from the static ground rules so those can
+// be session-deduplicated (see staticBlock) while the countdown always goes
+// in full. Returns null when there is nothing actionable to say.
+function hopBudgetNote(policy, usedBefore) {
   const ceiling = policy < 0 ? HOP_SAFETY_HOPS : policy;
   const remaining = Math.max(0, ceiling - usedBefore - 1);
-  const note = remaining === 0
+  // Unlimited exchanges need no countdown on ordinary legs; only surface the
+  // emergency edge when it becomes actionable.
+  if (policy < 0 && remaining > 0) return null;
+  return remaining === 0
     ? (policy < 0
       ? "This is the final handoff before Parley's emergency safety stop. Do not tag the other agent again; Parley will not deliver it in this exchange."
       : "This is the final agent-to-agent handoff allowed for this user message. Do not tag the other agent unless a new deliberate call is essential; Parley will not deliver it in this exchange.")
     : `${remaining} agent-to-agent handoff${remaining === 1 ? "" : "s"} remain after this turn.`;
-  // Unlimited exchanges need no countdown on ordinary legs; only surface the
-  // emergency edge when it becomes actionable.
-  return policy < 0 && remaining > 0 ? HOP_INSTRUCTION
-    : `${HOP_INSTRUCTION}\n\n(Hop budget: ${note})`;
 }
+// The static instruction each causal leg kind carries, by the key runHopTurn
+// deduplicates it under. Continuations are not deduplicated: they are rare and
+// their text is short enough that a reminder would save almost nothing.
+const LEG_INSTRUCTIONS = {
+  hop: HOP_INSTRUCTION,
+  sibling: SIBLING_ATTENTION_INSTRUCTION,
+  lurkReturn: LURK_RETURN_INSTRUCTION,
+};
 
 const escRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 function seatAlt(room) { return seatIds(room).map(escRe).join("|"); }
@@ -3608,7 +3640,7 @@ async function runHopTurn(room, agent, triggerEntry, rootN, scope = NO_SCOPE, op
     sourceN: triggerEntry.n,
     chain: opts.chain || null,
   });
-  const onStream = (text) => streamText(room, agent, text);
+  const onStream = (text) => { if (gen === room.generation) streamText(room, agent, text); };
   const onActivity = (label) => {
     if (gen === room.generation) appendEntry(room, { kind: "activity", author: agent, text: label }, { md: false, state: false });
   };
@@ -3637,12 +3669,17 @@ async function runHopTurn(room, agent, triggerEntry, rootN, scope = NO_SCOPE, op
     const trigger = relayMessage(`${triggerEntry.author} (to you)`, triggerEntry.text);
     const rootAttachmentContext = rootAttachments.length
       ? `\n${relayMessage("Parley root attachment context", rootAttachments.join("\n"))}` : "";
-    // A caller-supplied instruction (pair notes, sibling attention, budgeted
-    // hop text) is opaque and never shortened — the pair sentinels in
-    // particular fail closed, and a degraded instruction costs whole extra
-    // rounds. Only the bare hop ground rules are session-deduplicated.
+    // A caller-supplied composed instruction (pair notes, continuations) is
+    // opaque and never shortened — the pair sentinels in particular fail
+    // closed, and a degraded instruction costs whole extra rounds. Legs named
+    // by key carry static ground rules that are session-deduplicated, with the
+    // per-leg budget countdown always appended in full.
+    const legKey = opts.instruction ? null : (opts.instructionKey || "hop");
     const attemptPrompt = (dlv, ts) => {
-      const instruction = opts.instruction || staticBlock(room, agent, dlv, "hop", HOP_INSTRUCTION);
+      const instruction = legKey
+        ? staticBlock(room, agent, dlv, legKey, LEG_INSTRUCTIONS[legKey]) +
+          (opts.budgetNote ? `\n\n(Hop budget: ${opts.budgetNote})` : "")
+        : opts.instruction;
       const body = `${noteBlock(room, agent, dlv)}${head}${trigger}${rootAttachmentContext}\n\n${instruction}`;
       return dlv.prefix + body + (ts.discussion ? `\n${discussionBlock(room, agent, dlv)}` : "");
     };
@@ -3675,6 +3712,7 @@ async function runHopTurn(room, agent, triggerEntry, rootN, scope = NO_SCOPE, op
       if (e.resumeFailed && !e.stopped) {
         room.state.agents[agent].sessionRef = null;
         saveState(room);
+        broadcast(room, { type: "status", agent, phase: "retrying", startedAt, runId: run.runId, ...runProvenance(room, run) });
         const b2 = resetRecoveryBriefing(room, agent);
         // Recomposed: the fresh session gets full blocks, not the reminders the
         // dead session had earned.
@@ -4474,18 +4512,20 @@ function createCausalCoordinator(room, {
         continue;
       }
 
-      const instruction = request.charged
+      // Charged legs carry the budget countdown alongside their ground rules;
+      // the rules themselves are static per kind and deduplicated per session
+      // inside runHopTurn. A continuation keeps its full composed text.
+      const legOpts = request.charged
         ? (request.kind === "continuation"
-          ? causalContinuationInstruction(configuredBudget, hops)
-          : hopInstructionForBudget(configuredBudget, hops))
-        : request.kind === "sibling" ? SIBLING_ATTENTION_INSTRUCTION
-          : LURK_RETURN_INSTRUCTION;
+          ? { instruction: causalContinuationInstruction(configuredBudget, hops) }
+          : { instructionKey: "hop", budgetNote: hopBudgetNote(configuredBudget, hops) })
+        : { instructionKey: request.kind === "sibling" ? "sibling" : "lurkReturn" };
       const reply = await runHopTurn(room, target, trigger, userTurn.n, scope, {
         chain,
         phase: request.charged ? "hop" : "attention",
         receiptMode: request.charged ? "hop" : "attention",
         causalDelivery: request.kind === "continuation",
-        instruction,
+        ...legOpts,
         signalFailure: true,
         meta: request.charged ? null : {
           hop: false,
@@ -4663,6 +4703,7 @@ function startRecoveredDelivery(room, userTurn, targets, scope, turnOptions = nu
       if (gen !== room.generation) return;
       await withRootRelay(room, userTurn.n, async () => {
         if (gen !== room.generation) return;
+        if (mergedAway(results)) return;
         // Every re-delivery this retry owed was discarded again before it ran.
         // There is no exchange to continue and no lurk check to run.
         if (chain.cancelled && !chain.delivered) {
@@ -4792,6 +4833,9 @@ function launchUserDispatch(room, userTurn, {
     if (gen !== room.generation) return;
     await withRootRelay(room, userTurn.n, async () => {
     if (gen !== room.generation) return;
+    // Merged into a later message's turn: that root's coordinator owns the
+    // exchange from here — its hops, its provenance and its single lurk pass.
+    if (mergedAway(results)) return;
     // Every delivery this message owed was cancelled before it ran, so there is
     // no exchange to continue: no hops, and no lurk check either — a lurker
     // chiming in about a message the user cancelled is the whole bug. A split
@@ -5263,9 +5307,19 @@ const TERMINAL_CAUSAL_ANSWER_REQUESTED_INSTRUCTION = "(This is a causal answer d
 function isEntryResult(value) {
   return !!value && typeof value === "object" && Number.isFinite(Number(value.n));
 }
+// Settled into an older message's coordinator when its delivery was merged
+// into a later message's turn. That later root's coordinator owns the whole
+// exchange — hops, provenance, the lurk pass — so the older one has nothing
+// left to do: running its own lurk pass would be a second invocation about the
+// same reply, and on Stop it would fire on an exchange the user just killed.
+const MERGED_INTO_LATER = Symbol("merged-into-later");
+function mergedAway(results) {
+  return results.some((r) => r.status === "fulfilled" && r.value === MERGED_INTO_LATER);
+}
 
 function causalContinuationInstruction(policy, usedBefore) {
-  return hopInstructionForBudget(policy, usedBefore).replace(HOP_INSTRUCTION, CAUSAL_CONTINUATION_INSTRUCTION);
+  const note = hopBudgetNote(policy, usedBefore);
+  return note ? `${CAUSAL_CONTINUATION_INSTRUCTION}\n\n(Hop budget: ${note})` : CAUSAL_CONTINUATION_INSTRUCTION;
 }
 
 function causalAnswerRange(reply) {
@@ -5796,12 +5850,18 @@ function deferDelivery(room, agent, userTurn, scope, dispatch = {}, opts = {}) {
 // cannot double-hop, and their lurk passes coalesce into one catch-up).
 function runMergedDeliveries(room, seat, batch) {
   const newest = batch[batch.length - 1].mergeInfo;
+  const older = batch.slice(0, -1);
   for (const it of batch) {
     const chain = it.mergeInfo.dispatch.chain;
     if (chain) chain.delivered++;
   }
   runAgentTurn(room, seat, newest.userTurn, newest.scope, {
     heldCount: batch.length, heldReason: "busy",
+    // The older members share this run's fate: amber on Stop, and a receipt
+    // whose turn is the oldest of them, so the UI reads every member as
+    // answered in this turn rather than "caught up later".
+    mergedNs: older.map((it) => it.mergeInfo.userTurn.n),
+    receiptTurn: batch[0].mergeInfo.userTurn.n,
     queueGroupId: newest.dispatch.queueGroupId || null,
     chain: newest.dispatch.chain || null,
   }).then((result) => {
@@ -5809,9 +5869,11 @@ function runMergedDeliveries(room, seat, batch) {
     // the user had stopped is superseded by this completed run the same way a
     // Retry supersedes it.
     if (result) for (const it of batch) resolveInterrupted(room, seat, it.mergeInfo.userTurn.n);
-    for (const it of batch) it.mergeInfo.settle(result);
+    for (const it of older) it.mergeInfo.settle(MERGED_INTO_LATER);
+    newest.settle(result);
   }, () => {
-    for (const it of batch) it.mergeInfo.settle(null);
+    for (const it of older) it.mergeInfo.settle(MERGED_INTO_LATER);
+    newest.settle(null);
   });
 }
 
@@ -5832,7 +5894,9 @@ function drainLanes(room) {
   // A stop-and-ask redirect is the single exception: the user just asked for
   // that one, now. It is let through without releasing anything behind it.
   const held = !!room.queuePaused;
-  if (held && !room.pending.some((p) => p.bypassPause)) return;
+  // Held with nothing let through: waiters still re-check (a hop's seatBlocked
+  // is paused-aware, so a held queue does not block agent follow-ups).
+  if (held && !room.pending.some((p) => p.bypassPause)) { wakeSeatWaiters(room); return; }
   const claimed = new Set([...room.busy.keys()]);
   const still = [], go = [], drop = [];
   const absorbed = new Set();
@@ -5869,13 +5933,20 @@ function drainLanes(room) {
     // run of mergeable same-seat deliveries that are ready at THIS drain;
     // stopping at the first non-mergeable same-seat item keeps arrival order,
     // and items not yet ready keep their own cancel window untouched.
-    if (item.mergeInfo) {
+    const seatCursor = item.mergeInfo
+      ? (Number(room.state.agents[item.agents[0]] && room.state.agents[item.agents[0]].cursor) || 0) : 0;
+    // Only messages the seat has NOT already read can ride in a delta: a
+    // message at or under the cursor (a hop ran on this seat while the queue
+    // was paused and its receipt covered the message) would silently vanish
+    // from the merged prompt while the held note still claimed it was above.
+    // It runs alone, where it is the current message regardless of the cursor.
+    if (item.mergeInfo && item.mergeInfo.userTurn.n > seatCursor) {
       const seat = item.agents[0];
       const batch = [item];
       for (let j = i + 1; j < pending.length; j++) {
         const cand = pending[j];
         if (absorbed.has(cand) || !cand.agents.includes(seat)) continue;
-        if (!cand.mergeInfo || cand.gen !== room.generation ||
+        if (!cand.mergeInfo || cand.mergeInfo.userTurn.n <= seatCursor || cand.gen !== room.generation ||
             chainStopped(room, cand.stopAt) || (held && !cand.bypassPause)) break;
         batch.push(cand);
         absorbed.add(cand);
@@ -5902,13 +5973,17 @@ function drainLanes(room) {
 function releaseSeat(room, agent, run = null) {
   endStream(room, agent);
   room.busy.delete(agent);
-  wakeSeatWaiters(room, agent);
   if (run) endRun(room, agent, run); else room.runs.delete(agent);
   broadcast(room, { type: "status", agent, phase: "done", ...(run ? { runId: run.runId } : {}) });
   broadcast(room, { type: "room", room: roomSummary(room) });
   // Deferred by a tick so the turn that just ended finishes unwinding first.
+  // Seat waiters (hops, pair steps) are woken only AFTER the drain has had its
+  // pass: the user's queued aside claims the seat first, exactly the lane
+  // priority the queue promises. Waking them here, synchronously, let a pair
+  // step's microtask beat the deferred drain and jump the user's message.
   setImmediate(() => {
     if (room.pending.length) drainLanes(room);
+    else wakeSeatWaiters(room, agent);
     scheduleCatchUps(room);
   });
 }
@@ -6771,6 +6846,9 @@ function handleNewConversation(room) {
     }
   }
   room.generation++;
+  // The killed processes' stdout can still drain for a moment after SIGKILL;
+  // their coalescing buffers belong to the archived conversation.
+  for (const a of seatIds(room)) endStream(room, a);
   // Sleep is a fact about the seat's provider account, not about the
   // conversation, so archiving does not quietly make a rate-limited seat
   // invocable again. Everything else — cursors, sessions, pair — starts fresh.
@@ -7086,6 +7164,13 @@ const server = http.createServer(async (req, res) => {
       res.write(":connected\n\n");
       room.clients.add(res);
       markStreamsForKeyframe(room);
+      // The next flush will be a keyframe for everyone, but that flush only
+      // happens on the provider's next token — which may be minutes away
+      // (Claude inside a tool call) or never (Gemini does not stream). A tab
+      // that reloads mid-reply should see the text so far now, not dots.
+      for (const [agent, st] of room.streams) {
+        if (st.text) { try { res.write(`data: ${JSON.stringify({ type: "stream", agent, text: st.text })}\n\n`); } catch { /* closed */ } }
+      }
       scheduleCatchUps(room);
       const ping = setInterval(() => { try { res.write(":ping\n\n"); } catch { /* closed */ } }, 20000);
       req.on("close", () => { clearInterval(ping); room.clients.delete(res); });

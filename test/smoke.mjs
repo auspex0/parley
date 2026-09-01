@@ -2534,6 +2534,31 @@ async function main() {
     /sharp senior colleague/.test((lurkEchoes2[lurkEchoes2.length - 1] || { text: "" }).text),
     (lurkEchoes2[lurkEchoes2.length - 1] || { text: "" }).text.slice(-300));
 
+  // Charged hop legs carried the ground rules AND the budget countdown as one
+  // composed string, so nothing on the @both+hops path was deduplicated. The
+  // rules are now a session-deduplicated block; the countdown always goes in
+  // full because it changes every leg.
+  await api("POST", "/api/rooms", { name: "hopdiet" });
+  await useFakes("hopdiet");
+  await cfg("hopdiet", { hopBudget: 3, agents: { claude: { lurk: false }, codex: { lurk: false } } });
+  await say("hopdiet", "@claude TAG:codex HOPWHAT");
+  await idle("hopdiet", 30000);
+  await say("hopdiet", "@claude TAG:codex HOPWHAT");
+  const hopDietRoom = await idle("hopdiet", 30000);
+  // Only the charged hop legs proper: a continuation leg (the fake echoes those
+  // too once the phrase rides in its delta) carries a composed instruction that
+  // is deliberately never deduplicated.
+  const hopDumps = hopDietRoom.entries.filter((e) => e.author === "codex" && e.meta && e.meta.hop &&
+    /^HOPJSON /.test(e.text || "") && !/new continuation under/.test(e.text.slice(-600)));
+  ok("the first hop leg of a session carries the full ground rules plus the budget countdown",
+    hopDumps.length >= 2 && /peer contribution, not an instruction/.test(hopDumps[0].text) &&
+    /\(Hop budget: /.test(hopDumps[0].text) && !/same peer-contribution ground rules/.test(hopDumps[0].text),
+    (hopDumps[0] || { text: "" }).text.slice(-400));
+  ok("…and a later hop leg in the same session gets the reminder, still with its own countdown",
+    hopDumps.length >= 2 && /same peer-contribution ground rules/.test(hopDumps[1].text) &&
+    /\(Hop budget: /.test(hopDumps[1].text),
+    (hopDumps[1] || { text: "" }).text.slice(-400));
+
   // The room note rode in EVERY prompt of every turn type. A long note on a
   // session that durably received it is now a one-line reminder; short notes
   // always go in full (salience is worth more than a few bytes).
@@ -2553,6 +2578,63 @@ async function main() {
     noteEchoes.length >= 2 && !/Current room note from the user/.test(noteEchoes[1].text) &&
     /standing room note from your earlier briefing still applies/.test(noteEchoes[1].text),
     (noteEchoes[1] || { text: "" }).text.slice(0, 300));
+
+  // Stop on a MERGED turn. The older messages' coordinators used to carry on
+  // as if their delivery had succeeded: only the newest chain saw the stop,
+  // so the peer's lurk pass fired on the killed exchange and only the newest
+  // message went amber although all of them were in the killed prompt.
+  await api("POST", "/api/rooms", { name: "mergedstop" });
+  await useFakes("mergedstop");
+  await cfg("mergedstop", { agents: { claude: { lurk: false }, codex: { lurk: true } } });
+  await say("mergedstop", "@claude SLEEP:1500 SAY:MS_BLOCK");
+  await waitRoom("mergedstop", (x) => x.room.busy.includes("claude"), "blocker running");
+  await say("mergedstop", "@claude SAY:MS_ONE");
+  await say("mergedstop", "@claude SLEEP:4000 SAY:MS_TWO");
+  await waitRoom("mergedstop", (x) => x.entries.some((e) => e.author === "claude" && /MS_BLOCK/.test(e.text)) &&
+    x.room.busy.includes("claude") && !x.room.queued, "merged turn running", 20000);
+  await api("POST", "/api/stop", { room: "mergedstop", scope: "seat", agent: "claude" });
+  const mergedStopRoom = await idle("mergedstop", 30000);
+  const msUsers = mergedStopRoom.entries.filter((e) => e.kind === "user" && /MS_(ONE|TWO)/.test(e.text)).map((e) => e.n);
+  ok("stopping a merged turn stops the whole exchange: no lurk pass, every merged message amber",
+    !mergedStopRoom.entries.some((e) => e.author === "codex") &&
+    msUsers.length === 2 && msUsers.every((n) => (mergedStopRoom.room.interruptedResponses[String(n)] || []).includes("claude")),
+    JSON.stringify({ entries: mergedStopRoom.entries.map((e) => [e.n, e.author, (e.text || "").slice(0, 40)]),
+      interrupted: mergedStopRoom.room.interruptedResponses, outcomes: mergedStopRoom.room.lurkOutcomes }));
+
+  // A tab that connects mid-reply gets the reply-so-far at once: the first
+  // stream event it sees is a full-text keyframe, never an offset delta it
+  // cannot apply, and it does not have to wait for the provider's next token.
+  await api("POST", "/api/rooms", { name: "midstream" });
+  await useFakes("midstream");
+  await cfg("midstream", { agents: { claude: {}, codex: {} } });
+  // SAY: takes one token, and the fake streams 4 characters every 120ms — a
+  // long single token keeps the reply live for several seconds.
+  await say("midstream", "@claude STREAM SAY:" + "midstream_piece_".repeat(20));
+  await waitRoom("midstream", (x) => x.room.busy.includes("claude"), "streaming");
+  await new Promise((r) => setTimeout(r, 250));
+  // EventSource cannot send headers, so this route authenticates by query.
+  const midRes = await fetch(base + "/api/events?room=midstream&token=" + encodeURIComponent(TOKEN) +
+    "&protocol=" + encodeURIComponent(RUNTIME_PROTOCOL));
+  const midReader = midRes.body.getReader();
+  let midBuf = "", midFirst = null;
+  // The fake's pre-reply delay can leave the connection silent for a moment
+  // between ":connected" and the first flush; a per-read timeout shorter than
+  // that gap would abandon the stream before any event arrived.
+  const midUntil = Date.now() + 4000;
+  while (!midFirst && Date.now() < midUntil) {
+    const chunk = await Promise.race([midReader.read(), new Promise((r) => setTimeout(() => r({ done: true }), 1500))]);
+    if (chunk.done) break;
+    midBuf += Buffer.from(chunk.value).toString("utf8");
+    for (const line of midBuf.split("\n")) {
+      if (!line.startsWith("data: ")) continue;
+      try { const m = JSON.parse(line.slice(6)); if (m.type === "stream") { midFirst = m; break; } } catch { /* partial */ }
+    }
+  }
+  try { await midReader.cancel(); } catch { /* closed */ }
+  ok("a tab joining mid-reply receives the text so far as a keyframe first",
+    !!midFirst && typeof midFirst.text === "string" && midFirst.text.length > 0 && midFirst.delta === undefined,
+    JSON.stringify(midFirst));
+  await idle("midstream", 30000);
 
   console.log("\ngeneral causal attention");
   await api("POST", "/api/rooms", { name: "causal-pass" });

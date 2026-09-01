@@ -35,6 +35,7 @@
  *   WRITE:<file>    create the file in cwd and report a tool use (work mode)
  *   CHIME           when lurking, interject instead of passing
  *   LURKWHAT        when lurking, return the complete listener prompt as JSON
+ *   HOPWHAT         when addressed by the other agent, return the complete hop prompt as JSON
  *   CAUSALPASS      call the peer, whose answer is returned to a passing caller
  *   CAUSALSPEAK     call the peer, then speak once during the free answer return
  *   CAUSALTAG       as CAUSALPASS, but the peer explicitly tags its caller
@@ -250,6 +251,8 @@ if (isReview) {
   reply = has("SHOWCASE", prompt)
     ? "Added the redaction reminder and reran the release checks."
     : "Fixed as requested." + (has("NEVERHAPPY", prompt) ? " NEVERHAPPY" : "");
+} else if (isHop && has("HOPWHAT", prompt)) {
+  reply = "HOPJSON " + JSON.stringify(String(prompt || "").replaceAll("@", "\\u0040"));
 } else if (isLurk) {
   if (has("LURKVERSION", prompt)) {
     reply = prompt.startsWith("[Update to your standing instructions") ? "LURKVERSIONYES" : "LURKVERSIONNO";
