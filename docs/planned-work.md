@@ -8,19 +8,19 @@
 > module boundaries remain open; the only item from the audit's plan not built
 > is the just-in-time permission bridge (see the note at the end of Package 9).
 >
-> **2026-09-02.** Package 14 (retry scoping, cap finalization, continuation-budget
-> honesty) is settled and fully specified below as a handoff; it builds on branch
-> `perf-and-token-diet`, not `main`.
+> **2026-09-04.** Package 14 is superseded by the user handoff below: reliability is
+> implementation-ready; configurable accounting remains a proposal awaiting final decisions.
+> `perf-and-token-diet` was merged. Recheck current `main` and work on the requested new branch.
 
-Everything here was settled or recorded in room conversation between 2026-08-06 and
-2026-08-10. It is written down because the design lives across hundreds of chat messages
-and a bounded recovery excerpt does not survive a session reset. Packages still carrying
-a **settled** or **noted** status have not been implemented; a package marked **built**
-has, and says where its code lives.
+Packages 1–13 retain historical design notes recorded from August room conversations.
+Their original status labels and line references are historical, not a current work queue.
+The shipped-status notice above and Package 14's ready/proposed/deferred/shipped sections
+are authoritative for the current batch. In particular, agent agreement is distinct from
+user implementation approval, and implementation is distinct from verification or release.
 
 This file is contributor-facing. It is not linked from the README and is not in the npm
-payload (`files` in `package.json` ships `parley.mjs`, `ui/`, `README.md`, `LICENSE`
-only), so nothing here can be mistaken for a shipped feature.
+payload (see the current `files` list in `package.json`), so nothing here can be mistaken
+for a shipped feature.
 
 Line references are against `main` at the time of writing and should be treated as
 starting points, not addresses.
@@ -29,7 +29,7 @@ Status legend:
 
 | | |
 |---|---|
-| **Settled** | Both seats converged, design closed, ready to implement as written. |
+| **Settled** | Historical agent agreement; not independent implementation permission. The current user handoff determines authorized scope. |
 | **Agreed, unspecced** | Direction agreed; detail still to be worked out. |
 | **Noted** | Observed and parked; no decision taken. |
 | **Built** | Implemented as written; kept here as the design record. “Built in the working tree” is still uncommitted and unshipped unless a commit or release is named explicitly. |
@@ -610,7 +610,7 @@ These are stale-tab fences, not package-semver events.
 
 ---
 
-## Release plan
+## Historical release plan (superseded by shipped status above)
 
 **Where the code actually is.** `parley-room@1.0.2` is the published latest, and its
 `gitHead` (`804b692`) is on `main` — so the lineage trap that applied to `1.0.1` is gone
@@ -658,7 +658,7 @@ for the shipped Packages 1, 6, 10 and 11 to stand on their own. Package 12 is a 
 relay/lurk extension and does not gate that shipped slice.
 
 
-## Package 13 — Just-in-time permission approval (agreed, unspecced)
+## Package 13 — Just-in-time permission approval (deferred, unspecced)
 
 **Problem.** Work rooms force a standing grant: a seat runs under one permission
 mode chosen at launch, so an action outside it is auto-denied mid-turn with no
@@ -681,436 +681,230 @@ in-chat approve/deny entry kind that blocks the turn, and a fake-CLI directive
 that can request permission so the flow is testable before it is trusted.
 
 
-## Package 14 — Retry scoping, cap finalization and continuation-budget honesty (settled 2026-09-02, not built)
+## Package 14 — Reliability and execution transparency (implementation in progress, 2026-09-04)
 
-> **Handoff note.** Settled in room `parleyy` between Claude and Codex on
-> 2026-08-29/30 (entries 5986–6366), then verified against the code and
-> ruled on by Claude on 2026-09-02. This section is written so that either
-> seat can implement it without the room transcript. Line references are
-> against branch `perf-and-token-diet` at `fa01217`; **build on that branch**,
-> not on `main` — commits 3 and 4 touch the hop-instruction and coordinator
-> code that branch already changed. Do not merge to `main`; the user merges.
+The 2026-09-04 user handoff supersedes the earlier room agreement and its line-numbered
+implementation sketch. The work starts from current `main` (the checked handoff baseline
+was `e3c249a`); `perf-and-token-diet` was already merged. Work belongs on
+`codex/parley-reliability`. Do not commit, push, merge, or enable new accounting presets
+without the corresponding user request. Agent agreement alone is not implementation permission.
 
-### What triggered it
+### A. Implementation-ready work
 
-A `@both` message sent with a sticky composer override of `hopBudget: 1`
-produced seven agent bubbles before the cap entry appeared, and a direct
-root reply was labelled "↩ replying to you" while its prose answered an
-older Codex message. Investigation found the accounting correct (only
-charged continuations count; structural sibling delivery and answer
-returns are free by design) but the vocabulary, the projections and three
-pieces of recovery code dishonest or wrong.
+The following is the authorized reliability batch. “Implementation-ready” describes scope,
+not verification: completion requires current results for the browser, focused and integration
+checks below. Preserve existing behavior unless a listed correction changes it.
 
-### Already done on this branch — do not redo
+1. **Real-browser coverage first.** Keep fake-DOM probes and add an isolated browser suite
+   using a temporary room directory and fake providers. Create a room through the visible
+   submit button and separately through Enter in a text field (implicit submission). Send a
+   message; assert routing, streaming and final bubble. Operate visible Stop and Retry controls;
+   cover failed-seat recovery, cancelled queued Pair and reviewer/fix failure recovery. Assert
+   browser errors and visible control states. Use observable readiness, never live rooms or
+   authenticated providers.
+2. **Pair recovery.** Pair cycles can queue and their cancellation is reachable. Retry after
+   Pair ends must refuse before sleep/busy advice, repeatedly without mutation or launches.
+   Retry-target and sleep-blocking helpers must agree. Active Pair Retry reruns the entire
+   original task under the current Pair roles/configuration and rejects any supplied seat
+   subset. Ordinary recovery rejects the positive `meta.pair` marker; legacy ordinary roots
+   without relay metadata remain supported. Pair roots remain relay-free. A cancelled queued
+   Pair bubble shows both roles or whole-cycle status and offers one root-bound cycle action;
+   it never offers worker-only discarded-delivery recovery.
+3. **Root-bound, seat-scoped ordinary Retry.** Accept optional `agents`; omission means all
+   eligible seats, while an empty array, wrong type, unknown seat or seat outside the narrowed
+   retry envelope is invalid. Deduplicate supplied seats. Filter completed/occupied seats and
+   launch the free failed half immediately; never queue a duplicate running half. Name the
+   requested sleep/busy blocker if nothing can launch. Wake's narrowed envelope remains
+   authoritative. Preserve the original root and serialized relay coordination. Server-authored
+   recovery metadata identifies action kind, root and applicable seat. Only a direct-root
+   failure offers seat Retry; Pair offers whole-cycle Retry; causal failure offers no blind
+   ordinary Retry. Historical actions refuse safely and never target unrelated `lastUser`.
+   Preserve errors and mark them resolved by their succeeding attempt.
+4. **Causal finalization and cap provenance.** Pending disposal owns stopped/failed queued
+   requests and answer returns; `finishCaps` alone owns capped edges. Finalize once, terminally,
+   for live and recovered coordinators; never invoke providers or restart a drained scheduler.
+   Replaced generations write no old-generation outcomes. Preserve cap-before-Stop as cap and
+   Stop-before-launch as stopped. Record fulfilled lurk chimes without launching downstream
+   work after Stop. Write the cap at coordinator completion, independently of delayed catch-up.
+   Durably deduplicate `(target, triggerEntryN)` first-wins; validate root, stored budget and
+   policy source, ignoring differing observed use and process safety limits. Future policy
+   versions also validate immutable identity. Keep `relayCap.dropped`, with no duplicate
+   request-capped record. Later receipts/cursors retain precedence when delivery heals.
+5. **Launch/catch-up provenance.** At actual charged launch record its ordinal, root, trigger,
+   budget, effective limit and source. Carry it on text entries and receipts, explicit pass
+   and empty receipts, and failed/stopped terminal artifacts. No launched unit is refunded.
+   Failed/stopped attempts advance no delivery cursor and write no success receipt. A final
+   pass creates no cap unless further work was blocked. Enable `allowEmpty:true` deliberately
+   only for the intended charged causal path; preserve ordinary and Pair empty semantics.
+   Coalesced catch-up preserves exact root IDs and covered range alongside compatibility
+   markers. Display “caught up” / “caught up · N messages”; derive N from root IDs and never
+   attribute the whole invocation to its last root. Summary exposes the resolved safety limit;
+   active runs expose an explicit public projection, limit and source. No stored `limitKind`.
+6. **Current-policy prompt contract.** Read durable remaining use at invocation time. Append
+   dynamic text outside deduplicated static blocks. Warn at 2, 1 and terminal remaining on
+   roots, charged legs, sibling/explicit/continuation, nonterminal answer returns and lurk.
+   The allowance is shared and unreserved. Solo differs from zero continuations: structural
+   delivery may remain possible at zero. Fresh Until-settled roots have no scarcity copy;
+   recovered roots near exhaustion, including zero, disclose it. A new user message can
+   continue the discussion; do not encourage a terminal information dump. Coalesced terminal
+   catch-up has no single-root budget. Test actual captured prompts with safety ceilings 2/4.
+7. **Current-policy UI.** Use “continuations” for the existing accounting rule and display real
+   server safety limits. Preserve the sticky per-room/browser-session shortcut and identify
+   its override. Before send, show effective recipients, discussion behavior and applicable
+   budget. Accepted roots retain their policy when settings change. Add “Why did this run?”
+   details: trigger, delivery kind, source and consumption. Root provenance says “invoked by
+   your message”; causal replies name their trigger. Do not infer provenance from `retrying`.
+   Keep current badges and add charged counters/catch-up provenance. Distinguish pass/empty
+   and use seat labels. Caps explain what did not launch and actual reasons; separately owed
+   delivery may still complete. Do not claim old defaults from today's setting, promise that
+   editing reopens a root, or promise all withheld text enters later context.
+8. **Current-policy estimates.** Mirror server mention grammar before draft routing estimates.
+   For a fresh, isolated ordinary message, with effective charged allowance B: Solo `1`;
+   single/no eligible listener `1 + 2B`; single/eligible live listener `4 + 2B`; `@both`
+   `5 + 2B`. Pair uses rounds separately. One charged continuation adds at most two agent
+   turns. These are estimates, not lifetime totals, remaining-turn guarantees, token limits or
+   monetary caps. Do not derive root/exchange “turns completed” aggregates from receipts:
+   catch-up can span roots. Directly regress `@both` B=0 ≤5 and B=1 ≤7.
+9. **Incremental source extraction.** Keep `parley.mjs` and one startup command, zero runtime
+   dependencies. Extract budget-policy and prompt helpers first; add provider, persistence,
+   scheduling and HTTP boundaries where useful while keeping the scheduler cohesive. Separate
+   UI HTML/CSS/JS and freeze all client assets for a server lifetime so a page cannot mix
+   revisions. Prefer helper imports over source extraction in tests. Keep mechanical moves
+   separate from semantics. Update package files and inspect packed contents.
+10. **Testing and measured optimization.** Separate focused tests, smoke/integration and browser
+    commands; reuse FAILONCE/seat-specific and Pair directives. Add reproducible randomized
+    Stop/Retry/Wake/queue/generation sequences checking no concurrent duplicate seat execution,
+    double charge, missing disposition or stale action on new work. Add large-room rendering
+    and deep-navigation benchmarks; measure unnecessary/silent listener launches, latency and
+    streaming/layout overhead. Optimize existing merging/coalescing/throttling only if evidence
+    justifies it. Run current relevant suites and report actual results; the historical 835
+    assertions are not evidence for this branch.
 
-- `hopInstructionForBudget` and its `.replace(HOP_INSTRUCTION, …)` twin are
-  gone. `hopBudgetNote(policy, usedBefore)` (`parley.mjs:3428`) returns only
-  the countdown text; static rules live in `LEG_INSTRUCTIONS` (`:3443`) and
-  are session-deduplicated through `staticBlock`. **Any dynamic budget text
-  must be appended as a suffix outside the deduplicated block**, the way
-  `opts.budgetNote` is appended in `runHopTurn`; never inside `staticBlock`.
-- The hop menu already says a hop with an answer can mean two calls.
-- Burst merge (`runMergedDeliveries`), `MERGED_INTO_LATER`, cursor rebound,
-  seat waiters — see the `f2e8b4a` and `e73c1e2` commit messages.
+**Protocol decision:** inspect final client/server compatibility. Additive metadata alone need
+not bump the protocol, but a cached UI with invalid recovery actions or incorrect semantics may
+require a stale-tab fence. A bump is neither categorically required nor forbidden.
 
-### Commit 1 — Pair recovery fence
+### B. Approved automatic-turn accounting (implemented September 2026)
 
-**Bug.** A pair root is appended without a relay snapshot
-(`parley.mjs:5113`, `...(!asPairTurn ? { relay: relayPolicy } : {})`). Every
-pair gate in the retry path is `lu.pair && room.state.pair` (`:6245`,
-`:6262`, `:6331`). After `/pair end` nulls `room.state.pair`, Retry on a
-failed pair root falls through to `startRecoveredDelivery` (`:4666`) →
-`relayPolicyForEntry` (`:4653`), which synthesizes the *current* room policy
-with `source: "room"` for a root that never had one, and runs only the
-former worker — the review half is lost. Reconstruction of the old pair was
-shipped once, judged a bug, and reverted; the migration at `loadRoom`
-(`state.lastUser.pair !== true` → `true`) stands guard over that revert.
+The user approved this literal policy and explanation overhaul after the room debate.
+This supersedes the proposal to charge every covered catch-up root.
 
-**Changes.**
+- New rooms use **Automatic turns**, default **4** additional invocations per user message.
+  Initial user-addressed responses and Pair rounds are excluded. Every automatic invocation
+  counts, including listening, sibling, explicit call, answer return, follow-up, catch-up and
+  internal session-recovery retry. Pass, empty, failure and Stop after admission do not refund
+  it. No free terminal fallback survives in this mode.
+- Existing rooms retain **Extra exchanges** until explicitly switched in Settings. Accepted
+  roots retain their version, accounting, budget, source and safety snapshot. Retry/Wake and
+  restart retain durable usage. Never convert or relabel old counts.
+- Catch-up has one sponsor: the first-scheduled eligible pending obligation, fixed before
+  launch. Permissions, Sleep, Stop and remaining allowance determine eligibility. Other roots
+  contribute context, not charges. Downstream work keeps the sponsor. No eligible owner means
+  no automatic start. Later delivery is claimed only after a successful covering receipt.
+- Strict badges show automatic use rather than attention/answer/follow-up accounting jargon.
+  The shared live/completed explanation separates trigger, received context, allowance and
+  outcome. Cause is not every message discussed; duplicate root/trigger numbers are suppressed.
+- Provider quota failures use readable text with raw diagnostics in technical details.
+  Causal failures are not blindly retried. Receipts optionally name the produced reply; later
+  coverage links to it as context, never as resolution. Silent receipts invent no reply.
+  A cap means no start, not agreement or successful delivery.
+- Runtime protocol 12 fences stale clients. Tests cover real fake-provider start counts,
+  catch-up sponsorship, provider outcomes, browser interactions and legacy compatibility.
 
-1. `handleRetry` (`:6310`): if `lu.pair` is true and `room.state.pair` is
-   null, throw a 400 in the existing style: *"This turn belonged to Pair
-   mode, which has ended. Start Pair again or ask the worker directly with a
-   new message."* Place it **above** the sleep refusal (`retryBlockedBySleep`
-   / `asleepRefusal`, `:6259`–`:6271`) so a dozing seat never gets "wake them
-   to retry" for a turn the next guard refuses. `makePairRetryable`
-   (`:3924`) re-arms `lu.pair = true` on every failure, so the refusal is
-   stable and repeatable with no state churn.
-2. `handleRetryDiscarded` (`:6282`): resolve the source entry; if
-   `entry.meta && entry.meta.pair`, throw 400. It is believed unreachable
-   (pair turns never defer, and a pair turn with a sleeping seat refuses
-   before appending) but the two guards live in different functions — pin
-   it.
-3. `relayPolicyForEntry` (`:4653`): throw if `entry.meta && entry.meta.pair`.
-   The discriminator is the **positive** `meta.pair` marker, never the
-   absence of `meta.relay` — legacy ordinary roots without a relay snapshot
-   must keep the `room.cfg` fallback.
-4. Keep pair roots relay-free. Do **not** add `relay: { applicable: false }`:
-   `relayPolicyForEntry` normalizes per field, so an unknown flag falls open
-   to the room policy, byte-identical to omission.
+**Deferred:** Custom category counting and separate conversation presets. Custom may expose
+all known categories but requires an independent always-on all-start safeguard: uncounted is
+never permission to launch. Its validation, ceiling and UI remain separate work. Token/money
+budgets and the universal crash-recovery journal also remain outside this change.
 
-**Tests (smoke).** Pair root stores `meta.pair` and no `meta.relay`; failed
-pair → `/pair end` → Retry returns the refusal twice, launches no seat,
-mutates no state; a pair root cannot enter `POST /api/queue/retry`;
-switching pair roles while pair is still active retries the whole cycle
-under the current roles (existing behavior, keep it pinned).
+**Requested follow-up: Advanced Custom accounting.** Keep Automatic turns as the everyday
+default. Add Advanced controls for whether sibling delivery, explicit tag requests, listening,
+answer returns, follow-ups, catch-ups and recovery retries consume the allowance. Uncounted
+does not mean disabled or authorized. Snapshot the choices per accepted message; add a durable,
+independent all-automatic-start safety counter that excluded categories cannot bypass. Update
+prompts, explanations and estimates, and test zero/all-free combinations, catch-up ownership,
+Retry/Wake/restart and safety exhaustion before enabling Custom. This is backlog, not built.
 
-### Commit 2 — Seat-scoped Retry
+Extra exchanges is no longer offered for selection in Settings. An existing legacy room may
+display its current value as a disabled option until the user explicitly switches to Automatic
+turns and reviews its allowance. Saving unrelated settings does not silently migrate the room;
+historical roots remain interpretable under their original policy.
 
-**Bug.** `handleRetry` at `:6355`:
-`if (targets.some((a) => seatOccupied(room, a))) throw 409 "that agent is
-still busy"`. For a `@both` root where Claude failed while Codex is still
-running, `retryTargets` (`:6242`) correctly returns only the not-done,
-awake seats, then this line refuses the **whole** retry because of the seat
-the user did not ask about, and names nobody. The failed free half is
-blocked until the busy one finishes.
+### C. Deferred backlog — separate projects
 
-**Changes.**
+- Source-linked decisions panel: proposed, agreed, implementation-approved, implemented,
+  verified and superseded. Agent agreement grants no permission; avoid an automatic summary
+  invocation after every exchange.
+- Long-room search/filter by participant, root, failure and decision; optional chronological
+  exchange collapsing and clearer transcript-export access.
+- Conversation quality evaluation using representative transcripts; reduce demonstrated
+  repetitive agreement/recaps without a per-response judge-agent call.
+- Refresh the model catalog without restart; never silently change an active run's model.
+- Crash recovery journal: UUID attempts, persisted pending intent, reconciliation against
+  terminal artifacts, idempotent unknown-outcome notices and no automatic replay. Measure
+  hot-path persistence before choosing scoped/universal coverage. Atomic rename alone is not
+  a guarantee against every storage or power failure.
+- Just-in-time permission approval: verify each provider's actual supported mechanism; bind
+  action/run, fail safely on cancellation/timeout/restart, test fake flows and real integration.
+- Historical UI reports (partial stopped streams, stale errors, timeout/auth advice): reproduce
+  against the current tree before treating them as present bugs.
 
-1. **Filter, don't reject.** Drop occupied seats from `targets`; throw only
-   when the filtered list is empty. Keep occupancy out of `retryTargets`
-   itself — it feeds `canRetry` (`:2475`) and folding occupancy in makes the
-   button flicker as seats churn.
-2. **Name the blocker.** Add `busyRefusal(room, agents)` beside
-   `asleepRefusal` (`:6271`), same pluralization: *"codex is still finishing
-   a turn"*. Mirror `retryBlockedBySleep` (`:6259`) with
-   `retryBlockedByBusy`.
-3. **Optional seat list.** `POST /api/retry` (`:7211`) accepts
-   `{ room, agents? }`. Semantics mirror `handleRetryDiscarded`: unknown seat
-   id or a seat the root never addressed → 400 (structural); already
-   completed or currently occupied → filtered silently (state-dependent
-   race), refuse only when nothing survives. Same predicate as the omitted
-   path, only the source of the list differs. Omitted `agents` keeps today's
-   behavior (all eligible seats) for old tabs.
-4. **Pair stays whole-cycle.** In the pair branch, an incoming `agents`
-   subset is a 400, never silently intersected (a half-cycle is worse than a
-   refusal). Comment why this branch keeps the all-or-nothing shape the
-   `@both` branch loses, or the next reader harmonizes them.
-5. **UI.** The failure-entry Retry at `ui/index.html:1724` posts
-   `{ room }`; it sits next to a specific seat's error entry (`meta.agent`)
-   and must post `{ room, agents: [thatSeat] }`. The discarded-retry button
-   (`:1661`, `data-retry-seats`) is the pattern.
-6. The retry must replay the **original root entry and reuse `userTurn.n`**
-   — already true (`handleRetry` launches `lu`), keep it. Both coordinators
-   key `withRootRelay` on `${generation}:${rootN}`, and the `@both`
-   coordinator seeds from `directRootReplies`, so a retried half and the
-   still-running sibling reconcile at that boundary. No new machinery.
+### D. Already shipped — preserve rather than rebuild
 
-**Tests.** `@both`, Claude fails (fake `FAILONCE`-style directive) while
-Codex is busy (`SLEEP:`): Retry with `agents:["claude"]` launches only
-Claude immediately, response names nobody as busy; both direct replies then
-reconcile exactly once (sibling attention delivered once each way); assert
-the relay key / root `n` is shared (the retried reply's `replyTo` equals
-the original root). Unknown seat → 400. Completed seat in the list →
-filtered, not 400. Pair root with `agents` → 400. Retry with no `agents`
-still works.
+Sleep/Wake and held delivery; queue pause/discard and ordinary discarded-delivery recovery
+foundations; Ask again/Redirect; Stop-menu snapshots; image paste and target chips; prompt-note
+separation and static-block deduplication; burst merging, catch-up coalescing, cursor recovery
+and streaming optimizations. Earlier package text is historical design context. Package 14
+extends these foundations and corrects recovery/provenance; it does not reopen unrelated backlog.
 
-### Commit 3 — Reason-preserving cap finalization and durable provenance
+### Delivery and verification record
 
-**Bug A — orphaned caps.** Cap detection accumulates `cappedTargets` in the
-coordinator; the durable `relayCap` entry is written only by `finishCaps`
-(`:4626`). Both coordinator tails return early on Stop *before* it:
-`if (gen !== room.generation || chainHalted(room, chain)) return;` after
-the lurker `Promise.allSettled` (`:4923`, `:4770`), and `disposeStopped`
-(`:4575`) is reachable only from inside `settle()`. Cap trips during the
-first settle, Stop lands during the lurk await → map dropped, no entry, no
-outcome, the capped seat's dot orphaned. Also `disposeStopped` rewrites
-capped requests as `request-stopped`, which points the user at their Stop
-instead of the budget.
+Order: corrected plan → browser coverage → Pair/Retry fixes → causal finalization/provenance →
+focused extraction → current-policy UI/prompts → proposed configurable-policy specification.
+Keep this record honest: “implemented” means code exists, “verified” requires named current
+checks, and “shipped” requires an actual release. End the handoff with changes, tests, limitations
+and unresolved decisions, never an unqualified historical “done”.
 
-**Bug B — invisible provenance.** `recordRelayLaunch` (`:4356`) returns the
-launch ordinal and the coordinator discards it into `hops` (`:4535`); hop
-entries carry only `hop: true`. Catch-up chimes write `lurkCatchUp: true`
-(`:3360`) and `catchUpReturn: true` (`:5606`), and **neither is read
-anywhere in `ui/index.html`** — a coalesced catch-up spanning three roots
-renders identically to an ordinary chime. `[pass]` and empty replies write
-receipts that are indistinguishable (`spoke:false`, same mode).
+#### Current working-branch verification — 2026-09-04
 
-**Changes.**
+This is implementation verification for `codex/parley-reliability`, not a release claim.
 
-1. Split `disposeStopped` into `disposePending(reason)` that handles only
-   queued requests and queued answer returns: Stop → `request-stopped` /
-   `closure-stopped`; unexpected failure → `request-failed` /
-   `closure-failed`. It never touches `cappedTargets`.
-2. `finishCaps` becomes the sole owner of `cappedTargets`: re-filter by
-   cursor, write the `relayCap` entry, clear the map. Do **not** add a
-   parallel `request-capped` outcome — `relayCap.dropped` is already the
-   seat-level disposition the UI consumes (`cappedFrom`, `ui:1502`).
-3. One idempotent `finalize()` per coordinator lifetime, called from a
-   `try/finally` around both the live (`launchUserDispatch`) and recovered
-   (`startRecoveredDelivery`) coordinators while the generation still
-   matches: `disposePending` when halted or failed, then `finishCaps`
-   always. Finalization never calls providers and never re-enters
-   `settle()`; un-drained work on an exception gets `request-failed`.
-4. Stop during lurker settle: await all listener outcomes; reject only on
-   generation change; enqueue fulfilled chimes even if Stop arrived (the
-   chime is already an appended entry); if halted, launch nothing further
-   and let finalization mark the chimes' queued continuations
-   `request-stopped`. **Cap-over-Stop:** a request capped before Stop keeps
-   `cap` as its reason. The UI already ranks `cappedFrom` above
-   `lurkOutcomes` (`ui:1547` vs `:1559`), so this matches the client.
-5. Cap entry dedup: identity is `(target, n)` — the same key `capIndex`
-   uses; **first-wins**. Before writing, drop edges already represented by
-   an earlier `relayCap` with the same `(target, n)`. If the existing edge
-   disagrees on `(rootN, budget, source)`, log an invariant diagnostic and
-   keep the original; `used` and `limit` are metadata, not conflict fields
-   (usage accumulates per root across coordinators; the safety limit is
-   per process). Retry/Wake re-collecting the same direct reply via
-   `directRootReplies` must not produce a second identical entry.
-6. Write the cap entry at coordinator completion; do not wait for a
-   delayed catch-up owed by a busy lurker (that runs on a fresh chain,
-   outside the budget, and may coalesce across roots). The copy says
-   separately owed structural or catch-up delivery may still complete.
-7. `relayCap` meta gains `limit` (effective numeric ceiling — the
-   safety number under `-1`) and `source` (copy of the root's
-   `meta.relay.source`: `room` | `message` | `solo`). Do **not** store a
-   `limitKind`: derive it — `source === "solo"` → solo, `budget < 0` →
-   safety, `budget === 0` → off, `budget > 0` → selected.
-8. `hopRun` (built at `:4639`/`:4775` style sites, published at `:2466`)
-   gains `limit` and `source`. Replace the `{ ...run }` spread in
-   `roomSummary` with an explicit projection of `id, rootN, used, budget,
-   limit, source, phase` so future internal fields do not become wire
-   payload. No new `phase` values.
-9. `roomSummary` gains top-level `hopSafetyLimit` (= `HOP_SAFETY_HOPS`,
-   `:3422`, env-driven, per process — it cannot ride in a per-root
-   snapshot).
-10. **Launch index.** `onLaunch` in `runHopTurn` returns the record
-    `{ rootN, index, budget, limit, source }` built from
-    `recordRelayLaunch`'s return value. `runHopTurn` propagates that one
-    object by outcome: text reply → agent entry `meta.relayLaunch` **and**
-    receipt; `[pass]` → receipt with `outcome: "pass"`; empty → receipt
-    with `outcome: "empty"`; Stop → system entry `meta.relayLaunch`;
-    failure → system entry `meta.relayLaunch`. `appendReceipt` (`:2333`)
-    must learn the two optional fields. A charged `[pass]` that spends the
-    last allowance writes **no** cap entry (nothing was blocked); its
-    receipt is the accounting record. Structural and answer-return legs
-    never carry a counter.
-11. **Catch-up provenance.** Where `lurkCatchUp: true` is written
-    (`:3360`, from `catchUpRoots`), also write
-    `catchUp: { rootNs: [...], count, throughN }`. Keep the boolean for
-    old readers.
+| Check | Current result |
+|---|---|
+| `npm run test:unit` | 11 focused coordinator/policy tests passed. |
+| `npm run test:retry` | 8 root-bound Retry and Pair recovery scenarios passed. |
+| `npm run test:provenance` | 8 captured-prompt/provenance scenarios passed across safety ceilings 2 and 4. |
+| `npm run test:smoke` | 836 passed, 0 failed. |
+| `npm run test:browser` | 12 Chromium tests passed against temporary rooms, isolated homes and fake providers. |
+| `npm run test:sequences` | 18 seeded Stop/Retry/Wake/queue/generation scenarios passed; 65 fake invocations were checked for overlap and terminal state. |
+| `npm run test:package` | The packed package contained every runtime module and frozen client asset, then started successfully without an install step. |
 
-**Tests.** Stop before cap → stopped outcome only; cap before Stop → cap
-stays cap; cap then Stop during live lurk → cap entry plus stopped chime
-continuation; same on a recovered delivery; generation reset → nothing
-written; finalize twice → no duplicates; retrying the same capped edge →
-no duplicate entry; a new capped edge on the same root → appended; delayed
-catch-up after cap → later receipt/cursor supersede the capped dot; two
-charged launches carry `1/2`, `2/2`; a failed and a stopped launch each
-consume an index; Retry resumes at the next index; a charged `[pass]`
-consumes its index and writes no cap entry; pass and empty receipts are
-distinguishable; a coalesced catch-up stores its exact roots; a single
-delayed root reports count 1; `PARLEY_HOP_SAFETY=4` shows up in
-`hopSafetyLimit`, `hopRun.limit` and the cap entry (spawn the server with
-the env var in the test rig); no private hop-run fields leak through the
-summary.
+The measured synthetic large-room benchmark used 6,000 entries (2.72 MB): initial connected
+rendering was 139–209 ms, a deep navigation rendered all rows in 2.55–2.64 s, and streaming
+performed nine visible updates with 13.2 ms of layout work. The fake-provider conversations
+measured one invocation without a listener, two with a silent listener, one in Solo, and exactly
+five/seven for fresh `@both` budgets 0/1. These are local benchmark observations, not service-level
+latency promises. At that verification date the accounting presets were unimplemented.
+The September 2026 approval and implementation in section B supersede that status; Custom
+remains deferred. These historical test counts are not a claim about later changes.
 
-### Commit 4 — Model-facing budget contract
+#### Automatic-turn verification — 2026-09-15
 
-Everything here is prompt text; nothing crosses the browser protocol.
-Human vocabulary is "continuations"; the model-facing noun stays
-**handoffs** — a continuation is a billing unit the model cannot observe
-(one continuation is up to six turns under `@both`).
+Uncommitted working-tree verification, not a release:
 
-1. **Until-settled band.** `hopBudgetNote` (`:3428`) currently returns
-   `null` for `policy < 0 && remaining > 0`, so an unlimited room is silent
-   for 24 legs and then hits a wall. Change the suppression to
-   `remaining > 2`; at `remaining` 2 or 1 emit the dynamic neutral warning,
-   at 0 the terminal text. Clamp against the ceiling: `HOP_SAFETY_HOPS` is
-   floored at 2, so at ceiling 2 the first charged leg computes
-   `remaining = 1` — a `=== 2` trigger would never fire there. Wording:
-   *"Safety boundary: N charged handoffs remain after this turn. Each
-   launched handoff's answer is still returned once. Continue only on
-   unresolved substance; reply exactly [pass] if settled. The user can
-   reopen the discussion with a new message — do not cram everything into
-   this turn."* The escape hatch is load-bearing: without it a model told it
-   is on its last handoff dumps its whole remaining case.
-2. **Uncharged legs get the number.** Sibling-attention and lurk-return
-   legs (`LEG_INSTRUCTIONS.sibling` / `.lurkReturn`) say a budget exists but
-   not what is left. When `remaining <= 2`, append a dynamic suffix
-   (outside the static block): *"Budget status: N charged handoffs remain
-   for this user message, shared across both seats. This delivery is
-   uncharged."* Compute from durable `relayUsed(room, rootN)` at launch,
-   not at enqueue.
-3. **Root disclosure**, appended to `buildPrompt` output the way the pair
-   role note is composed (never through `staticBlock`; it varies per
-   message), computed from `relayUsed` at launch, only for **finite**
-   policies with effective remaining ≤ 2; until-settled roots stay
-   qualitative. Matrix, keyed on (route, budget):
-   - Solo: *"Solo mode: only you are being invoked. Answer completely; tags
-     will not schedule the other seat."*
-   - 0, single seat, no eligible listener: *"No agent-to-agent delivery
-     for this message; answer completely yourself."*
-   - 0, `@both`: same, plus *"Sibling delivery and answer returns already
-     owed may still complete; no new continuation will launch."*
-   - 0, lurk-enabled: same base, plus *"An enabled listener may still
-     overhear this structurally."*
-   - 1, `@both`: *"One charged handoff remains for this message, in a
-     shared, unreserved pool. The other seat may use it first; make this
-     answer self-contained."* (Use "use it first", not "tag first" —
-     implicit causal speech also consumes it.)
-   - 2, `@both`: *"Two charged handoffs remain, shared across both seats and
-     not reserved per seat."* Never imply one each.
-   - 1–2, single seat: numeric line without the concurrency clause.
-   - 3+ remaining: nothing.
-   Budget 0 is **not** Solo: structural deliveries still run at 0.
-4. Countdown wording: replace "handoffs remain" / "Agent-hop budget
-   reached" / "safety stop after N **exchanges**" (`:4637`–`:4638`) — three
-   words for one quantity — with one vocabulary in prose; the system
-   entries are covered in commit 5.
-
-**Tests.** End-to-end prompt captures, not just formatter unit tests — the
-wiring is where the bug lives. Use the fake CLI's `SAWWHAT` (echoes a root
-prompt), `HOPWHAT` (echoes a hop prompt; note a user message containing
-`@codex` routes to both seats, so trigger hops with `TAG:codex`) and
-`LURKWHAT`. Pin stable clauses, not whole prompts. Cover: Solo root; zero
-on single, `@both` and lurk routes; `@both` N=1 shared/unreserved; until-
-settled root carries no scarcity copy; remaining-2 and remaining-1
-warnings on a charged leg and on an uncharged leg; `PARLEY_HOP_SAFETY=2`
-warns "1 remains" on the first charged leg; terminal copy keeps exact
-`[pass]`; the reopen sentence is present. Echo tests nest earlier prompts
-inside later deltas — assert on occurrence counts of phrases, not mere
-presence. Note `SAY:` takes one token.
-
-### Commit 5 — Human copy and projections
-
-Renders the fields commit 3 landed; no new server fields. Keep the
-persisted key `hopBudget` and the `maxHops` migration untouched.
-
-1. **Vocabulary.** UI strings "Hops" → "Continuations" (`ui:813` button
-   label, menu at `:815`–`:834`, `:3492` room-default line, `:3528`
-   readout, settings help). Persisted keys unchanged.
-2. **No fake infinity.** `hopBudgetLabel(-1)` (`ui:3425`) renders "∞";
-   under `PARLEY_HOP_SAFETY=2` the readout says `limit ∞ · safety stop`
-   beside a counter that is actively running down. Render *"Until settled ·
-   safety max N per message"* with N from `summary.hopSafetyLimit`, never a
-   client constant. The live readout reads `run.limit` and `run.source`:
-   `Continuations 4/25` (and ` · safety` when `budget < 0`). "Room" renders
-   the room's actual configured policy.
-3. **Route-aware projection, in the menu and tooltip only — never on the
-   chip.** The chip is the persistent policy (`1 continuation` / `Until
-   settled`). Each menu row shows the fresh-message ceiling for the current
-   draft, computed in the browser from its existing route mirror
-   (`guessTextTarget`, chip, `cfg.agents[a].lurk`, `lastAddressed`) and
-   `hopSafetyLimit`: Solo → 1; single, no eligible listener → `1 + 2B`;
-   single with an eligible listener → `4 + 2B`; `@both` → `6 + 2B`; pair →
-   no estimate (rounds govern). Label it as an estimate for a fresh,
-   isolated message; delayed catch-ups coalesce across messages, so actual
-   work can be lower and cannot always be attributed to one root. The 0
-   row must explain itself: *"0 continuations — required cross-delivery
-   and answer returns may still use up to 6 agent turns; no new
-   continuation launches."* Avoid "2 direct + 6 automatic" (joins an exact
-   count to a bound). Tooltip: *"The selected number controls charged
-   continuation launches. Structural sibling delivery and one guaranteed
-   answer return per launched request do not consume it."*
-4. **Sticky override, named.** The composer shortcut persists per room +
-   browser session and silently applied `1` to three consecutive messages.
-   Show *"Message override: 1 · Room default: Until settled"* in the menu;
-   keep it sticky (the user asked for that explicitly).
-5. **Cap entries** (`:4637`–`:4638`). Budget: *"Continuation limit reached
-   — 1/1 used for this message. Parley did not launch a new turn for Codex
-   to receive Claude's message in this exchange. The message stays in the
-   transcript and will be included the next time Codex receives room
-   context; Codex was not asked to answer it now. This limit came from your
-   message override; the room default is Until settled. Change the setting
-   if you like, then send a new message to continue."* Use seat labels, not
-   provider names (two seats can share a provider). Safety: *"Until-settled
-   safety boundary reached — 25/25 continuations used for this message.
-   This is a protective per-message boundary, not an agent failure.
-   Undelivered replies remain visible. Send a new message to continue."*
-   Never say "raise the limit": the root's policy is snapshotted, so
-   changing the setting cannot reopen the old root. Do not print a turn
-   total in the durable entry (a later coalesced catch-up makes it stale);
-   derive "N agent turns completed" from receipts in live views only and
-   call it *completed*, since failed/stopped attempts may lack receipts.
-6. **Provenance labels.** `quoteRefHTML` (`ui:2095`) and `PHASE_VERB`
-   (`:2406`) paint every `replyTo` as "replying to". `replyTo` means
-   "dispatched by" for root turns and "immediate trigger" for hops. Root
-   turns: *"invoked by your message"*; causal/hop entries keep *"replying to
-   <seat>"* and show `replyRoot` secondarily (*"from your message #N"*).
-   Tooltip: *"The prompt snapshot ended before later concurrent replies."*
-7. **Badges.** Keep the existing taxonomy (`ui:1753`–`1761`: closure,
-   answer, attention, chimed in, follow-up, delayed). Add exactly two:
-   `⛓ 1/1` on charged continuations from `meta.relayLaunch` (`⛓ 1/25 ·
-   safety` under until-settled), tooltip *"Charged continuation 1 of 1; its
-   guaranteed answer return is uncharged."*; and `👂 caught up` /
-   `👂 caught up · 3 msgs` from `meta.catchUp`, tooltip *"Delivered late as
-   one coalesced catch-up covering 3 earlier user messages; not attributable
-   to only one of them."* Receipt tooltips for pass/empty:
-   *"Charged continuation 1/1 delivered — nothing to add"* vs *"returned no
-   content"*.
-8. Docs: `docs/conversation.md` hop section and `docs/reference.md`
-   config table get the vocabulary and the projection formula; README's
-   cost line if it mentions hops.
-
-**Tests.** UI probe: `hopBudgetLabel`-style rendering under a custom
-safety limit; menu rows recompute synchronously when `@both` is added or
-removed from the draft; new UI degrades if `limit`/`source`/
-`hopSafetyLimit` are absent (old summary). Server: cap entry copy names the
-override source; a root sent under `source: "room"` names the room default.
-
-### Rejected, with reasons — do not relitigate
-
-- **A second hard automatic-call cap.** Total turns are already an affine
-  function of the continuation limit (`6 + 2B` under `@both`); a second
-  cutoff either duplicates that bound or severs a guaranteed answer return
-  mid-flight. If strict spend admission is ever needed, reserve the return
-  leg before launching the request; never cut before the return.
-- **A `/api/relay-preview` endpoint.** The browser already mirrors the
-  route grammar synchronously for the route hint; the ceiling formula does
-  not consume the route parser; a fetched preview is stale per keystroke.
-- **Projection coefficients on the wire.** Two implementations of one
-  rule, and a cached old page with stale coefficients renders a confidently
-  wrong number — the exact criterion for a protocol bump.
-- **Persisted `fanoutClass` / `freshTurnCeiling`.** A listener can be
-  evicted from the run into a coalesced catch-up that spans several roots,
-  so a per-root ceiling attributes cost to the wrong message. The accepted
-  `meta.audience` snapshot already carries the inputs with correct arity.
-- **A stored `limitKind`.** Second representation of `budget`'s sign; can
-  disagree with the first.
-- **`relay: { applicable: false }` on pair roots.** Fails open.
-- **Turn-ceiling as the persisted control.** Inverting a route-dependent
-  map silently rewrites B; the displayed number can move opposite to the
-  authority it controls.
-- **A new `hopRun.phase`.** Stop/failure truth belongs in durable
-  outcomes; runs are deleted in `finally`.
-- **A protocol bump.** Every added field is additive; existing phases
-  remain valid; prompt text never crosses the browser boundary. Decide
-  from the final diff: bump only if a cached older UI would state something
-  false (a new phase, a removed or renamed field, an old action made
-  invalid).
-
-### Deferred — crash-window journal (own package, unspecced)
-
-`recordRelayLaunch` persists usage before the provider runs; a server crash
-before any artifact leaves usage advanced with no record and no
-provenance. The settled shape, if built: a bounded `pendingRelayLaunches`
-map keyed by a **UUID** launch id (never `${rootN}:${index}` or a state
-counter — `state.json` can be restored from backup and regress while
-`events.jsonl` cannot lose writes), written atomically with `relayUsage`
-(free: `saveState` already runs there), matched at load against terminal
-artifacts carrying the id, unmatched records grouped into one system entry
-`meta.relayRecovery.launches[]` keyed in the UI by `(target, triggerN)` and
-ranked **below** receipts and cursor like `cappedFrom`, pending roots added
-to `relayUsageProtectedRoots` so pruning cannot reset a live index. The
-open question that stopped the discussion: every provider launch has the
-same crash window, and `beginRun` (`:2496`) is already the universal
-chokepoint, so the coherent endpoint is a universal delivery-attempt
-journal with a UUID beside `runId` — at the cost of one state write before
-every launch on the hot path. Measure that before choosing scoped vs
-universal. Not part of this package.
-
-### Working rules for whoever builds it
-
-- Base: `perf-and-token-diet` at `fa01217`. One commit per package
-  section above, in order, each with its focused tests; full suite
-  (`node test/smoke.mjs`, ~7 minutes, 835 assertions green at the base)
-  after each behavioral commit. Push the branch; do not merge.
-- Fake CLI directives that matter here: `SAY:<token>` (one token),
-  `SLEEP:<ms>`, `TAG:<seat>`, `SAWWHAT`, `HOPWHAT`, `LURKWHAT`, `READY:<id>`.
-  `test/smoke.mjs` is one giant `main()`: prefix new locals to avoid
-  identifier collisions.
-- Verify the real user path for UI changes (drive the actual button, not
-  the handler); two UI regressions have passed the whole suite before.
-- Keep persisted keys and the runtime protocol number unchanged unless the
-  final diff meets the bump criterion above.
+- Automatic-turn integration: real fake-provider start counts at 0/1/2/4 and Until settled;
+  listener pass/empty, charged provider failure, later receipt link, catch-up sponsorship and
+  exhausted fallback refusal, internal session-recovery charging, immutable root policies and
+  loading legacy/durable strict state.
+- Unit: 11 passed. Retry and provenance integration passed (legacy safety limits 2 and 4).
+- Chromium: 13 passed; the three policy/provenance browser tests also reran after UI refinements.
+- Seeded scheduler coverage: 12 scenarios / 58 fake invocations passed with queue, retry, wake
+  and cap-before-stop selected. Full native Stop/generation coverage is not claimed: Windows
+  process-tree termination is restricted in this runner.
+- Packed runtime starts successfully; relative archive extraction avoids GNU tar's Windows
+  drive-letter ambiguity. Package verification is included in CI.
+- Smoke with existing restricted-runner native picker/kill exclusions: **820 passed, 1 failed**.
+  The remaining assertion assumes its temporary folder is outside any Git repository, while
+  this runner's writable temporary tree is under the Parley repository. Do not call this a
+  fully green unrestricted smoke run. The failure bundle is retained in `smoke-failure/`.
+- Syntax checks and `git diff --check` passed. Restart the actual server and reload to use
+  runtime protocol 12; explicitly switch an existing room to Automatic turns in Settings.

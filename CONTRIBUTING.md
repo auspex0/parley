@@ -9,17 +9,32 @@ of the project — please read the shape below before a big PR.
 node parley.mjs
 ```
 
-No install step, no build, no dependencies. Use Node ≥ 20 with the `claude` /
-`codex` CLIs installed and authenticated through their normal provider setup.
+No install step or build is required to run Parley; it has zero runtime dependencies.
+Use Node ≥ 20 with supported provider CLIs installed and authenticated through their
+normal setup. Browser tests use development-only dependencies.
 
 ## Running the tests
 
 ```bash
-npm test
+npm ci
+npx playwright install chromium
+npm run test:unit
+npm run test:retry
+npm run test:provenance
+npm run test:smoke
+npm run test:browser
+npm run test:sequences
+npm run bench
 ```
 
+Use focused unit/Retry/provenance checks while developing. The smoke suite remains
+available as `npm test`; browser tests supplement its fake-DOM probes with actual
+Chromium interaction. Seeded scheduler sequences and reproducible benchmarks are separate
+commands so measured performance work does not inflate every focused edit cycle. Report
+the commands and current results you ran, including benchmark environment and seed.
+
 The smoke suite ([test/smoke.mjs](test/smoke.mjs)) boots a real server against a
-fake agent CLI ([test/fake-cli.mjs](test/fake-cli.mjs)) that speaks both wire
+fake agent CLI ([test/fake-cli.mjs](test/fake-cli.mjs)) that speaks the supported wire
 protocols. So it exercises routing, the delta protocol, session resume, per-seat
 flags, lurk and right of reply, hops, pair sessions, per-agent lanes, queueing,
 work mode and activity lines — **without a provider login and without spending a
@@ -27,7 +42,7 @@ token.** CI runs it on Linux, Windows and macOS, across Node 20, 22 and 24.
 
 The fake is driven by directives in the prompt, which makes new tests short to
 write. Common directives include `SAY:`, `RECALL`, `ARGS`, `TAG:`, `WRITE:`,
-`CHIME`, `NEEDSFIX`, `SHOWCASE`, `NEVERHAPPY`, `SLEEP:`, `FAILONCE:`, `RESUMEERROR`,
+`CHIME`, `NEEDSFIX`, `SHOWCASE`, `NEVERHAPPY`, `SLEEP:`, `FAILONCE:`, `FAILONCESEAT:`, `RESUMEERROR`,
 `MISSINGSESSION`, `SPAWNCHILD:`, `REVIEWFAILONCE`, `FIXFAILONCE`, `REVIEWFAIL`
 and `FAIL`; the complete, current list is documented at the top of
 [test/fake-cli.mjs](test/fake-cli.mjs). `ARGS` is especially handy: the fake
@@ -39,15 +54,23 @@ worth a line in the suite.
 
 ## The shape of the project
 
-Two files do everything: [parley.mjs](parley.mjs) (server: adapters, room
-engine, HTTP + SSE) and [ui/index.html](ui/index.html) (the whole frontend).
-That's deliberate — Parley runs on top of your existing CLI logins, so being
-auditable in an afternoon matters more than architectural elegance.
+The single entrypoint remains [parley.mjs](parley.mjs). Focused modules in `lib/`
+hold budget policy, dynamic prompts, causal scheduling and client-asset snapshots.
+The UI separates [markup](ui/index.html), [styles](ui/styles.css) and
+[JavaScript](ui/app.js). All three are captured together at server startup;
+versioned asset URLs prevent a running page from mixing source revisions.
+
+Extract cohesive provider, persistence and HTTP boundaries when they help; avoid
+splitting a scheduler into many mutually dependent fragments. Keep mechanical
+extraction separate from behavior changes and verify `npm pack --dry-run` includes
+every runtime module and client asset.
 
 Two rules follow from it:
 
-1. **If a feature doesn't fit in those files, it probably doesn't ship.** No
-   framework, no bundler, no database, no runtime dependencies.
+1. **Keep startup simple.** One command; no framework, bundler, database or runtime
+   dependencies. Test tooling may be development-only. Prefer importing helpers in
+   focused tests over extracting fragments from source text; retain DOM probes where
+   DOM lifetime itself is the behavior under test.
 2. **Agent capability, yes; UI chrome, no.** Agents may read, write and run
    commands. But their actions render as inline chat lines — not a diff viewer,
    file tree, or embedded terminal. The chat is the interface; the user's editor

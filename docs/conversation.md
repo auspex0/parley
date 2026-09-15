@@ -1,6 +1,6 @@
 # How the room behaves
 
-Routing, delivery, the context protocol, lurk mode, agent-to-agent hops and pair sessions. This is the detailed reference; the [README](../README.md) has the short version.
+Routing, delivery, the context protocol, lurk mode, agent-to-agent continuations and pair sessions. This is the detailed reference; the [README](../README.md) has the short version.
 
 ## Talking to the table
 
@@ -19,7 +19,7 @@ Each agent has its own **lane**: a message dispatches immediately if *its* targe
 
 Everything you send is accepted the moment you send it — it appears in the conversation straight away, in the order you sent it, and only its *delivery* waits for a busy agent (⏳ badge, delivered in order). `@both` is delivered per lane too: the free agent answers immediately and the busy one receives the same message when it finishes, badged "⏳ delayed". Sent while both are busy, each answers as it frees rather than both waiting for the slower one. Provider turns remain atomic: a reply that lands while its sibling is still generating is not injected into that running prompt. Once both initial `@both` turns have succeeded, Parley delivers each sibling reply to the other at the next safe boundary; a cancelled, sleeping or failed half is not resurrected by that rule.
 
-**A burst becomes one turn.** Several messages sent to one seat while it is busy used to run one provider call each, back to back — and every call after the first was a near-pure re-ask, because the previous turn's delta had already delivered the later messages. When the seat frees, the ready burst now merges into a single turn shaped exactly like Wake & deliver: the newest message is the root, the earlier ones sit above it in the delta at their real positions, and a note asks for one reply covering all of them. Each message keeps its own ⏳ cancel while it waits; @both halves, pair turns, redirects and any message the seat has already read never merge. The merged turn is one exchange: hops and the lurk pass belong to the newest message, and stopping it stops all of them — every merged message shows as interrupted, with its own Retry.
+**A burst becomes one turn.** Several messages sent to one seat while it is busy used to run one provider call each, back to back — and every call after the first was a near-pure re-ask, because the previous turn's delta had already delivered the later messages. When the seat frees, the ready burst now merges into a single turn shaped exactly like Wake & deliver: the newest message is the root, the earlier ones sit above it in the delta at their real positions, and a note asks for one reply covering all of them. Each message keeps its own ⏳ cancel while it waits; @both halves, pair turns, redirects and any message the seat has already read never merge. The merged turn is one exchange: continuations and the lurk pass belong to the newest message, and stopping it stops all of them — every merged message shows as interrupted, with its own Retry.
 
 Your message is never posted twice, and the exchange it triggers still runs once, after both have replied. Splitting never reorders anything: a held half joins the back of that agent's own lane, so a message you sent earlier is still answered first. Everything you send outranks agent-to-agent follow-ups, so the agents can't answer each other before they answer you; and a late agent that has already read the early one's reply isn't asked about it a second time.
 
@@ -37,7 +37,7 @@ The **⏳ queued** badge opens the queue itself. One card per *dispatch* — the
 
 **Pause** holds the queue without dropping any of it. Nothing new starts, responses already running finish normally, and the queue keeps its exact contents and order — the badge switches to **⏸ held** and cards read "held #2" rather than "queued #2". Anything you send while it is held joins the queue too, so pause-then-compose works: line up three messages, read what came back, then release them. **Resume** starts everything whose seat is free, in order.
 
-The hold is about *your* work, not the agents'. Hops, a live lurker's right of reply and causal answers between the agents are unaffected — a paused delivery stops competing for the seat, so an agent follow-up is not left waiting on a seat nobody is going to claim. A lurk catch-up owed to a held seat becomes a persisted obligation that runs on resume, exactly as it would behind a busy seat.
+The hold is about *your* work, not the agents'. Continuations, a live lurker's right of reply and causal answers between the agents are unaffected — a paused delivery stops competing for the seat, so an agent follow-up is not left waiting on a seat nobody is going to claim. A lurk catch-up owed to a held seat becomes a persisted obligation that runs on resume, exactly as it would behind a busy seat.
 
 Pause is deliberately not saved across a restart: there would be no queue behind it, and it would silently swallow the first thing you sent. It is also armed rather than counted — pausing an empty queue is allowed and holds whatever you send next, which is why the badge stays visible saying so.
 
@@ -59,7 +59,7 @@ The quoted message is restaged into that turn's prompt, so the seat can answer e
 
 ### Stop is four intentions, not one button
 
-**Stop** is four separate intentions rather than one button and a guess: stop a named agent's current response, stop the current responses but keep queued work, cancel the queue but let the running responses finish, or stop everything — responses, pair cycle, hops, lurkers and queue. Each click names the response it meant, so a click that lands after that response has already ended does nothing rather than killing the next one, and it never reports an error you would answer by clicking again.
+**Stop** is four separate intentions rather than one button and a guess: stop a named agent's current response, stop the current responses but keep queued work, cancel the queue but let the running responses finish, or stop everything — responses, pair cycle, continuations, lurkers and queue. Each click names the response it meant, so a click that lands after that response has already ended does nothing rather than killing the next one, and it never reports an error you would answer by clicking again.
 
 **The ■ button acts; the ▾ beside it chooses.** When one seat is replying and nothing is queued — the ordinary case — ■ stops that response on the first click, and the follow-ups it would have triggered stop with it. It widens only when a single click genuinely cannot answer the question: two seats running, work still queued, or a pair cycle in flight all open the chooser instead. The ▾ opens that same chooser whenever you want it, which is where per-seat stops live. An open menu is a snapshot: rows never reorder under your cursor, and work that finishes while you are aiming goes grey in place rather than vanishing.
 
@@ -132,7 +132,43 @@ Sleep is **manual only**. Parley never infers it from a provider error — the C
 
 Sleep lives in `state.json` beside the per-seat cursors, not in `room.json` beside `lurk`: it is a temporary, externally caused *condition*, not part of how the seat is configured. So it survives restarts, and it survives **Archive & start fresh** — a rate-limited account does not become invocable again because you archived a conversation.
 
-## Agent-to-agent hops & right of reply
+<a id="agent-to-agent-hops--right-of-reply"></a>
+
+## Continuations & right of reply
+
+### Automatic turns (new rooms)
+
+New rooms default to **4 automatic turns per user message**. The first responses you
+explicitly requested do not count. Every subsequent automatic provider invocation counts:
+sibling delivery on `@both`, response to a tag, listening, answer return, follow-up,
+coalesced catch-up, and an internal fresh-session recovery retry. Pass, empty output,
+failure and Stop after admission do not refund the unit. Receiving several messages in
+one invocation costs one, not one per message. Pair rounds remain separate.
+
+At 0, `@both` gets two independent initial responses with no automatic peer turns.
+At 4, it gets **up to four additional invocations**, not a promised number of rounds.
+No free return or terminal catch-up bypasses the limit. Blocked work is not agreement
+or successful delivery; it can be included as context on a later authorized turn.
+Until settled uses the server safety limit captured when the message was accepted.
+
+Coalesced catch-up has one owner: the first-scheduled eligible pending obligation.
+Eligibility includes remaining allowance, permissions, Sleep and Stop. The owner is
+fixed before launch and owns downstream turns; other covered messages add context,
+not charges. If no owner is eligible, nothing automatically starts.
+
+Existing rooms keep **Extra exchanges** until explicitly switched in Settings.
+Already accepted messages retain their accounting version, budget and durable use
+through Retry, Wake and restart. No legacy counts are converted. Settings and composer
+changes apply only to future messages. Custom counting remains deferred.
+
+**Why did this run?** separates trigger, received context, allowance and outcome.
+Automatic replies show their used/limit counter. Failure diagnostics are expandable;
+successful later receipts can show “included as context for reply #N”, which does not
+claim the message was answered or resolved. Silent deliveries have no invented reply link.
+
+### Extra exchanges (legacy compatibility)
+
+The remaining rules in this section describe the compatibility preset, not Automatic turns.
 
 The live relay is a causal **request/answer scheduler**. A request is an agent-produced entry that Parley owes to one peer:
 
@@ -141,25 +177,56 @@ The live relay is a causal **request/answer scheduler**. A request is an agent-p
 
 A single-addressed reply that neither tags nor otherwise calls the peer creates no request. That boundary keeps ordinary one-seat work quiet instead of turning every agent utterance into a two-seat call. Markdown emphasis around a real tag is transparent — `**@codex**` calls exactly like `@codex` — while ordinary prose such as "give Codex write access" does not.
 
-Mentions inside fenced code, inline code and blockquotes are examples, not routing. Parley masks those regions only in a detection copy, preserving every newline; the transcript and prompt remain untouched. This also prevents a pasted `@codex` example from consuming a handoff.
+In agent replies, mentions inside fenced code, inline code and blockquotes are examples, not automatic calls. Parley masks those regions only in a detection copy, preserving every newline; the transcript and prompt remain untouched. User-message routing is separate: explicit seat tags anywhere in your text override the recipient chip, and Markdown emphasis around a leading tag is accepted. The composer preview uses the same rule as the server.
 
 The server, not the model, owns the counter. `hopBudget` is snapshotted when each user message is accepted, and charged usage is persisted against that user-message root. Wake & deliver and Retry therefore resume the root's already-spent count and remaining budget instead of minting a fresh allowance. The bounded execution-history map retains the newest 200 inactive roots with charged usage, plus any older root that is still active, held or retryable, so state stays bounded without erasing an unresolved exchange's cap:
 
-- **`-1` / `∞`** — follow up until the exchange settles, still fenced by the emergency safety stop.
+- **`-1` / Until settled** — continue until settled, with the actual server safety maximum shown in the menu and live counter.
 
-A new room starts at **3** rather than ∞. One charged hop can mean two provider calls, so an unlimited default let a first cross-tagged exchange spend a dozen before anyone had a feel for what a hop costs; ∞ is one click away in the composer control and in Settings, and rooms created before this keep whatever they had.
+The previous new-room default was **3** extra exchanges. One charged continuation can mean up to two agent turns: its request and one free answer return. Until settled is available in the composer and Settings; existing rooms keep their configured value.
 - **`0`** — launch no charged requests; structural requests and answers already owed still run.
 - **positive integer** — launch at most that many charged requests. Settings accepts any safe whole number; the compact composer control offers quick values through `8`.
 
+The composer calls this policy **Continuations**. Its shortcut remains selected for this room
+and browser session, including reloads; a visible “override” label identifies a message override.
+Changing the room default or shortcut affects newly accepted messages. Retry/Wake keep the
+original message's budget and use, and a limit reached on an old message is not reopened by a
+settings edit. These units measure neither tokens nor money.
+
+For a **fresh, isolated message**, let B be its effective continuation limit, including the
+server safety ceiling. The current compatibility policy gives these agent-turn estimates:
+
+| Route | Estimate |
+|---|---:|
+| Solo | 1 |
+| One seat, no eligible live listener | 1 + 2B |
+| One seat with an eligible live listener | 4 + 2B |
+| Ordinary `@both` | 5 + 2B |
+| Pair | Separate review rounds |
+
+Thus `@both` with zero continuations can still use up to five agent turns, and one continuation
+up to seven. These are fresh-message estimates, not lifetime spend or remaining-turn guarantees.
+Coalesced catch-up can serve several roots in one invocation; Parley does not invent per-root
+“turns completed” totals from its receipts.
+
+Charged replies show their launch counter and **Why did this run?** identifies the trigger,
+delivery kind, original policy source and allowance use. A direct response is labelled
+“invoked by your message”; a causal reply names the peer message that triggered it. Delayed
+catch-up shows the exact covered user messages and range, with “caught up · N messages” when
+several roots were combined. `[pass]` and empty successful responses have distinct receipt
+outcomes. Failure or Stop after launch spends the continuation but does not advance the cursor
+or write a success receipt. A cap says what was not launched; separately owed delivery may
+still complete, subject to Stop, Sleep and withholding rules.
+
 The initial agent response is not a hop. A charged request spends one hop only when Parley launches its target: an asleep target or a late target whose cursor already covers the request spends nothing, while a launched call that later fails still spends one. Structural requests remain eligible even at budget zero.
 
-Every launched request that produces an answer earns one free, read-only **answer return** to its immediate caller. If that return says `[pass]`, the chain settles. If it speaks, that speech becomes the next charged request to the agent who supplied the answer — no new `@tag` is required, and an explicit tag does not charge the same return twice. Consequently one counted hop can launch up to two provider turns: the charged request itself and its uncharged answer return. Further speech must spend the next hop.
+Every launched request that produces an answer earns one free, read-only **answer return** to its immediate caller. If that return says `[pass]`, the chain settles. If it speaks, that speech becomes the next charged request to the agent who supplied the answer — no new `@tag` is required, and an explicit tag does not charge the same return twice. Consequently one counted continuation can launch up to two provider turns: the charged request itself and its uncharged answer return. Further speech must spend the next continuation.
 
 At the cap, Parley does not launch the next charged request. Its text is already in the transcript and reaches that seat as ordinary context on a later deliberate turn; a durable system line records what was not delivered. Cursor reconciliation happens before that line is written, so a structural or full-delta delivery that already carried the entry cannot leave a false cap notice. The live counter beside the composer reports charged launches in the latest active exchange, and each launched charged request is told how many remain; the relay remains authoritative if the model ignores the hint.
 
-The composer control is a sticky shortcut: **Room default**, **Solo**, `∞`, or `0`–`8`. Its choice remains selected across sends and page reloads for that room during the current browser session; switching rooms restores that room's own shortcut. Every accepted user message still receives its own immutable policy snapshot. **Solo** requires one ordinary addressee, suppresses both lurk and agent-to-agent handoffs for that message, and is rejected with `@both` or a Pair turn. It controls reaction, not later visibility: the other seat can still read that transcript entry in a future delta.
+The composer control is a sticky shortcut: **Room default**, **Solo**, **Until settled**, or `0`–`8`. Its choice remains selected across sends and page reloads for that room during the current browser session; switching rooms restores that room's own shortcut. Every accepted user message still receives its own immutable policy snapshot. **Solo** requires one ordinary addressee, suppresses both lurk and agent-to-agent handoffs for that message, and is rejected with `@both` or a Pair turn. It controls reaction, not later visibility: the other seat can still read that transcript entry in a future delta.
 
-The live status beside it belongs to the exchange already running, not to the shortcut for later messages. For example, **Hops used 3 · limit ∞** means three charged requests have launched in an exchange that started under `∞`; selecting `3` while it runs affects subsequent accepted messages and cannot retroactively rewrite that exchange.
+The live status belongs to the original message already running. **Continuations 3/4 · safety** means three continuations launched under a server safety ceiling of four. Its tooltip identifies the original policy source. Selecting a new shortcut while it runs affects later accepted messages and cannot change that message's policy.
 
 A busy request target waits for its lane instead of losing the call, but never interrupts a provider turn already in progress. Successful initial `@both` replies are each structural requests to their sibling at that safe boundary, even with `hopBudget: 0`; this is how the slower-looking transcript order is reconciled with what each atomic prompt actually contained.
 

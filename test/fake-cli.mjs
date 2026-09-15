@@ -66,6 +66,7 @@
  *   SLEEP:<ms>      stay busy this long before replying (occupies a seat)
  *   FAILONCE:<id>   fail one process invocation, then succeed on explicit Retry
  *   FAILONCESEAT:<seat>  as FAILONCE, but only on that seat's CLI
+ *   HOPRESULT:<mode> call the peer, which returns empty/pass or pauses (slow)
  *   RESUMEERROR     fail a resumed invocation with a generic provider error
  *   MISSINGSESSION  fail a resumed invocation as a missing native session
  *   RESUMEDELAY:<ms> hold a resumed invocation open before it fails, so a test
@@ -209,13 +210,48 @@ const isClosure = has("causal closure delivery", prompt) || has("causal answer d
 const isReview = has("you are the reviewer", prompt);
 const isFix = has("review feedback above", prompt);
 const isHop = has("You were addressed directly by the other agent", prompt);
-const isPeerRequest = isHop || has("same @both exchange", prompt) ||
+const isAutomaticTurn = has("Another agent's message was delivered for your response", prompt);
+const isPeerRequest = isAutomaticTurn || isHop || has("same @both exchange", prompt) ||
   has("lurking agent just chimed in", prompt) || has("new continuation under", prompt);
 const isSiblingRequest = has("same @both exchange", prompt);
 const round = Number((/round (\d)/.exec(prompt) || [])[1] || 0);
 
+// Opt-in integration evidence records the adapter's actual invocation input
+// without changing its response. It never runs for authenticated providers.
+if (process.env.FAKE_TRACE_PROMPTS === "1") {
+  const traceFile = path.resolve(process.cwd(), ".fake-cli-prompts.jsonl");
+  const seat = codexMode ? "codex" : "claude";
+  const previous = fs.existsSync(traceFile)
+    ? fs.readFileSync(traceFile, "utf8").trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line)) : [];
+  const ended = new Set(previous.filter((event) => event.event === "end").map((event) => event.pid));
+  const overlappingPids = previous.filter((event) => event.event === "start" && event.seat === seat && !ended.has(event.pid))
+    .map((event) => event.pid).filter((pid) => { try { process.kill(pid, 0); return true; } catch { return false; } });
+  const sep = ["", "", "---", "", ""].join("\n");
+  const briefing = codexMode
+    ? (rawInput.includes(sep) ? rawInput.slice(0, rawInput.indexOf(sep)) : "")
+    : (arg("--append-system-prompt") || "");
+  const phase = isLurk ? "lurk" : isClosure ? "closure" : isReview ? "review" : isFix ? "fix"
+    : isHop ? "explicit" : isSiblingRequest ? "sibling"
+      : has("new continuation under", prompt) ? "continuation"
+        : has("lurking agent just chimed in", prompt) ? "lurk-return"
+          : has("delayed lurk catch-up", prompt) && has("right of reply", prompt) ? "catch-up-return" : "root";
+  fs.appendFileSync(traceFile, JSON.stringify({ event: "start", pid: process.pid, startedAt: Date.now(), seat, phase, prompt, briefing, overlappingPids }) + "\n");
+  process.once("exit", (code) => {
+    fs.appendFileSync(traceFile, JSON.stringify({ event: "end", pid: process.pid, endedAt: Date.now(), code }) + "\n");
+  });
+}
+
 let reply, wroteFile = null;
-if (isReview) {
+if (after("HOPRESULT:")) {
+  const mode = after("HOPRESULT:");
+  if (isPeerRequest && ["fail", "rate"].includes(mode)) {
+    process.stderr.write(mode === "rate" ? JSON.stringify({ type: "rate_limit_event", rate_limit_info: {
+      status: "rejected", rateLimitType: "five_hour", overageDisabledReason: "out_of_credits" } }) : "fake automatic failure");
+    process.exit(1);
+  }
+  reply = isPeerRequest ? (mode === "empty" ? "" : mode === "pass" ? "[pass]" : "SLOW_COMPLETE")
+    : `@${codexMode ? "claude" : "codex"} HOPRESULT:${mode}`;
+} else if (isReview) {
   // NEVERHAPPY keeps the reviewer unsatisfied so a test can reach the round
   // cap; the marker rides along in the feedback so the next round sees it.
   const showcase = has("SHOWCASE", prompt);
@@ -254,7 +290,8 @@ if (isReview) {
 } else if (isHop && has("HOPWHAT", prompt)) {
   reply = "HOPJSON " + JSON.stringify(String(prompt || "").replaceAll("@", "\\u0040"));
 } else if (isLurk) {
-  if (has("LURKVERSION", prompt)) {
+  if (has("LURKEMPTY", prompt)) reply = "";
+  else if (has("LURKVERSION", prompt)) {
     reply = prompt.startsWith("[Update to your standing instructions") ? "LURKVERSIONYES" : "LURKVERSIONNO";
   }
   else if (has("LURKWHAT", prompt)) {
@@ -477,7 +514,8 @@ if ((isReview && /\bREVIEWFAIL\b/.test(current)) || /\bFAIL\b/.test(current)) {
 const slept = after("SLEEP:");
 const orderDelay = has("ORDERSTART") && !codexMode ? 400 : 0;
 const reviewDelay = isReview && has("SLOWREVIEW", prompt) ? 5000 : 0;
-await new Promise((r) => setTimeout(r, Number(slept || reviewDelay || process.env.FAKE_DELAY_MS || 250) + orderDelay));
+const hopDelay = isPeerRequest && after("HOPRESULT:") === "slow" ? 5000 : 0;
+await new Promise((r) => setTimeout(r, Number(slept || reviewDelay || hopDelay || process.env.FAKE_DELAY_MS || 250) + orderDelay));
 
 const out = (o) => process.stdout.write(JSON.stringify(o) + "\n");
 // Small pieces, spread over time, so one reply crosses several server-side

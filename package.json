@@ -12,7 +12,18 @@
   },
   "scripts": {
     "start": "node parley.mjs",
-    "test": "node test/smoke.mjs"
+    "test": "node test/smoke.mjs",
+    "test:smoke": "node test/smoke.mjs",
+    "test:browser": "playwright test --config test/browser.config.mjs",
+    "test:unit": "node --test test/unit.mjs",
+    "test:retry": "node test/retry.mjs",
+    "test:automatic": "node test/automatic.mjs",
+    "test:provenance": "node test/provenance.mjs",
+    "test:sequences": "node test/scheduler-sequences.mjs",
+    "bench": "node test/benchmark.mjs",
+    "test:integration": "npm run test:retry && npm run test:provenance && npm run test:sequences && npm run test:automatic",
+    "test:all": "npm run test:unit && npm run test:integration && npm run test:smoke && npm run test:browser && npm run test:package",
+    "test:package": "node test/package.mjs"
   },
   "license": "MIT",
   "publishConfig": {
@@ -32,9 +43,13 @@
   ],
   "files": [
     "parley.mjs",
+    "lib/",
     "ui/",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"
-  ]
+  ],
+  "devDependencies": {
+    "@playwright/test": "^1.62.1"
+  }
 }

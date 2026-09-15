@@ -1,0 +1,126 @@
+import { test, expect, createRoom, send, idle } from "./browser-fixture.mjs";
+
+test("strict accounting switch, literal projections, failed outcome and later receipt link", async ({ app, server }) => {
+  await createRoom(app, server, "strict-ui");
+  await expect(app.locator("#hopBtnLabel")).toContainText("Extra exchanges");
+  await app.locator("#settingsBtn").click();
+  await expect(app.locator('#s_accounting option[value="exchanges"]')).toBeDisabled();
+  await app.locator("#s_accounting").selectOption("automatic");
+  await app.locator("#s_hopbudget").fill("1");
+  await app.locator("#mSave").click();
+  await expect(app.locator("#hopBtnLabel")).toContainText("Automatic turns: Room (1)");
+  await expect(app.locator("#hopAccountingNote")).toContainText("Every automatic start counts");
+  await expect(app.locator("#hopAccountingNote")).not.toContainText("request and its free answer return");
+  await app.locator("#settingsBtn").click();
+  await expect(app.locator('#s_accounting option[value="exchanges"]')).toHaveCount(0);
+  await app.locator("#mCancel").click();
+  await app.locator("#input").fill("@both compare");
+  await app.locator("#hopBtn").click();
+  await expect(app.locator('[data-hop-choice="0"]')).toContainText("up to 2 turns");
+  await expect(app.locator('[data-hop-choice="1"]')).toContainText("up to 3 turns");
+  await app.locator('[data-hop-choice="default"]').click();
+  await send(app, "@codex HOPRESULT:rate");
+  let d = await idle(server, "strict-ui");
+  const failure = d.entries.find((e) => e.meta?.error);
+  expect(failure).toBeTruthy();
+  const row = app.locator(`[data-n="${failure.n}"]`);
+  await expect(row).toContainText("five-hour");
+  await row.locator(".why-run summary").click();
+  await expect(row.locator(".why-run")).toContainText("Outcome: failed");
+  await expect(row.locator(".why-run")).toContainText("Consumed automatic turn 1/1");
+  await expect(row.getByText("Technical details", { exact: true })).toBeVisible();
+  await send(app, "@claude SAY:RECOVERED");
+  d = await idle(server, "strict-ui");
+  await expect(row.locator(".why-run")).toContainText("later included as context for reply");
+  await expect(row.locator(".why-run [data-jump-n]")).toBeVisible();
+  const final = d.entries.filter((e) => e.kind === "agent").at(-1);
+  const why = app.locator(`[data-n="${final.n}"] .why-run`);
+  await why.locator("summary").click();
+  await expect(why).toContainText("Outcome: replied");
+});
+
+test("current-policy menu uses routing, real safety limits and a sticky override", async ({ app, server }) => {
+  await createRoom(app, server, "policy-ui");
+  await app.locator("#input").fill("@both compare");
+  await app.locator("#hopBtn").click();
+  const zero = app.locator('[data-hop-choice="0"]');
+  const one = app.locator('[data-hop-choice="1"]');
+  await expect(zero).toContainText("up to 5 turns");
+  await expect(one).toContainText("up to 7 turns");
+  await expect(app.locator('[data-hop-choice="-1"]')).toHaveAttribute("title", /safety max 4/);
+  await expect(app.locator('[data-hop-choice="-1"]')).toContainText("up to 13 turns");
+  await app.locator("#input").fill("**@codex** explain");
+  await expect(app.locator("#routeHint")).toContainText(/Codex/i);
+  await expect(zero).toContainText("up to 1 turn");
+  await expect(one).toContainText("up to 3 turns");
+  await server.configure("policy-ui", { agents: { claude: { lurk: true } } });
+  await expect(zero).toContainText("up to 4 turns");
+  await expect(one).toContainText("up to 6 turns");
+  await server.configure("policy-ui", { agents: { claude: { lurk: true, permissionMode: "bypassPermissions" } } });
+  await expect(zero).toContainText("up to 1 turn");
+  expect((await server.room("policy-ui")).room.agents.claude.liveLurkEligible).toBe(false);
+  await server.configure("policy-ui", { agents: { claude: { lurk: true, permissionMode: "auto" } } });
+  await expect(zero).toContainText("up to 4 turns");
+  await one.click();
+  await expect(app.locator("#hopBtnLabel")).toContainText("1 · override");
+  await app.reload();
+  await expect(app.locator("#connDot")).toHaveClass(/on/);
+  await expect(app.locator("#hopBtnLabel")).toContainText("1 · override");
+  await app.locator("#hopBtn").click();
+  await expect(app.locator("#hopOverrideNote")).toContainText("Message override: 1 · Room default: 0");
+  await app.locator('[data-hop-choice="solo"]').click();
+  await send(app, "**@codex** SAY:POLICY_ROOT");
+  const finished = await idle(server, "policy-ui");
+  const root = finished.entries.find((entry) => entry.kind === "user");
+  expect(root.target).toBe("codex");
+  expect(root.meta.relay).toMatchObject({ solo: true, source: "solo" });
+  expect(finished.entries.filter((entry) => entry.kind === "agent")).toHaveLength(1);
+  const response = app.locator('.msg.agent.codex[data-n]');
+  await expect(response.locator(".quote-ref")).toContainText("invoked by your message");
+  await response.locator(".why-run summary").click();
+  await expect(response.locator(".why-run")).toContainText("Did not consume a continuation");
+  await expect(response.locator(".why-run")).toContainText("Solo override");
+});
+
+test("provenance preserves charged outcomes, exact catch-up roots and old-summary uncertainty", async ({ app, server }) => {
+  await createRoom(app, server, "provenance-ui");
+  const results = await app.evaluate(() => {
+    const launch = { rootN: 10, triggerEntryN: 11, index: 2, budget: -1, limit: 4, source: "message" };
+    const catchUp = { rootNs: [2, 7, 10], fromN: 2, throughN: 14 };
+    const previousSummary = state.summary;
+    const previousEntries = state.entries;
+    const previousReceipts = state.receipts;
+    const e = { n: 11, kind: "agent", author: "claude", text: "peer" };
+    const receipt = { agent: "codex", from: 10, upTo: 11, turn: 10, mode: "hop", spoke: false, relayLaunch: launch };
+    state.receipts = [{ ...receipt, outcome: "pass" }];
+    const pass = computeHeard("codex", e).title;
+    state.receipts = [{ ...receipt, outcome: "empty" }];
+    const empty = computeHeard("codex", e).title;
+    const badges = provenanceBadges({ relayLaunch: launch, catchUp });
+    state.entries = [{ n: 10, kind: "user", author: "user", text: "root", meta: { relay: { hopBudget: 1, source: "message" } } }, e];
+    const details = whyRunHTML({ n: 12, kind: "agent", author: "codex", text: "answer", meta: {
+      replyTo: 11, replyRoot: 10, relayLaunch: launch,
+      delivery: { kind: "explicit", rootN: 10, triggerEntryN: 11, source: "message", counted: true },
+    } });
+    const caughtUp = catchUpDetail(catchUp);
+    const oneRoot = catchUpLabel({ rootNs: [10, 10] });
+    state.summary = { ...previousSummary, hopSafetyLimit: undefined };
+    const unavailable = { label: hopBudgetLabel(-1), detail: hopBudgetDetail(-1), limit: effectiveHopLimit(-1),
+      estimate: freshTurnEstimate("-1", { target: "both", listeners: [] }) };
+    const missingEligibility = freshTurnEstimate("0", { target: "codex", listeners: [], listenerEligibilityKnown: false });
+    state.summary = previousSummary; state.entries = previousEntries; state.receipts = previousReceipts;
+    return { pass, empty, badges, details, caughtUp, oneRoot, unavailable, missingEligibility };
+  });
+  expect(results.pass).toContain("nothing to add ([pass])");
+  expect(results.empty).toContain("returned no content");
+  expect(results.badges).toContain("2/4 · safety");
+  expect(results.badges).toContain("caught up · 3 messages");
+  expect(results.caughtUp).toContain("#2, #7, #10");
+  expect(results.caughtUp).toContain("entries 2–14");
+  expect(results.oneRoot).toBe("caught up");
+  expect(results.details).toContain("explicit peer call");
+  expect(results.details).toContain("your message override");
+  expect(results.details).toContain("Consumed continuation 2/4");
+  expect(results.unavailable).toEqual({ label: "Until settled", detail: "server safety limit unavailable", limit: null, estimate: null });
+  expect(results.missingEligibility).toBeNull();
+});

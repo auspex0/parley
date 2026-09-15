@@ -1,0 +1,716 @@
+  :root {
+    --bg: #0b0e14;
+    --bg2: #0e1219;
+    --panel: #121722;
+    --panel2: #161c29;
+    --border: rgba(255,255,255,.07);
+    --border2: rgba(255,255,255,.12);
+    --text: #dee3ec;
+    --text-dim: #8b93a5;
+    /* Was #5c6374, about 3.2:1 on the page background — under AA for the
+       11-12px text this token is actually used for. */
+    --text-faint: #79808f;
+    --user: #7aa2f7;
+    --claude: #e8845c;
+    --codex: #2fd6a8;
+    --danger: #f26d6d;
+    /* Already the busy-pill amber; naming it keeps the palette the same size. */
+    --warn: #ffd479;
+    /* Text that sits ON an accent fill (a chip, the send button) rather than on
+       the page. It was the page background repeated as a literal in five
+       places, which is exactly what made a light theme impossible. */
+    --on-accent: #0b0e14;
+    --code-bg: #0a0d12;
+    --danger-fg: #ffb4b4;
+    --danger-wash: rgba(235,75,90,.14);
+    --danger-edge: rgba(235,75,90,.5);
+    --warn-wash: rgba(255,212,121,.10);
+    --warn-edge: rgba(255,212,121,.35);
+    --radius: 14px;
+    --mono: ui-monospace, "Cascadia Code", Consolas, "SF Mono", monospace;
+  }
+  /* Parley was dark-only, so anyone on a light desktop got an uninvited dark
+     app. Only the tokens change; every rule below is written against them. */
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f7f8fa;
+      --bg2: #eef1f5;
+      --panel: #ffffff;
+      --panel2: #f2f4f8;
+      --border: rgba(16,20,28,.10);
+      --border2: rgba(16,20,28,.17);
+      --text: #1b2130;
+      --text-dim: #5a6376;
+      --text-faint: #5f6879;
+      --user: #2f6fd0;
+      --claude: #b8502a;
+      --codex: #0f8f6a;
+      --danger: #c22f3f;
+      --warn: #9a6b13;
+      --on-accent: #ffffff;
+      --code-bg: #f4f6fa;
+      --danger-fg: #8c1f2c;
+      --danger-wash: rgba(194,47,63,.10);
+      --danger-edge: rgba(194,47,63,.35);
+      --warn-wash: rgba(154,107,19,.10);
+      --warn-edge: rgba(154,107,19,.32);
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    font: 15px/1.55 "Segoe UI Variable Text", "Segoe UI", Inter, system-ui, sans-serif;
+    color: var(--text);
+    background:
+      radial-gradient(1200px 700px at 85% -10%, rgba(47,214,168,.055), transparent 60%),
+      radial-gradient(1000px 600px at -10% 110%, rgba(232,132,92,.05), transparent 60%),
+      var(--bg);
+    overflow: hidden;
+  }
+  button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
+  input, textarea, select { font: inherit; color: inherit; }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-thumb { background: rgba(255,255,255,.1); border-radius: 5px; border: 2px solid transparent; background-clip: content-box; }
+  ::-webkit-scrollbar-track { background: transparent; }
+
+  #app { display: flex; height: 100%; }
+
+  /* ---------- sidebar ---------- */
+  #sidebar {
+    width: 250px; flex-shrink: 0; display: flex; flex-direction: column;
+    background: var(--bg2); border-right: 1px solid var(--border);
+  }
+  .logo { display: flex; align-items: center; gap: 10px; padding: 18px 18px 14px; }
+  .logo svg { flex-shrink: 0; }
+  .logo b { font-size: 17px; letter-spacing: .2px; }
+  .logo span { color: var(--text-faint); font-size: 11px; display: block; margin-top: -3px; }
+  .side-label { padding: 14px 18px 6px; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-faint); display:flex; justify-content: space-between; align-items:center;}
+  .side-label button { color: var(--text-dim); font-size: 16px; line-height: 1; padding: 2px 6px; border-radius: 6px; }
+  .side-label button:hover { background: var(--panel2); color: var(--text); }
+  #roomList { overflow-y: auto; flex: 1; padding: 0 10px; }
+  .room-item {
+    display: flex; align-items: center; gap: 4px; width: 100%; text-align: left;
+    padding: 0 6px 0 0; border-radius: 9px; color: var(--text-dim); margin-bottom: 2px;
+  }
+  /* The row is a container; this is the part that opens the room. */
+  .room-item .ropen {
+    display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0;
+    padding: 8px 4px 8px 10px; color: inherit; border-radius: 9px 0 0 9px;
+  }
+  .room-item:hover { background: var(--panel); color: var(--text); }
+  .room-item.active { background: var(--panel2); color: var(--text); }
+  .room-item .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-faint); flex-shrink: 0; }
+  /* status icons and the hover actions occupy the same slot on the right, so
+     a mode marker never sits next to a destructive button */
+  .room-item .rmeta { display: flex; gap: 3px; align-items: center; flex-shrink: 0; }
+  .room-item .racts { display: none; gap: 1px; flex-shrink: 0; }
+  .room-item:hover .rmeta { display: none; }
+  .room-item:hover .racts, .room-item:focus-within .racts { display: flex; }
+  .room-item .ract { padding: 1px 4px; border-radius: 5px; color: var(--text-faint); font-size: 12px; line-height: 1.2; cursor: pointer; }
+  .room-item .ract:hover { color: var(--text); background: var(--panel2); }
+  .room-item .ract.del:hover { color: var(--danger); }
+  .room-item.active .dot { background: var(--codex); }
+  #newRoomForm { display: none; padding: 4px 12px 8px; }
+  #newRoomForm input {
+    width: 100%; background: var(--panel); border: 1px solid var(--border2); border-radius: 8px;
+    padding: 6px 10px; color: var(--text); outline: none; font-size: 14px;
+  }
+  #newRoomForm select {
+    background: var(--panel); border: 1px solid var(--border2); border-radius: 8px;
+    padding: 4px 6px; color: var(--text-dim); font-size: 12.5px; outline: none;
+  }
+  .side-foot { padding: 12px; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 2px; }
+  .side-foot button, .side-foot a {
+    display: flex; align-items: center; gap: 9px; padding: 7px 10px; border-radius: 8px;
+    color: var(--text-dim); font-size: 13.5px; text-decoration: none;
+  }
+  .side-foot button:hover, .side-foot a:hover { background: var(--panel); color: var(--text); }
+  .side-foot .ico { width: 16px; text-align: center; opacity: .8; }
+  /* branch line: reads as a caption under Open workspace, never as an action */
+  #gitId {
+    padding: 0 10px 4px 35px; margin-top: -3px; font-size: 11.5px; color: var(--text-faint);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+
+  /* ---------- main column ---------- */
+  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
+
+  header {
+    display: flex; align-items: center; gap: 14px; padding: 12px 20px;
+    border-bottom: 1px solid var(--border); background: rgba(14,18,25,.7); backdrop-filter: blur(8px);
+  }
+  #roomTitle { font-weight: 600; font-size: 15.5px; }
+  #connDot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-faint); transition: background .3s; }
+  #connDot.on { background: var(--codex); box-shadow: 0 0 6px rgba(47,214,168,.7); }
+  .pills { display: flex; gap: 8px; margin-left: auto; }
+  .pill {
+    display: flex; align-items: center; gap: 7px; padding: 5px 12px; border-radius: 999px;
+    border: 1px solid var(--border2); font-size: 12.5px; color: var(--text-dim); background: var(--panel);
+  }
+  .pill .st { width: 7px; height: 7px; border-radius: 50%; background: var(--text-faint); }
+  .pill.claude b { color: var(--claude); font-weight: 600; }
+  .pill.codex b { color: var(--codex); font-weight: 600; }
+  .pill.linked .st { background: var(--user); }
+  .pill.busy .st { background: var(--warn); animation: pulse 1s infinite; }
+  .hdot.withheld { background: none; border: 1px solid var(--danger); opacity: .75; position: relative; }
+  .pill.bad .st { background: var(--danger); }
+  .pill .ear, .pill .moon { font-size: 13px; line-height: 1; padding: 0 1px; opacity: .25; filter: grayscale(1); transition: opacity .15s, filter .15s; }
+  .pill .ear.on, .pill .moon.on { opacity: 1; filter: none; }
+  .pill .ear:hover, .pill .moon:hover { opacity: .8; }
+  .pill.asleep { border-style: dashed; opacity: .72; }
+  /* :not(.busy) — a seat slept mid-answer is still writing that answer, and its
+     status dot has to keep saying so. */
+  .pill.asleep:not(.busy) .st { background: var(--text-faint); animation: none; }
+  @keyframes pulse { 50% { opacity: .3; } }
+  .hbtn { padding: 6px 10px; border-radius: 9px; color: var(--text-dim); font-size: 13px; border: 1px solid transparent; }
+  .hbtn:hover { background: var(--panel2); color: var(--text); border-color: var(--border); }
+
+  /* talk/work mode */
+  #modeToggle { display: flex; border: 1px solid var(--border2); border-radius: 999px; overflow: hidden; }
+  .mbtn { padding: 4px 12px; font-size: 12.5px; color: var(--text-dim); }
+  .mbtn:hover { color: var(--text); }
+  .mbtn.active[data-m="talk"] { background: var(--panel2); color: var(--text); }
+  .mbtn.active[data-m="work"] { background: rgba(224,158,66,.25); color: #f2c078; }
+  #workBanner {
+    display: none; padding: 6px 20px; font-size: 12.5px; color: #e8b45c;
+    background: rgba(224,158,66,.1); border-bottom: 1px solid rgba(224,158,66,.35);
+  }
+
+  /* agent activity lines (tool use / exec) */
+  .activity {
+    align-self: flex-start; display: flex; gap: 7px; align-items: center;
+    font-family: var(--mono); font-size: 12px; color: var(--text-dim);
+    padding: 0 10px; animation: rise .18s ease-out; max-width: 85%;
+    overflow-wrap: anywhere;
+  }
+  .activity .adot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+  .activity.claude .adot { background: var(--claude); }
+  .activity.codex .adot { background: var(--codex); }
+  .activity-more { opacity: .82; }
+  .activity-more:hover { color: var(--text); opacity: 1; }
+  .history-more { align-self: center; padding: 2px 10px; color: var(--user); font-size: 12px; }
+  .history-more:hover { text-decoration: underline; }
+
+  /* ---------- chat ---------- */
+  #chatWrap { flex: 1; overflow-y: auto; scroll-behavior: smooth; display: flex; flex-direction: column; }
+  #chat { max-width: 880px; width: 100%; margin: 0 auto; padding: 26px 24px 10px; display: flex; flex-direction: column; gap: 18px; }
+
+  .msg { display: flex; flex-direction: column; max-width: 78%; animation: rise .18s ease-out; }
+  @keyframes rise { from { opacity: 0; transform: translateY(5px); } }
+  .msg.user { align-self: flex-end; align-items: flex-end; }
+  .msg.agent { align-self: flex-start; }
+  .meta { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-faint); margin: 0 6px 5px; }
+  .meta .who { font-weight: 600; font-size: 12.5px; }
+  .msg.claude .who { color: var(--claude); }
+  .msg.codex .who { color: var(--codex); }
+  .msg.user .who { color: var(--user); }
+  .avatar {
+    width: 22px; height: 22px; border-radius: 7px; display: inline-flex; align-items: center; justify-content: center;
+    font-size: 12px; font-weight: 700; color: var(--on-accent);
+  }
+  .msg.claude .avatar { background: var(--claude); }
+  .msg.codex .avatar { background: var(--codex); }
+  .bubble {
+    padding: 11px 15px; border-radius: var(--radius); font-size: 14.8px;
+    background: var(--panel); border: 1px solid var(--border);
+    /* `anywhere`, not `break-word`: only `anywhere` shrinks min-content width, so a
+       pasted token with no break opportunity (DKIM key, base64) can't push the bubble
+       past .msg's max-width and spill sideways over the sidebar. */
+    overflow-wrap: anywhere; min-width: 40px;
+    /* Hard cap so a wide child (code block, table) can't push the bubble past .msg
+       either — without this their overflow-x scrollers never actually engage. */
+    max-width: 100%;
+  }
+  .msg.user .bubble {
+    background: linear-gradient(135deg, rgba(122,162,247,.16), rgba(122,162,247,.09));
+    border-color: rgba(122,162,247,.25);
+  }
+  .msg.claude .bubble { border-left: 2px solid rgba(232,132,92,.55); }
+  .msg.codex .bubble { border-left: 2px solid rgba(47,214,168,.5); }
+  .attachments { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 9px; }
+  .attachments:first-child { margin-top: 0; }
+  .attachment {
+    display: block; max-width: min(360px, 100%); border: 1px solid var(--border2);
+    border-radius: 10px; overflow: hidden; background: rgba(0,0,0,.18);
+  }
+  .attachment img { display: block; max-width: 100%; max-height: 320px; object-fit: contain; }
+  .attachment .attachment-name { display: block; padding: 4px 8px; color: var(--text-faint); font-size: 11px; }
+  .attachment-file {
+    display: flex; align-items: center; gap: 10px; min-width: 210px; padding: 10px 12px;
+    color: var(--text); text-align: left; cursor: pointer;
+  }
+  .attachment-file:hover { border-color: var(--user); background: rgba(122,162,247,.08); }
+  .attachment-file:disabled { cursor: wait; opacity: .7; }
+  .attachment-file-icon { font-size: 22px; flex-shrink: 0; }
+  .attachment-file-copy { min-width: 0; }
+  .attachment-file .attachment-name { padding: 0; color: var(--text); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .attachment-file-size { display: block; margin-top: 2px; color: var(--text-faint); font-size: 11px; }
+  .bubble > :first-child { margin-top: 0; }
+  .bubble > :last-child { margin-bottom: 0; }
+  .bubble p { margin: 8px 0; }
+  .bubble h1, .bubble h2, .bubble h3, .bubble h4 { margin: 14px 0 6px; line-height: 1.3; }
+  .bubble h1 { font-size: 1.25em; } .bubble h2 { font-size: 1.15em; } .bubble h3 { font-size: 1.05em; } .bubble h4 { font-size: 1em; }
+  .bubble ul, .bubble ol { margin: 8px 0; padding-left: 22px; }
+  .bubble li { margin: 3px 0; }
+  .bubble blockquote { margin: 8px 0; padding: 4px 12px; border-left: 3px solid var(--border2); color: var(--text-dim); }
+  .bubble hr { border: none; border-top: 1px solid var(--border2); margin: 12px 0; }
+  .bubble a { color: var(--user); text-decoration: none; }
+  .bubble a:hover { text-decoration: underline; }
+  .bubble code { font-family: var(--mono); font-size: .88em; background: rgba(255,255,255,.08); padding: 2px 5px; border-radius: 5px; }
+  .md-table-wrap { max-width: 100%; margin: 10px 0; overflow-x: auto; border: 1px solid var(--border2); border-radius: 9px; }
+  .bubble table { width: 100%; min-width: max-content; border-collapse: collapse; font-size: .92em; }
+  .bubble th, .bubble td { max-width: 420px; padding: 8px 10px; border-right: 1px solid var(--border); border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
+  .bubble th { background: rgba(255,255,255,.055); color: var(--text); font-weight: 650; }
+  .bubble tbody tr:nth-child(even) { background: rgba(255,255,255,.025); }
+  .bubble tr:last-child td { border-bottom: 0; }
+  .bubble th:last-child, .bubble td:last-child { border-right: 0; }
+  .bubble th.align-center, .bubble td.align-center { text-align: center; }
+  .bubble th.align-right, .bubble td.align-right { text-align: right; }
+  .codeblock { position: relative; margin: 10px 0; border: 1px solid var(--border2); border-radius: 10px; background: var(--code-bg); overflow: hidden; }
+  .codeblock .cb-head { display: flex; justify-content: space-between; align-items: center; padding: 5px 12px; font-size: 11.5px; color: var(--text-faint); border-bottom: 1px solid var(--border); }
+  .codeblock .cb-copy { font-size: 11.5px; color: var(--text-dim); padding: 2px 8px; border-radius: 6px; }
+  .codeblock .cb-copy:hover { background: var(--panel2); color: var(--text); }
+  .codeblock pre { margin: 0; padding: 12px 14px; overflow-x: auto; }
+  .codeblock code { background: none; padding: 0; font-size: 13px; line-height: 1.5; }
+  /* Highlighting reuses the palette rather than introducing a theme of its
+     own, so it follows light and dark with everything else. */
+  .tok-com { color: var(--text-faint); font-style: italic; }
+  .tok-str { color: var(--codex); }
+  .tok-kw  { color: var(--user); }
+  .tok-lit { color: var(--claude); }
+  .tok-num { color: var(--claude); }
+
+  .sysmsg { align-self: center; text-align: center; max-width: 85%; font-size: 12.8px; color: var(--text-dim);
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 7px 14px; animation: rise .18s ease-out; }
+  .sysmsg.err { color: #f2a1a1; border-color: rgba(242,109,109,.3); }
+  .sysmsg .retry { margin-left: 8px; color: var(--user); font-weight: 600; }
+  .sysmsg .retry:hover { text-decoration: underline; }
+  .sysmsg .recovery-state { margin-left: 8px; font-size: 11px; }
+  .sysmsg.resolved { border-color: var(--border); color: var(--text-dim); }
+  .why-run { font-size: 11px; color: var(--text-dim); margin-top: 5px; max-width: 100%; }
+  .why-run summary { cursor: pointer; }
+  .why-run p { margin: 5px 0; line-height: 1.5; }
+
+  .whisper { align-self: center; text-align: center; font-size: 12px; color: var(--text-faint);
+    padding: 2px 10px; animation: rise .18s ease-out; transition: opacity .8s; }
+
+  /* A node recreated by a rebuild is not new to the reader, and replaying every
+     entrance animation at once is what the flicker actually looked like. Marked
+     on the node rather than toggled on #chat: re-enabling the animation later
+     would simply start it then, which is the same flash one frame downstream.
+     Placed after the rules it cancels so it wins on order, not !important. */
+  .norise { animation: none; }
+  @media (prefers-reduced-motion: reduce) {
+    .msg, .activity, .sysmsg, .whisper { animation: none; }
+    #chatWrap { scroll-behavior: auto; }
+    /* The entrance animations were stopped here, but the infinite ones kept
+       running: pulsing dots and a blinking caret are exactly what someone who
+       asked for less motion is asking to be rid of. A static dimmed state
+       carries the same meaning. */
+    .caret, .hdot.pending, .pill.busy .st, .qp-row.running .bs-dot, #jump.flash {
+      animation: none !important;
+    }
+    .thinking-dots i { animation: none !important; opacity: .6; }
+  }
+
+  /* who-heard-this receipt dots */
+  .heard { display: flex; gap: 5px; margin: 5px 8px 0; }
+  .hdot { width: 8px; height: 8px; border-radius: 50%; box-sizing: border-box; }
+  .hdot.claude { --hc: var(--claude); }
+  .hdot.codex { --hc: var(--codex); }
+  .hdot.live { background: var(--hc); }
+  .hdot.passed { background: var(--hc); opacity: .45; }
+  .hdot.late { border: 1.5px solid var(--hc); opacity: .75; }
+  .hdot.unheard { border: 1.5px solid var(--text-faint); opacity: .35; }
+  .hdot.pending { border: 1.5px solid var(--hc); opacity: .8; animation: pulse 1s infinite; }
+  .hdot.interrupted { background: none; border: 1.5px solid var(--warn); opacity: .9; }
+
+  /* Per-seat delivery status, inline and in chronological place. The message is
+     permanent; its delivery state is changeable — so it says what happened to
+     it here, rather than being explained by a pill floating somewhere below. */
+  .dstatus { display: flex; flex-wrap: wrap; gap: 6px; margin: 5px 8px 0; font-size: 12px; }
+  .dchip { border-radius: 999px; padding: 1px 8px; border: 1px solid var(--border2);
+    background: var(--panel); color: var(--text-dim); }
+  .dchip.cancelled { color: var(--danger); border-color: rgba(242,109,109,.35); }
+  .dchip.interrupted { color: var(--warn); border-color: rgba(255,212,121,.35); }
+  .dchip.delivered { color: var(--text-faint); }
+  .dretry { color: var(--user); font-weight: 600; font-size: 12px; padding: 1px 4px; }
+  .dretry:hover { text-decoration: underline; }
+  .dretry[disabled] { opacity: .5; text-decoration: none; }
+  /* Readable, not struck through: the text is still the record. */
+  .bubble.dimmed { opacity: .62; }
+
+  /* Day boundary in a long-lived room. */
+  .daysep { display: flex; align-items: center; gap: 10px; margin: 14px 4px 6px;
+    color: var(--text-faint); font-size: 11px; letter-spacing: .04em; text-transform: uppercase; }
+  .daysep::before, .daysep::after { content: ""; flex: 1; height: 1px; background: var(--border); }
+
+  .meta .cpy, .meta .ask { opacity: 0; font-size: 11px; padding: 0 4px; transition: opacity .15s; }
+  .msg:hover .meta .cpy, .msg:hover .meta .ask { opacity: .6; }
+  .meta .cpy:hover, .meta .ask:hover { opacity: 1 !important; }
+  .bubble.collapsed { max-height: 300px; overflow: hidden;
+    -webkit-mask-image: linear-gradient(#000 75%, transparent); mask-image: linear-gradient(#000 75%, transparent); }
+  .showmore { align-self: flex-start; font-size: 12px; color: var(--user); margin: 4px 6px 0; }
+  .msg.user .showmore { align-self: flex-end; }
+
+  .caret { display: inline-block; width: 7px; height: 15px; background: var(--text-dim); vertical-align: -2px; margin-left: 2px; animation: pulse .8s infinite; border-radius: 2px; }
+  .thinking-dots { display: inline-flex; gap: 4px; align-items: center; }
+  .thinking-dots i { width: 6px; height: 6px; border-radius: 50%; background: var(--text-dim); animation: bounce 1.2s infinite; }
+  .thinking-dots i:nth-child(2) { animation-delay: .15s; } .thinking-dots i:nth-child(3) { animation-delay: .3s; }
+  @keyframes bounce { 0%, 60%, 100% { transform: none; opacity: .4; } 30% { transform: translateY(-4px); opacity: 1; } }
+  .elapsed { color: var(--text-faint); font-size: 12px; }
+
+  /* ---------- empty state ---------- */
+  #empty { margin: auto; text-align: center; padding: 40px 20px; color: var(--text-dim); }
+  #empty .big { font-size: 40px; margin-bottom: 8px; }
+  #empty h2 { color: var(--text); margin: 0 0 6px; font-size: 20px; }
+  #empty p { margin: 0 0 22px; font-size: 14px; }
+  .starters { display: flex; flex-direction: column; gap: 8px; align-items: center; }
+  .starter { background: var(--panel); border: 1px solid var(--border2); border-radius: 10px; padding: 9px 16px; color: var(--text-dim); font-size: 13.5px; }
+  .starter:hover { color: var(--text); border-color: var(--user); }
+  .starter b.c1 { color: var(--claude); } .starter b.c2 { color: var(--codex); } .starter b.c3 { color: var(--user); }
+
+  /* ---------- composer ---------- */
+  #composerWrap { padding: 10px 24px 18px; }
+  #composer { max-width: 880px; margin: 0 auto; position: relative; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; align-items: center; min-width: 0; }
+  .chip {
+    padding: 4px 13px; border-radius: 999px; font-size: 12.5px; border: 1px solid var(--border2);
+    color: var(--text-dim); background: var(--panel);
+  }
+  .chip:hover { color: var(--text); }
+  .chip:disabled { opacity: .35; cursor: not-allowed; }
+  .chip:disabled:hover { color: var(--text-dim); }
+  .chip.active { color: var(--on-accent); font-weight: 600; }
+  .chip.active[data-t="auto"] { background: var(--text-dim); border-color: var(--text-dim); }
+  .chip.active[data-t="claude"] { background: var(--claude); border-color: var(--claude); }
+  .chip.active[data-t="codex"] { background: var(--codex); border-color: var(--codex); }
+  .chip.active[data-t="both"] { background: var(--user); border-color: var(--user); }
+  #routeHint { margin-left: auto; min-width: 0; font-size: 12px; color: var(--text-faint); }
+  #routeHint.warn { color: #e8b45c; }
+
+  /* Per-message exchange policy. The menu is fixed and positioned from the
+     trigger, like the wake menu, so a wrapped composer row cannot clip it. */
+  #hopWrap { position: relative; display: inline-flex; align-items: center; flex-shrink: 0; }
+  #hopBtn {
+    display: inline-flex; align-items: center; gap: 5px; padding: 4px 9px;
+    border-radius: 999px; border: 1px solid var(--border2); background: var(--panel);
+    color: var(--text-dim); font-size: 12px; white-space: nowrap;
+  }
+  #hopBtn:hover, #hopWrap.open #hopBtn { color: var(--text); border-color: rgba(122,162,247,.55); }
+  #hopBtn.override { color: var(--user); border-color: rgba(122,162,247,.55); }
+  #hopBtn .hop-caret { font-size: 9px; opacity: .7; }
+  #hopMenu {
+    position: fixed; display: none; width: 286px; max-width: calc(100vw - 16px);
+    max-height: calc(100vh - 16px); overflow-y: auto; padding: 6px;
+    background: var(--panel2); border: 1px solid var(--border2); border-radius: 11px;
+    box-shadow: 0 8px 30px rgba(0,0,0,.5); z-index: 40;
+  }
+  #hopWrap.open #hopMenu { display: block; }
+  #hopMenu > button {
+    width: 100%; padding: 8px 9px; border-radius: 7px; text-align: left;
+    color: var(--text-dim);
+  }
+  #hopMenu > button:hover, #hopMenu > button[aria-checked="true"] { background: var(--panel); color: var(--text); }
+  #hopMenu button b { display: block; font-size: 12.5px; }
+  #hopMenu .hm-sub { display: block; margin-top: 2px; font-size: 10.5px; line-height: 1.3; opacity: .68; }
+  #hopMenu .hm-label { margin: 5px 7px 4px; padding-top: 6px; border-top: 1px solid var(--border); color: var(--text-faint); font-size: 10.5px; }
+  #hopMenu .hm-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 4px; }
+  #hopMenu .hm-grid button {
+    padding: 6px 2px; border: 1px solid transparent; border-radius: 7px;
+    color: var(--text-dim); font-size: 12px; text-align: center;
+  }
+  #hopMenu .hm-grid button:hover { background: var(--panel); color: var(--text); }
+  #hopMenu .hm-grid button[aria-checked="true"] { border-color: var(--user); color: var(--user); background: rgba(122,162,247,.08); }
+  #hopProgress {
+    display: inline-flex; align-items: center; flex-shrink: 0; padding: 3px 7px;
+    border-radius: 8px; border: 1px solid rgba(122,162,247,.25);
+    color: var(--text-faint); font-size: 11px; white-space: nowrap;
+  }
+  #hopProgress.capped { color: #e8b45c; border-color: rgba(232,180,92,.35); }
+  #hopProgress[hidden] { display: none; }
+  #draftImages { display: none; gap: 8px; flex-wrap: wrap; margin: 0 0 8px; }
+  #draftImages.show { display: flex; }
+  .draft-image { position: relative; width: 74px; height: 62px; border: 1px solid var(--border2); border-radius: 9px; overflow: hidden; background: var(--panel); }
+  .draft-image img { width: 100%; height: 100%; object-fit: cover; }
+  .draft-image button { position: absolute; top: 3px; right: 3px; width: 21px; height: 21px; border-radius: 50%; background: rgba(11,14,20,.86); color: var(--text); line-height: 1; }
+  .draft-file { position: relative; display: flex; align-items: center; gap: 8px; width: min(260px, 100%); min-height: 62px; padding: 8px 34px 8px 10px; border: 1px solid var(--border2); border-radius: 9px; background: var(--panel); }
+  .draft-file-icon { font-size: 20px; flex-shrink: 0; }
+  .draft-file-copy { min-width: 0; }
+  .draft-file-name { display: block; color: var(--text); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .draft-file-size { display: block; margin-top: 2px; color: var(--text-faint); font-size: 11px; }
+  .draft-file button { position: absolute; top: 3px; right: 3px; width: 21px; height: 21px; border-radius: 50%; color: var(--text-dim); line-height: 1; }
+  .box {
+    display: flex; align-items: flex-end; gap: 10px; background: var(--panel);
+    border: 1px solid var(--border2); border-radius: 16px; padding: 10px 10px 10px 16px;
+    transition: border-color .15s;
+  }
+  .box:focus-within { border-color: rgba(122,162,247,.5); }
+  #input {
+    flex: 1; background: none; border: none; outline: none; resize: none;
+    max-height: 200px; line-height: 1.5; padding: 4px 0; color: var(--text);
+  }
+  #input::placeholder { color: var(--text-faint); }
+  #attachBtn {
+    width: 34px; height: 38px; border-radius: 10px; color: var(--text-dim);
+    display: flex; align-items: center; justify-content: center; flex-shrink: 0; font-size: 19px;
+  }
+  #attachBtn:hover { color: var(--text); background: var(--panel2); }
+  #sendBtn, #stopBtn {
+    width: 38px; height: 38px; border-radius: 12px; display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+  }
+  #sendBtn { background: var(--user); color: var(--on-accent); }
+  #sendBtn:disabled { background: var(--panel2); color: var(--text-faint); cursor: default; }
+  #stopWrap { position: relative; display: none; flex-shrink: 0; align-items: center; }
+  #stopBtn { background: rgba(242,109,109,.15); color: var(--danger); border: 1px solid rgba(242,109,109,.4); border-radius: 12px 3px 3px 12px; }
+  /* The arrow is always there, so the deliberate scopes — seat-only above all —
+     never depend on the primary happening to be ambiguous. */
+  #stopMore {
+    width: 20px; height: 38px; flex-shrink: 0; font-size: 10px; margin-left: 2px;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: 3px 12px 12px 3px;
+    background: rgba(242,109,109,.15); color: var(--danger);
+    border: 1px solid rgba(242,109,109,.4);
+  }
+  #stopBtn:hover, #stopMore:hover, #stopWrap.open #stopMore { background: rgba(242,109,109,.28); }
+  #stopMenu {
+    position: absolute; right: 0; bottom: calc(100% + 7px); display: none; min-width: 170px;
+    padding: 5px; background: var(--panel2); border: 1px solid var(--border2); border-radius: 11px;
+    box-shadow: 0 8px 30px rgba(0,0,0,.5); z-index: 35;
+  }
+  #stopWrap.open #stopMenu { display: block; }
+  #stopMenu button { width: 100%; padding: 8px 10px; border-radius: 7px; text-align: left; color: var(--text-dim); }
+  #stopMenu button:hover { background: var(--panel); color: var(--text); }
+  #stopMenu button.stop-all { color: var(--danger); border-top: 1px solid var(--border); border-radius: 0 0 7px 7px; margin-top: 4px; padding-top: 9px; }
+  #stopMenu button.stop-scope { color: var(--text-dim); }
+  #stopMenu button .sm-sub { display: block; font-size: 10.5px; opacity: .62; margin-top: 1px; }
+  /* A row whose work ended while the menu was open is disabled where it stands,
+     never removed: pulling it out moves the row the cursor was aiming at. */
+  #stopMenu button:disabled { opacity: .4; cursor: default; }
+  #stopMenu button:disabled:hover { background: transparent; color: var(--text-dim); }
+  #stopMenu button.stop-all:disabled:hover { color: var(--danger); }
+
+  /* Wake menu. Waking a seat with messages held for it is a three-way choice —
+     deliver, wake only, or cancel — which a native confirm() cannot express:
+     its two buttons would leave Escape silently picking one of the two wakes.
+     Same anchored-menu shape as #stopMenu, but positioned against the moon
+     button, which lives in a pill row that re-renders under it. */
+  #wakeMenu {
+    position: fixed; display: none; min-width: 210px;
+    padding: 5px; background: var(--panel2); border: 1px solid var(--border2); border-radius: 11px;
+    box-shadow: 0 8px 30px rgba(0,0,0,.5); z-index: 40;
+  }
+  #wakeMenu.open { display: block; }
+  #wakeMenu button { width: 100%; padding: 8px 10px; border-radius: 7px; text-align: left; color: var(--text-dim); }
+  #wakeMenu button:hover { background: var(--panel); color: var(--text); }
+  #wakeMenu button .sm-sub { display: block; font-size: 10.5px; opacity: .62; margin-top: 1px; }
+
+  /* Ask menu. Fixed like the wake menu and for the same reason: the message row
+     it would otherwise anchor into is rebuilt on every render, and an anchored
+     child would be thrown away mid-choice. */
+  #askMenu {
+    position: fixed; display: none; min-width: 260px; max-width: 320px;
+    padding: 7px; background: var(--panel2); border: 1px solid var(--border2); border-radius: 11px;
+    box-shadow: 0 8px 30px rgba(0,0,0,.5); z-index: 40;
+  }
+  #askMenu.open { display: block; }
+  #askMenu button { width: 100%; padding: 8px 10px; border-radius: 7px; text-align: left; color: var(--text-dim); }
+  #askMenu button:hover { background: var(--panel); color: var(--text); }
+  #askMenu button .sm-sub { display: block; font-size: 10.5px; opacity: .62; margin-top: 1px; }
+  #askMenu input { width: 100%; margin: 2px 0 6px; padding: 6px 8px; border-radius: 7px;
+    background: var(--panel); border: 1px solid var(--border); color: var(--text); font: inherit; }
+  #askMenu .ask-seats { display: flex; gap: 4px; margin-bottom: 6px; }
+  #askMenu .ask-seats button { width: auto; flex: 1; text-align: center; padding: 5px 8px;
+    font-size: 12px; border: 1px solid var(--border); }
+  #askMenu .ask-seats button.active { color: var(--text); border-color: var(--user); }
+
+  /* quote header: what a reply is answering. Lives between .meta and .bubble
+     so copying a message never picks up the quoted text. */
+  .quote-ref {
+    display: flex; gap: 7px; align-items: stretch; width: 100%; text-align: left;
+    margin: 0 0 4px 0; padding: 5px 8px; border-radius: 8px 8px 4px 4px;
+    background: var(--panel); border: 1px solid var(--border); cursor: pointer;
+    font-size: 11.5px; color: var(--text-dim); overflow: hidden;
+  }
+  .quote-ref:hover { background: var(--panel2); color: var(--text); }
+  .quote-ref .qr-bar { width: 2px; border-radius: 2px; background: currentColor; opacity: .5; flex-shrink: 0; }
+  .quote-ref .qr-body { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+  .quote-ref .qr-head { display: flex; gap: 6px; font-size: 10.5px; opacity: .75; }
+  .quote-ref .qr-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: .9; }
+
+  @keyframes jumpflash { 0%,100% { background: transparent } 25%,60% { background: rgba(122,162,247,.22) } }
+  .jump-flash { animation: jumpflash 1.6s ease-in-out; border-radius: 10px; }
+
+  /* composer strip: the same provenance, but only while its bubble is off-screen */
+  #busyStrip { display: none; flex-direction: column; gap: 4px; margin-bottom: 7px; }
+  /* Hidden, not removed. This box is in the composer, so dropping a row would
+     shorten the composer, lengthen #chatWrap, and move the text being read. */
+  #busyStrip .bs-hidden { visibility: hidden; }
+  #busyStrip button {
+    display: flex; align-items: center; gap: 6px; width: 100%; text-align: left;
+    padding: 5px 9px; border-radius: 9px; background: var(--panel); border: 1px solid var(--border);
+    font-size: 11.5px; color: var(--text-dim); overflow: hidden;
+  }
+  #busyStrip button:hover { background: var(--panel2); color: var(--text); }
+  #busyStrip .bs-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; animation: pulse 1s infinite; }
+  #busyStrip .bs-agent { font-weight: 600; flex-shrink: 0; }
+  #busyStrip .bs-verb, #busyStrip .bs-time { flex-shrink: 0; opacity: .8; }
+  #busyStrip .bs-snip { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: .72; }
+  /* The count never wraps to a second line: the snippet beside it is what gives
+     way, because the strip's height is the thing that must not change. */
+  #busyStrip .bs-other { flex-shrink: 0; opacity: .8; }
+
+  /* queue popover */
+  #queueWrap { position: relative; display: inline-flex; }
+  #queueBadge {
+    display: none; align-items: center; gap: 5px; color: #e8b45c; font-size: 12px;
+    padding: 2px 7px; border-radius: 8px; border: 1px solid rgba(232,180,92,.32);
+  }
+  #queueBadge:hover { background: rgba(232,180,92,.12); }
+  #queuePop {
+    position: absolute; left: 0; bottom: calc(100% + 8px); display: none; width: 330px;
+    max-height: 320px; overflow-y: auto; padding: 7px; background: var(--panel2);
+    border: 1px solid var(--border2); border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,.5); z-index: 36;
+  }
+  #queueWrap.open #queuePop { display: block; }
+  .qp-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 3px 5px 7px; font-size: 11.5px; color: var(--text-faint); }
+  .qp-head button { color: var(--danger); font-size: 11.5px; padding: 2px 6px; border-radius: 6px; }
+  .qp-head button:hover { background: rgba(242,109,109,.14); }
+  .qp-actions { display: flex; align-items: center; gap: 4px; }
+  /* The hold is not a destructive action, so it does not wear the discard red. */
+  .qp-head .qp-pause { color: var(--text-dim); }
+  .qp-head .qp-pause:hover { background: var(--panel); color: var(--text); }
+  .qp-card.paused { border-style: dashed; opacity: .85; }
+  .qp-card { padding: 7px 8px; border-radius: 9px; background: var(--panel); border: 1px solid var(--border); margin-bottom: 6px; }
+  .qp-card:last-child { margin-bottom: 0; }
+  .qp-top { display: flex; align-items: flex-start; gap: 6px; }
+  .qp-src { flex: 1; min-width: 0; text-align: left; color: var(--text-dim); font-size: 12px; }
+  .qp-src:hover { color: var(--text); }
+  .qp-src .qp-snip { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .qp-src .qp-meta { display: block; font-size: 10.5px; opacity: .62; margin-top: 1px; }
+  .qp-x { flex-shrink: 0; color: var(--text-faint); width: 20px; height: 20px; border-radius: 6px; }
+  .qp-x:hover { color: var(--danger); background: rgba(242,109,109,.14); }
+  .qp-rows { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 5px; font-size: 11px; color: var(--text-faint); }
+  .qp-row { display: inline-flex; align-items: center; gap: 5px; }
+  .qp-row .bs-dot { width: 6px; height: 6px; border-radius: 50%; }
+  .qp-row.running .bs-dot { animation: pulse 1s infinite; }
+  .qp-empty { padding: 10px; text-align: center; font-size: 12px; color: var(--text-faint); }
+
+  .hint { text-align: center; font-size: 11.5px; color: var(--text-faint); margin-top: 8px; }
+  .hint code { font-family: var(--mono); font-size: 11px; background: var(--panel); padding: 1px 5px; border-radius: 4px; }
+
+  /* mention popover */
+  #mention {
+    position: absolute; bottom: 100%; left: 12px; margin-bottom: 6px; display: none;
+    background: var(--panel2); border: 1px solid var(--border2); border-radius: 10px; overflow: hidden;
+    box-shadow: 0 8px 30px rgba(0,0,0,.5); min-width: 180px; z-index: 30;
+  }
+  #mention button { display: flex; gap: 8px; align-items: center; width: 100%; text-align: left; padding: 8px 14px; font-size: 13.5px; color: var(--text-dim); }
+  #mention button.sel, #mention button:hover { background: var(--panel); color: var(--text); }
+  #mention .mdot { width: 8px; height: 8px; border-radius: 50%; }
+
+  /* jump to bottom */
+  #jump {
+    position: absolute; bottom: 130px; left: 50%; transform: translateX(-50%);
+    background: var(--panel2); border: 1px solid var(--border2); border-radius: 999px;
+    padding: 6px 16px; font-size: 12.5px; color: var(--text-dim); display: none;
+    box-shadow: 0 6px 20px rgba(0,0,0,.4); z-index: 20;
+  }
+  #jump:hover { color: var(--text); }
+
+  /* ---------- modal ---------- */
+  #overlay {
+    position: fixed; inset: 0; background: rgba(5,7,10,.65); backdrop-filter: blur(3px);
+    display: none; align-items: center; justify-content: center; z-index: 50;
+  }
+  #overlay.open { display: flex; }
+  .modal {
+    width: min(560px, 92vw); max-height: 86vh; overflow-y: auto;
+    background: var(--bg2); border: 1px solid var(--border2); border-radius: 18px; padding: 24px 26px;
+    box-shadow: 0 20px 60px rgba(0,0,0,.6);
+  }
+  .modal h2 { margin: 0 0 4px; font-size: 18px; }
+  .modal .sub { color: var(--text-faint); font-size: 12.5px; margin-bottom: 18px; }
+  .mgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .mgroup { border: 1px solid var(--border); border-radius: 12px; padding: 14px; }
+  .mgroup h3 { margin: 0 0 10px; font-size: 13px; }
+  .mgroup h3 .agc { font-weight: 700; }
+  .mgroup h3 .agc.claude { color: var(--claude); } .mgroup h3 .agc.codex { color: var(--codex); }
+  .fld { margin-bottom: 10px; }
+  .fld label { display: block; font-size: 11.5px; color: var(--text-faint); margin-bottom: 4px; }
+  .fld input, .fld select {
+    width: 100%; background: var(--panel); border: 1px solid var(--border2); border-radius: 8px;
+    padding: 7px 10px; outline: none; font-size: 13.5px;
+  }
+  .fld input:focus, .fld select:focus { border-color: rgba(122,162,247,.5); }
+  .fld .note { font-size: 11px; color: var(--text-faint); margin-top: 3px; }
+  .fld .note.danger { color: #d99a72; line-height: 1.35; }
+  .freecombo { position: relative; }
+  .fld .freecombo-input { padding-right: 36px; }
+  .freecombo-toggle {
+    position: absolute; right: 1px; top: 1px; bottom: 1px; width: 34px;
+    border-left: 1px solid var(--border); border-radius: 0 7px 7px 0;
+    color: var(--text-dim); background: var(--panel);
+  }
+  .freecombo-toggle:hover, .freecombo.open .freecombo-toggle { color: var(--text); background: var(--panel2); }
+  .freecombo-menu {
+    position: absolute; z-index: 70; top: calc(100% + 4px); left: 0; right: 0;
+    max-height: 240px; overflow-y: auto; padding: 5px;
+    background: var(--panel2); border: 1px solid var(--border2); border-radius: 9px;
+    box-shadow: 0 12px 30px rgba(0,0,0,.55);
+  }
+  .freecombo-menu[hidden] { display: none; }
+  .freecombo-option {
+    display: block; width: 100%; padding: 7px 8px; border-radius: 6px;
+    text-align: left; line-height: 1.3; color: var(--text-dim);
+  }
+  .freecombo-option b { display: block; color: var(--text); font-size: 13px; }
+  .freecombo-option span { display: block; margin-top: 2px; font-size: 11px; overflow-wrap: anywhere; }
+  .freecombo-option:hover, .freecombo-option.active { background: rgba(122,162,247,.13); }
+  .freecombo-option.selected b { color: var(--user); }
+  .freecombo-empty { padding: 7px 8px; color: var(--text-faint); font-size: 11.5px; }
+  .sess { font-size: 12px; color: var(--text-dim); margin-top: 6px; }
+  .mrow { display: flex; gap: 10px; margin-top: 18px; justify-content: space-between; align-items: center; }
+  .btn { padding: 8px 18px; border-radius: 10px; font-size: 14px; border: 1px solid var(--border2); color: var(--text-dim); }
+  .btn:hover { color: var(--text); background: var(--panel); }
+  .btn.primary { background: var(--user); border-color: var(--user); color: var(--on-accent); font-weight: 600; }
+  .btn.primary:hover { filter: brightness(1.1); }
+  .btn.danger { color: var(--danger); border-color: rgba(242,109,109,.4); }
+  .btn.danger:hover { background: rgba(242,109,109,.1); }
+
+  /* toast */
+  #toast {
+    position: fixed; top: 18px; left: 50%; transform: translateX(-50%) translateY(-80px);
+    background: var(--panel2); border: 1px solid var(--border2); border-radius: 12px;
+    padding: 10px 20px; font-size: 13.5px; z-index: 100; transition: transform .25s ease;
+    box-shadow: 0 8px 30px rgba(0,0,0,.5); max-width: 80vw;
+  }
+  #toast.show { transform: translateX(-50%) translateY(0); }
+  #toast.err { border-color: rgba(242,109,109,.5); color: #f2a1a1; }
+
+  #navToggle { display: none; }
+  #navScrim { display: none; position: fixed; inset: 0; z-index: 55; background: rgba(0,0,0,.45); }
+  @media (max-width: 760px) {
+    /* The sidebar slides over the chat rather than disappearing: without it
+       rooms, the workspace, the transcript and settings were all unreachable,
+       and the only way back to another room was editing ?room= by hand. */
+    #sidebar {
+      position: fixed; inset: 0 auto 0 0; z-index: 60; width: min(280px, 86vw);
+      transform: translateX(-102%); transition: transform .18s ease;
+      box-shadow: 0 0 40px rgba(0,0,0,.5);
+    }
+    body.nav-open #sidebar { transform: none; }
+    body.nav-open #navScrim { display: block; }
+    #navToggle { display: flex; }
+    header { flex-wrap: wrap; row-gap: 6px; }
+    .msg { max-width: 92%; }
+    #composerWrap { padding: 8px 10px 12px; }
+    .chips { gap: 5px; }
+    .chip { padding-left: 10px; padding-right: 10px; }
+    #routeHint {
+      order: 20; width: 100%; margin-left: 0; white-space: nowrap;
+      overflow: hidden; text-overflow: ellipsis;
+    }
+    #hopMenu { width: min(286px, calc(100vw - 16px)); }
+  }

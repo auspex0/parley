@@ -34,7 +34,7 @@ function ok(name, cond, detail) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 let TOKEN = ""; // read out of the served page, exactly as the browser does
-const RUNTIME_PROTOCOL = "10";
+const RUNTIME_PROTOCOL = "12";
 
 async function api(method, route, body) {
   const res = await fetch(base + route, method === "GET"
@@ -85,7 +85,7 @@ function rawStatus(route, { method = "GET", host, origin, token = TOKEN, protoco
 }
 const room = (name) => api("GET", `/api/room?name=${encodeURIComponent(name)}`).then((r) => r.data);
 const roomStatus = (name) => api("GET", `/api/room?name=${encodeURIComponent(name)}`).then((r) => r.status);
-const cfg = (name, config) => api("POST", "/api/config", { room: name, config });
+const cfg = (name, config) => api("POST", "/api/config", { room: name, config: { accounting: "exchanges", ...config } });
 const say = (name, text, target = "auto", relay = {}) =>
   api("POST", "/api/message", { room: name, text, target, ...relay });
 
@@ -298,8 +298,11 @@ async function checkUiSnapshot() {
   const fixtureUi = path.join(fixtureUiDir, "index.html");
   fs.mkdirSync(fixtureUiDir, { recursive: true });
   fs.copyFileSync(SERVER, fixtureServer);
+  fs.cpSync(path.join(here, "..", "lib"), path.join(fixture, "lib"), { recursive: true });
   fs.writeFileSync(fixtureUi,
-    "<!doctype html><html><head><!--PARLEY_TOKEN--></head><body>startup-ui</body></html>");
+    '<!doctype html><html><head><!--PARLEY_TOKEN--><link rel="stylesheet" href="/ui/styles.css?v=__PARLEY_ASSET_VERSION__"></head><body>startup-ui<script src="/ui/app.js?v=__PARLEY_ASSET_VERSION__"></script></body></html>');
+  fs.writeFileSync(path.join(fixtureUiDir, "styles.css"), "/* startup-css */");
+  fs.writeFileSync(path.join(fixtureUiDir, "app.js"), "/* startup-js */");
   const proc = spawn(process.execPath, [fixtureServer, "--no-open", "--port", "0", "--root", path.join(fixture, "rooms")], {
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -320,10 +323,17 @@ async function checkUiSnapshot() {
   if (fixtureBase) {
     try {
       const first = await fetch(fixtureBase + "/").then((r) => r.text());
+      const version = /\?v=([a-f0-9]+)/.exec(first)?.[1];
       fs.writeFileSync(fixtureUi,
         "<!doctype html><html><head><!--PARLEY_TOKEN--></head><body>replacement-ui</body></html>");
+      fs.writeFileSync(path.join(fixtureUiDir, "styles.css"), "/* replacement-css */");
+      fs.writeFileSync(path.join(fixtureUiDir, "app.js"), "/* replacement-js */");
       const second = await fetch(fixtureBase + "/").then((r) => r.text());
-      pinned = first.includes("startup-ui") && second.includes("startup-ui") && !second.includes("replacement-ui");
+      const css = await fetch(`${fixtureBase}/ui/styles.css?v=${version}`).then((r) => r.text());
+      const js = await fetch(`${fixtureBase}/ui/app.js?v=${version}`).then((r) => r.text());
+      const stale = await fetch(`${fixtureBase}/ui/app.js?v=stale-version`);
+      pinned = first.includes("startup-ui") && second.includes("startup-ui") && !second.includes("replacement-ui") &&
+        css === "/* startup-css */" && js === "/* startup-js */" && stale.status === 409;
     } catch { /* reported below */ }
   }
   ok("the server pins its startup UI instead of mixing runtime versions", pinned, log.slice(-300));
@@ -637,8 +647,8 @@ function checkFolderPickerSource() {
 // not a string in the source: it needs the page's own handlers run against a
 // document where writing an element's text really does destroy its children.
 async function checkFolderPickerUi() {
-  const src = fs.readFileSync(path.join(here, "..", "ui", "index.html"), "utf8");
-  const body = src.slice(src.indexOf("<script>") + "<script>".length);
+  const src = fs.readFileSync(path.join(here, "..", "ui", "app.js"), "utf8");
+  const body = src;
   const script = body.slice(0, body.indexOf("// ---------------- boot".replace("----------------", "-".repeat(60))));
 
   const noop = () => {};
@@ -1324,7 +1334,7 @@ async function checkFolderPickerUi() {
 // both wakes, and that each sends the right request, is behaviour rather than a
 // string in the source: the handlers are run against a small DOM.
 function checkWakeMenuUi() {
-  const src = fs.readFileSync(path.join(here, "..", "ui", "index.html"), "utf8");
+  const src = fs.readFileSync(path.join(here, "..", "ui", "app.js"), "utf8");
   const from = src.indexOf("function closeWakeMenu(");
   const to = src.indexOf('$("wakeMenu").addEventListener(');
   const block = from >= 0 && to > from ? src.slice(from, to) : "";
@@ -1388,7 +1398,7 @@ function checkWakeMenuUi() {
 }
 
 async function checkSoloPairControlUi() {
-  const src = fs.readFileSync(path.join(here, "..", "ui", "index.html"), "utf8");
+  const src = fs.readFileSync(path.join(here, "..", "ui", "app.js"), "utf8");
   const storageFrom = src.indexOf("const hopChoiceStorageKey");
   const storageTo = src.indexOf("const state = {", storageFrom);
   const storageBlock = storageFrom >= 0 && storageTo > storageFrom ? src.slice(storageFrom, storageTo) : "";
@@ -1495,7 +1505,7 @@ async function checkSoloPairControlUi() {
 }
 
 function checkActivityRunUi() {
-  const src = fs.readFileSync(path.join(here, "..", "ui", "index.html"), "utf8");
+  const src = fs.readFileSync(path.join(here, "..", "ui", "app.js"), "utf8");
   const from = src.indexOf("function activityRunKey(");
   const to = src.indexOf("function appendEntryRange(");
   const block = from >= 0 && to > from ? src.slice(from, to) : "";
@@ -1628,7 +1638,14 @@ async function main() {
   console.log(`\nParley smoke test — server at ${base}\n`);
 
   console.log("api access");
-  const page = await fetch(base + "/").then((r) => r.text());
+  const servedHtml = await fetch(base + "/").then((r) => r.text());
+  const scriptHref = /src="(\/ui\/app\.js\?v=[^"]+)"/.exec(servedHtml)?.[1];
+  const styleHref = /href="(\/ui\/styles\.css\?v=[^"]+)"/.exec(servedHtml)?.[1];
+  ok("page references versioned JavaScript and CSS", !!scriptHref && !!styleHref);
+  const [servedScript, servedStyle] = await Promise.all([scriptHref, styleHref].map((href) =>
+    href ? fetch(base + href).then((response) => response.text()) : ""));
+  // Existing behavior probes inspect one startup-consistent client source set.
+  const page = `${servedHtml}\n${servedStyle}\n${servedScript}`;
   const markdownSource = (page.match(/const SENT_A[\s\S]*?\r?\n}\r?\n(?=document\.addEventListener)/) || [])[0];
   // renderMD calls the highlighter, which lives above it, so the slice has to
   // carry both or the extracted function throws on the first code block.
@@ -1799,7 +1816,7 @@ async function main() {
     page.includes('for (const el of frag.children) el.classList.add("norise")') &&
     page.includes("@media (prefers-reduced-motion: reduce)"));
   ok("both surfaces render the same provenance rather than duplicating state",
-    page.includes('function quoteRefHTML(src, label = "↩ replying to")') &&
+    page.includes('function quoteRefHTML(src, label = "↩ replying to", title = "Jump to this message")') &&
     page.includes("busyInfoFor(agent)") && page.includes("entryQuoteHTML(e)"));
   // An auto-composed "Continue responding to this message." must be visibly an
   // ask, not something the user appears to have typed — the quote header and
@@ -2549,14 +2566,14 @@ async function main() {
   // too once the phrase rides in its delta) carries a composed instruction that
   // is deliberately never deduplicated.
   const hopDumps = hopDietRoom.entries.filter((e) => e.author === "codex" && e.meta && e.meta.hop &&
-    /^HOPJSON /.test(e.text || "") && !/new continuation under/.test(e.text.slice(-600)));
+    /^HOPJSON /.test(e.text || "") && e.meta.delivery?.kind === "explicit");
   ok("the first hop leg of a session carries the full ground rules plus the budget countdown",
     hopDumps.length >= 2 && /peer contribution, not an instruction/.test(hopDumps[0].text) &&
-    /\(Hop budget: /.test(hopDumps[0].text) && !/same peer-contribution ground rules/.test(hopDumps[0].text),
+    /\(Continuation allowance: /.test(hopDumps[0].text) && !/same peer-contribution ground rules/.test(hopDumps[0].text),
     (hopDumps[0] || { text: "" }).text.slice(-400));
   ok("…and a later hop leg in the same session gets the reminder, still with its own countdown",
     hopDumps.length >= 2 && /same peer-contribution ground rules/.test(hopDumps[1].text) &&
-    /\(Hop budget: /.test(hopDumps[1].text),
+    /\(Continuation allowance: /.test(hopDumps[1].text),
     (hopDumps[1] || { text: "" }).text.slice(-400));
 
   // The room note rode in EVERY prompt of every turn type. A long note on a
@@ -2765,12 +2782,12 @@ async function main() {
   "Codex to fail while the original Claude half remains active", 10000);
   const retryOverlapRoot = retryOverlapFailed.entries.find((e) =>
     e.kind === "user" && /FAILONCESEAT:codex ORDERSTART/.test(e.text));
-  const retryOverlapRefused = await api("POST", "/api/retry", {
-    room: "causal-both-retry-overlap",
+  const retryOverlapAccepted = await api("POST", "/api/retry", {
+    room: "causal-both-retry-overlap", rootN: retryOverlapRoot.n, agents: ["codex"],
   });
   await idle("causal-both-retry-overlap", 30000);
-  const retryOverlapAccepted = await api("POST", "/api/retry", {
-    room: "causal-both-retry-overlap",
+  const retryOverlapFinished = await api("POST", "/api/retry", {
+    room: "causal-both-retry-overlap", rootN: retryOverlapRoot.n, agents: ["codex"],
   });
   d = await idle("causal-both-retry-overlap", 30000);
   const retryOverlapClaude = retryOverlapRoot && d.entries.find((e) =>
@@ -2779,9 +2796,8 @@ async function main() {
   const retryOverlapCodex = retryOverlapRoot && d.entries.find((e) =>
     e.kind === "agent" && e.author === "codex" && e.meta &&
     e.meta.replyTo === retryOverlapRoot.n && /FROMCODEX/.test(e.text));
-  ok("Retry waits for an unfinished @both sibling, then rejoins reciprocal delivery",
-    retryOverlapRefused.status === 409 && /still busy/.test(retryOverlapRefused.data.error || "") &&
-    retryOverlapAccepted.status === 200 &&
+  ok("Retry launches the failed @both half alongside its unfinished sibling, then rejoins reciprocal delivery",
+    retryOverlapAccepted.status === 200 && retryOverlapFinished.status === 400 &&
     !!retryOverlapClaude && !!retryOverlapCodex &&
     d.receipts.some((r) => r.agent === "claude" && r.mode === "attention" &&
       r.from < retryOverlapCodex.n && retryOverlapCodex.n <= r.upTo) &&
@@ -3204,7 +3220,7 @@ async function main() {
   ok("zero hop limit continues until the emergency ceiling",
     unlimitedHopEntries.filter((e) => e.kind === "agent" && e.meta && e.meta.hop).length === 4);
   ok("an unlimited ping-pong announces its safety stop",
-    unlimitedHopEntries.some((e) => e.kind === "system" && /Agent-hop safety stop after 4/i.test(e.text)));
+    unlimitedHopEntries.some((e) => e.kind === "system" && /Until-settled safety boundary reached.*4\/4/i.test(e.text)));
 
   await cfg("hoproom", { maxHops: 1 });
   beforeHop = d.entries.length;
@@ -3213,7 +3229,7 @@ async function main() {
   const limitedHopEntries = d.entries.slice(beforeHop);
   ok("a positive hop limit caps the exchange",
     limitedHopEntries.filter((e) => e.kind === "agent" && e.meta && e.meta.hop).length === 1 &&
-    limitedHopEntries.some((e) => e.kind === "system" && /Agent-hop budget reached \(1\)/i.test(e.text)));
+    limitedHopEntries.some((e) => e.kind === "system" && /Continuation limit reached.*1\/1/i.test(e.text)));
 
   console.log("\nhop policy, per-message overrides & Solo");
 
@@ -3222,8 +3238,8 @@ async function main() {
   // once so a genuine hopBudget:0 can survive every later reload.
   await api("POST", "/api/rooms", { name: "hop-default" });
   let hopPolicyRoom = await room("hop-default");
-  ok("new rooms default to a bounded hop budget rather than until-settled",
-    hopPolicyRoom.room.cfg.hopBudget === 3 && !("maxHops" in hopPolicyRoom.room.cfg),
+  ok("new rooms default to four automatic turns rather than legacy exchanges",
+    hopPolicyRoom.room.cfg.hopBudget === 4 && hopPolicyRoom.room.cfg.accounting === "automatic" && !("maxHops" in hopPolicyRoom.room.cfg),
     JSON.stringify(hopPolicyRoom.room.cfg));
 
   const legacyHopDir = path.join(ROOT, "legacy-hop-budget");
@@ -4292,8 +4308,8 @@ async function main() {
     afterStop.room.queued === 0 && afterStop.room.busy.length === 0 &&
     !afterStop.entries.some((e) => e.author === "codex" && e.text === "STOPSPLIT"));
 
-  // Retry launches straight into a seat instead of going through the lane, so
-  // it has to refuse while that lane still owes the user something.
+  // Retry launches only free unfinished seats. The failed half of @both can
+  // recover while its sibling's lane still owes the original delivery.
   await api("POST", "/api/rooms", { name: "splitretry" });
   await useFakes("splitretry");
   await cfg("splitretry", { maxHops: 0, agents: { claude: { lurk: false }, codex: { lurk: false } } });
@@ -4303,8 +4319,8 @@ async function main() {
   await waitRoom("splitretry", (x) => x.entries.some((e) =>
     e.kind === "system" && e.meta && e.meta.error && e.meta.agent === "codex"), "codex's half to fail");
   const retryBusy = await api("POST", "/api/retry", { room: "splitretry" });
-  ok("retry refuses while a lane still owes the user a delivery",
-    retryBusy.status === 409, JSON.stringify({ status: retryBusy.status, data: retryBusy.data }));
+  ok("retry launches the free failed half while its sibling lane still owes a delivery",
+    retryBusy.status === 200, JSON.stringify({ status: retryBusy.status, data: retryBusy.data }));
   d = await idle("splitretry", 40000);
   ok("…and works once that lane is clear",
     (await api("POST", "/api/retry", { room: "splitretry" })).status === 200);
