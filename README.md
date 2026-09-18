@@ -11,15 +11,19 @@ Most multi-agent tools are work queues — worktrees, kanban boards, parallel te
 
 It drives the **official Claude Code and Codex CLIs through your existing CLI logins**. No API key, no proxy; Parley never reads or stores provider credentials — if a CLI isn't authenticated, you see its own error in the chat.
 
-**Note**: The screenshots and demos below show an earlier version. The current interface, labels, and turn-budget controls have changed. The current npm package is also behind this GitHub version.
+The screenshots below are real conversations captured in version **1.2.0**.
 
-![Parley: only @codex is addressed, but Claude — lurking — chimes in to correct an over-cautious claim, and Codex agrees](https://raw.githubusercontent.com/auspex0/parley/9146b95ded06d8a1a939546bac1688b19da68463/docs/parley-lurk.png)
+![Parley 1.2.0 Work mode: Codex edits a booking guard and runs 12 passing tests while Claude reads the changed files](https://raw.githubusercontent.com/auspex0/parley/v1.2.0/docs/parley-work-1.2.png)
 
-*A real run. Only `@codex` was addressed. Claude was lurking, judged the answer more pessimistic than the facts warranted, and said so unprompted — then Codex read the correction and agreed.*
+*Work mode, on a small demo project: Codex fixes overlapping appointments and adds regression tests — all 12 pass. Claude, lurking, reads the changed implementation and tests and finds nothing to add. The activity lines show the actual edits, test command, and review reads.*
 
-![Parley: one @both message; Codex argues for repo-relative paths, Claude argues the two failure modes are not symmetric](https://raw.githubusercontent.com/auspex0/parley/9146b95ded06d8a1a939546bac1688b19da68463/docs/parley-both.png)
+![Parley 1.2.0: Claude answers a booking-policy question; Codex, lurking, flags a late-payment race](https://raw.githubusercontent.com/auspex0/parley/v1.2.0/docs/parley-lurk-1.2.png)
 
-*`@both` puts one question to each seat. Here they disagreed — Codex preferring relative paths, Claude arguing the two failure modes aren't symmetric — and settled it in the same thread.*
+*Only `@claude` was addressed. Codex was lurking and spotted a missing edge case: a late payment can arrive after a booking hold expires and someone else takes the slot. It chimed in without being tagged.*
+
+![Parley 1.2.0: Claude and Codex discuss a weekend grocery-list app, with automatic follow-ups and their triggers visible](https://raw.githubusercontent.com/auspex0/parley/v1.2.0/docs/parley-both-1.2.png)
+
+*One `@both` question starts a practical trade-off: live sync or a refresh button for a weekend grocery-list app? They build on each other's answers, separating reliable saves from live updates. The follow-ups show their triggers and automatic-turn usage.*
 
 ## Lurk mode 👂
 

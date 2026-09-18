@@ -2,10 +2,12 @@
 
 Notable changes per published version. Dates are release dates on npm.
 
-## 1.2.0 — unreleased
+## 1.2.0 — 2026-09-18
 
 Durability, the settled interaction fixes, a third provider, and the first pass
 at cost visibility.
+
+- **Automatic turns, counted plainly.** New rooms allow four automatic provider starts per message after the initial requested replies. Listening, sibling attention, answer returns, catch-up and internal recovery all spend that allowance, including silent or failed attempts. The policy and usage survive Retry, Wake and restart; existing rooms retain their previous accounting until explicitly switched. The composer shows the allowance, and each reply explains what triggered it.
 
 - **Survives what it used to die from.** A CLI that exits while Parley is still writing its prompt, a torn `state.json`, or a disk error in a background exchange each used to take down the whole server and orphan every running agent. Prompt writes, room state, attachment downloads and the detached exchange chains are now individually fault-tolerant, and agent processes are killed on every exit path rather than only on Ctrl+C.
 - **Stop stops.** With one seat replying and nothing queued, the ■ button stops that response on the first click instead of opening a chooser; the ▾ beside it keeps every deliberate scope. The menu no longer rearranges itself under the cursor while it is open.
