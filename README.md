@@ -11,7 +11,7 @@ Most multi-agent tools are work queues — worktrees, kanban boards, parallel te
 
 It drives the **official Claude Code and Codex CLIs through your existing CLI logins**. No API key, no proxy; Parley never reads or stores provider credentials — if a CLI isn't authenticated, you see its own error in the chat.
 
-Note: The screenshots and demos below show an earlier version. The current interface, labels, and turn-budget controls have changed.
+**Note**: The screenshots and demos below show an earlier version. The current interface, labels, and turn-budget controls have changed. The current npm package is also behind this GitHub version.
 
 ![Parley: only @codex is addressed, but Claude — lurking — chimes in to correct an over-cautious claim, and Codex agrees](https://raw.githubusercontent.com/auspex0/parley/9146b95ded06d8a1a939546bac1688b19da68463/docs/parley-lurk.png)
 
