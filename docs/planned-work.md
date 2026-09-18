@@ -82,11 +82,6 @@ oversized backlogs.
   totals. Distinguish unavailable from zero. Show session reuse/reset reason and
   automatic-turn owner; separate prompt preparation, provider time and observable
   tool time where possible.
-- **Investigate the reported 106.8-second documentation edit.** The report showed
-  2,977 output tokens (325 reasoning), two searches and an edit. Search exit 1
-  normally means no match; visible activity labels do not locate the latency.
-  Use ordinary telemetry first. Do not assume lowering effort, adding finish
-  instructions, a small-task mode or a hard deadline fixes this example.
 - **Honest timeout controls.** `seatTimeout` raises Work turns to at least 15
   minutes and deep-effort turns to at least 30. Separate a user hard deadline
   from recommended provider timeout; expose the effective value before launch
