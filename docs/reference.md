@@ -142,8 +142,6 @@ In the **+** form, picking the same provider in both dropdowns reveals a pair of
 
 ## Adding a provider
 
-Parley's two seats can host any CLI coding agent. To add one: write a `send(room, opts)` adapter in [parley.mjs](../parley.mjs) with the same contract as `claudeSend`/`codexSend` (read your config from `room.cfg.agents.<yourname>`, return `{ text, sessionRef, resetSession?, usage? }`), add it to the `adapters` map, and describe it in the `PROVIDERS` registry (label, avatar, color, default seat config, settings fields). The seat picker, settings UI, routing and receipts pick it up automatically.
+A provider is a CLI coding harness that runs in a seat: Claude Code, Codex and Gemini CLI today. Adding one means writing an adapter in [parley.mjs](../parley.mjs) and registering it in `PROVIDERS`; the seat picker, settings, routing and receipts pick it up automatically. A harness doesn't need to support session resume — the room's delta protocol and inline history replay can carry a stateless CLI.
 
-Parley doesn't require your CLI to support session resume — the room's delta protocol and inline history replay can carry a stateless CLI.
-
-See [CONTRIBUTING.md](../CONTRIBUTING.md).
+The full guide is in [CONTRIBUTING.md](../CONTRIBUTING.md#adding-an-agent-provider), including the three parts that need care: taking the final answer from an authoritative source, session resume and lost-session recovery, and enforced read-only turns for reviewers and listeners.
