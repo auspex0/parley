@@ -24,6 +24,7 @@ import { normalizeHopBudget, requireRoomHopBudget, requireMessageHopBudget,
 import { createCausalCoordinator as coordinateCausal } from "./lib/causal-coordinator.mjs";
 import { relayAllowanceNote } from "./lib/budget-prompts.mjs";
 import { snapshotClientAssets } from "./lib/client-assets.mjs";
+import { claudeLoggedIn } from "./lib/claude-auth.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Keep the browser and backend on the same build. Previously the server read
@@ -2428,7 +2429,7 @@ const AUTH_HINTS = {
 };
 const AUTH_ENV = { gemini: ["GEMINI_API_KEY", "GOOGLE_API_KEY"], claude: ["ANTHROPIC_API_KEY"], codex: ["OPENAI_API_KEY"] };
 
-function seatHealth(room, seat) {
+async function seatHealth(room, seat) {
   const cfg = room.cfg.agents[seat];
   const spec = resolveCommand(cfg.command);
   if (spec.error) {
@@ -2443,7 +2444,7 @@ function seatHealth(room, seat) {
     const envKey = (AUTH_ENV[pid] || []).find((k) => process.env[k]);
     const signedIn = envKey || hint.paths.some((parts) => {
       try { return fs.existsSync(path.join(os.homedir(), ...parts)); } catch { return false; }
-    });
+    }) || (pid === "claude" && (await claudeLoggedIn(spec)) !== false);
     if (!signedIn) {
       return { ok: false, stage: "auth", detail: `${spec.via} is installed but no ${PROVIDERS[pid].label} login was found`, how: hint.how };
     }
@@ -7157,12 +7158,12 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, {
         node: process.version,
         parley: packageVersion(),
-        seats: Object.fromEntries(seatIds(room).map((a) => [a, {
+        seats: Object.fromEntries(await Promise.all(seatIds(room).map(async (a) => [a, {
           provider: providerIdOf(room, a),
           label: providerOf(room, a).label,
           command: room.cfg.agents[a].command,
-          ...seatHealth(room, a),
-        }])),
+          ...(await seatHealth(room, a)),
+        }]))),
       });
     }
 
