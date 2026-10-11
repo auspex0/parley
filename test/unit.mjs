@@ -140,3 +140,24 @@ test("dynamic prompt contract distinguishes Solo, zero structural delivery and r
   }
   assert.match(relayAllowanceNote({ budget: -1 }, 1, 2, { charged: true }), /1 charged continuation remains after this turn/);
 });
+
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { claudeLoggedIn } from "../lib/claude-auth.mjs";
+
+function fakeClaude(body) {
+  const file = join(mkdtempSync(join(tmpdir(), "parley-auth-")), "claude.mjs");
+  writeFileSync(file, body);
+  return { cmd: process.execPath, pre: [file] };
+}
+
+test("claude auth: reads loggedIn whatever the exit code", async () => {
+  assert.equal(await claudeLoggedIn(fakeClaude(`process.stdout.write(JSON.stringify({ loggedIn: true }));`)), true);
+  assert.equal(await claudeLoggedIn(fakeClaude(`process.stdout.write(JSON.stringify({ loggedIn: false })); process.exit(1);`)), false);
+});
+
+test("claude auth: an older CLI or a missing binary is unknown, not logged out", async () => {
+  assert.equal(await claudeLoggedIn(fakeClaude(`process.stderr.write("error: unknown command 'auth'"); process.exit(1);`)), null);
+  assert.equal(await claudeLoggedIn({ cmd: join(tmpdir(), "no-such-claude-binary"), pre: [] }), null);
+});
