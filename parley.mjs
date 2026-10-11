@@ -180,8 +180,8 @@ function sameSecret(given, expected) {
  *   sessionScope        { field, of(seatCfg, roomMode) } — the permission
  *                       provenance stamped on a saved session, so a session
  *                       created under looser rules is never silently resumed
- *   isolateProtectedTurn(seatCfg, roomMode) — true when a read-only turn must
- *                       not reuse this seat's saved session at all
+ *   isolateProtectedTurn(seatCfg, roomMode) — legacy capability used to
+ *                       coalesce listeners that cross a full-access boundary
  *   extraArgsIssue(args) — provider-specific dangerous-flag rules
  *   resumeLostPatterns  stderr shapes meaning "that session is gone"
  *   sentinelSessionRefs session refs that are not durable identities
@@ -652,13 +652,33 @@ function effectiveClaudePermissionMode(cfg, roomMode) {
   return configured === "auto" ? (roomMode === "work" ? "acceptEdits" : "default") : configured;
 }
 
-// Some providers cannot make a read-only turn safe inside a session that was
-// created with broader powers, so that turn has to run outside the session
-// entirely. Which providers those are is declared, not assumed.
+// Scheduling policy for full-access listeners. This predicate no longer
+// discards sessions: effective permission transitions are handled before
+// prompt composition, and consecutive protected turns resume Plan.
 function isolatedProtectedTurn(room, agent, { discussion, readOnly } = {}) {
   if (!(discussion || readOnly)) return false;
   const isolate = capsOf(room, agent).isolateProtectedTurn;
   return typeof isolate === "function" && !!isolate(room.cfg.agents[agent], room.cfg.mode);
+}
+
+// The permission scope a Claude turn's native session lives under.
+//
+// Plan is a separate *session* only for a seat whose configured mode would
+// defeat it: Claude documents that Plan's write blocks do not hold inside a
+// session that has bypass available, so a Full-access seat keeps one session
+// for ordinary turns and a separate Plan session for protected ones. For every
+// other seat Plan is just a flag on the same native session: a discussion turn
+// resumes the work session with `--permission-mode plan`, and the next work
+// turn resumes it again, so alternating the two keeps the session's context.
+function claudeSessionScope(room, agent, protectedTurn) {
+  const configured = effectiveClaudePermissionMode(room.cfg.agents[agent], room.cfg.mode);
+  return protectedTurn && isolatedProtectedTurn(room, agent, { readOnly: true }) ? "plan" : configured;
+}
+
+// Can the seat's saved session serve this turn as it is? Anything else must be
+// dropped before the prompt is composed, so the fresh session is briefed.
+function claudeSessionUsable(room, agent, protectedTurn) {
+  return room.state.agents[agent].permissionScope === claudeSessionScope(room, agent, protectedTurn);
 }
 
 // A native session is created under one set of settings and cannot be changed
@@ -677,11 +697,8 @@ function applyAdapterSession(room, agent, res, epoch) {
   // exactly how a finishing turn would stamp a new permission onto an old
   // session. The next turn re-briefs from the transcript under the new setting.
   if (epoch !== undefined && epoch !== seatEpoch(room, agent)) return;
-  // A protected Claude turn must not reuse a bypass-enabled native session:
-  // Claude documents that Plan's write blocks do not hold once bypass is
-  // available in that session. Discard the full-access session after the
-  // isolated Plan invocation; the next ordinary turn is re-briefed from the
-  // transcript before starting a fresh full-access session.
+  // Retain the effective permissions of the session actually launched, not
+  // merely the room default. Consecutive protected turns can resume Plan.
   if (res.resetSession) room.state.agents[agent].sessionRef = null;
   else if (res.sessionRef) {
     room.state.agents[agent].sessionRef = res.sessionRef;
@@ -690,7 +707,10 @@ function applyAdapterSession(room, agent, res, epoch) {
     // stricter ones, and the check on load is what enforces that.
     const scope = capsOf(room, agent).sessionScope;
     if (scope) {
-      room.state.agents[agent][scope.field] = scope.of(room.cfg.agents[agent], room.cfg.mode);
+      room.state.agents[agent][scope.field] = res.sessionScope ?? scope.of(room.cfg.agents[agent], room.cfg.mode);
+      if (providerIdOf(room, agent) === "claude") {
+        room.state.agents[agent].permissionConfigScope = res.permissionConfigScope;
+      }
     }
   }
 }
@@ -1036,8 +1056,11 @@ function briefingVersionOf(room, agent) {
   return Number.isFinite(version) ? version : 1;
 }
 
-function retireOutdatedSession(room, agent) {
-  if (room.state.agents[agent].sessionRef && briefingVersionOf(room, agent) < PROMPT_RETIRE_BELOW) {
+function retireOutdatedSession(room, agent, turnScope = {}) {
+  const seat = room.state.agents[agent];
+  const permissionChanged = providerIdOf(room, agent) === "claude" &&
+    !claudeSessionUsable(room, agent, !!(turnScope.discussion || turnScope.readOnly));
+  if (seat.sessionRef && (permissionChanged || briefingVersionOf(room, agent) < PROMPT_RETIRE_BELOW)) {
     room.state.agents[agent].sessionRef = null;
     saveState(room);
   }
@@ -1325,8 +1348,12 @@ function codexItemLabel(item) {
 async function claudeSend(room, { seat = "claude", prompt, briefing, onStream, onActivity, discussion, readOnly, images = [], inputDir = null, allowEmpty = false }) {
   const cfg = room.cfg.agents[seat];
   const protectedTurn = !!(discussion || readOnly);
-  const isolatedProtected = isolatedProtectedTurn(room, seat, { discussion, readOnly });
-  const sess = isolatedProtected ? null : room.state.agents[seat].sessionRef;
+  const permissionConfigScope = effectiveClaudePermissionMode(cfg, room.cfg.mode);
+  const sessionScope = claudeSessionScope(room, seat, protectedTurn);
+  const sess = room.state.agents[seat].sessionRef;
+  if (sess && !claudeSessionUsable(room, seat, protectedTurn)) {
+    throw new AdapterError("internal error: Claude session permission transition was not prepared");
+  }
   const checked = checkedExtraArgs(room, seat, cfg.extraArgs);
   // A protected discussion/review turn must not be reopened by an advanced
   // per-room permission override. Provider/user-level CLI settings remain part
@@ -1430,8 +1457,9 @@ async function claudeSend(room, { seat = "claude", prompt, briefing, onStream, o
   return {
     text: text || "",
     emptyReply: !text,
-    sessionRef: isolatedProtected ? null : sessionRef,
-    resetSession: isolatedProtected,
+    sessionRef,
+    sessionScope,
+    permissionConfigScope,
     usage,
   };
 }
@@ -1822,7 +1850,9 @@ function loadRoom(name, seatChoice, create = false) {
     const scope = pid && (PROVIDERS[pid].capabilities || {}).sessionScope;
     if (!scope || !state.agents[id]) continue;
     const expected = scope.of(cfg.agents[id], cfg.mode);
-    if (state.agents[id][scope.field] !== expected) {
+    const retainedPlan = pid === "claude" && state.agents[id][scope.field] === "plan" &&
+      state.agents[id].permissionConfigScope === expected;
+    if (state.agents[id][scope.field] !== expected && !retainedPlan) {
       state.agents[id].sessionRef = null;
       state.agents[id][scope.field] = expected;
       stateMigrated = true;
@@ -3147,10 +3177,9 @@ async function runAgentTurn(room, agent, userTurn, scope = NO_SCOPE, opts = {}) 
         (allowance ? `\n\n(${allowance})` : "");
     };
     let turnScope = scopeNow();
-    retireOutdatedSession(room, agent);
-    const isolated = isolatedProtectedTurn(room, agent, turnScope);
-    const fresh = !room.state.agents[agent].sessionRef || isolated;
-    let delivery = composePromptDelivery(room, agent, fresh, isolated);
+    retireOutdatedSession(room, agent, turnScope);
+    const fresh = !room.state.agents[agent].sessionRef;
+    let delivery = composePromptDelivery(room, agent, fresh);
     const briefing = delivery.briefing;
     let prompt = attemptPrompt(delivery, turnScope);
 
@@ -3394,10 +3423,9 @@ async function runListenerTurn(room, agent, userTurnN, scope = NO_SCOPE, opts = 
     // Re-derived per attempt — see makeScope.
     const scopeNow = () => ({ discussion: scope.now(), readOnly: true });
     let turnScope = scopeNow();
-    retireOutdatedSession(room, agent);
-    const isolated = isolatedProtectedTurn(room, agent, turnScope);
-    const fresh = !room.state.agents[agent].sessionRef || isolated;
-    let delivery = composePromptDelivery(room, agent, fresh, isolated);
+    retireOutdatedSession(room, agent, turnScope);
+    const fresh = !room.state.agents[agent].sessionRef;
+    let delivery = composePromptDelivery(room, agent, fresh);
     const briefing = delivery.briefing;
     let prompt = attemptPrompt(delivery, turnScope);
 
@@ -3785,10 +3813,9 @@ async function runHopTurn(room, agent, triggerEntry, rootN, scope = NO_SCOPE, op
       return { discussion: d, readOnly: !!(d || opts.readOnly) };
     };
     let turnScope = scopeNow();
-    retireOutdatedSession(room, agent);
-    const isolated = isolatedProtectedTurn(room, agent, turnScope);
-    const fresh = !room.state.agents[agent].sessionRef || isolated;
-    let delivery = composePromptDelivery(room, agent, fresh, isolated);
+    retireOutdatedSession(room, agent, turnScope);
+    const fresh = !room.state.agents[agent].sessionRef;
+    let delivery = composePromptDelivery(room, agent, fresh);
     const briefing = delivery.briefing;
     let prompt = attemptPrompt(delivery, turnScope);
 
@@ -4821,13 +4848,9 @@ function launchUserDispatch(room, userTurn, {
         queueLurkCatchUp(room, a, userTurn.n, throughN);
         return false;
       }
-      // A seat whose protected turns must run isolated (a bypass-enabled
-      // Claude seat) pays the worst possible price for live lurking: every
-      // overheard exchange discards its session, so the NEXT ordinary turn
-      // re-briefs from scratch — steady state is a full fresh briefing on
-      // every single invocation. Route its lurks through the catch-up
-      // machinery instead: N overheard exchanges coalesce into one isolated
-      // invocation, and the pending-attention semantics are identical.
+      // Preserve coalesced lurking for full-access seats. Switching between
+      // full-access work and Plan still requires a fresh session, although
+      // consecutive protected turns now retain and resume their Plan session.
       if (isolatedProtectedTurn(room, a, { readOnly: true })) {
         const throughN = room.entries.length ? room.entries[room.entries.length - 1].n : userTurn.n;
         queueLurkCatchUp(room, a, userTurn.n, throughN);
@@ -7520,7 +7543,9 @@ const server = http.createServer(async (req, res) => {
         room.cfgEpoch[id] = seatEpoch(room, id) + 1;
       }
       for (const id of scopeSeats) {
-        if (room.state.agents[id]) room.state.agents[id][capsOf(room, id).sessionScope.field] = nextScopes[id];
+        if (room.state.agents[id] && !room.state.agents[id].sessionRef) {
+          room.state.agents[id][capsOf(room, id).sessionScope.field] = nextScopes[id];
+        }
       }
       if (resetRequiredSeats.size || scopeSeats.length || roomNoteChanged) saveState(room);
       // A room-sourced mode follows Settings for its next cycle. An in-flight
@@ -7586,17 +7611,14 @@ const server = http.createServer(async (req, res) => {
         if (prevMode !== room.cfg.mode && was !== full && now !== full) continue;
         const label = titleCase(id);
         const text = now === full
-          ? `⚠ ${label} Full access enabled — ordinary ${id} turns bypass ordinary permission prompts and checks. ${label} starts a fresh session; Parley requests isolated read-only invocations for protected discussion, review and listener turns.`
+          ? `⚠ ${label} Full access enabled — ordinary ${id} turns bypass ordinary permission prompts and checks. Protected discussion, review and listener turns use Plan sessions. Sessions restart when effective permissions change; consecutive turns with the same permissions resume.`
           : was === full
             ? `🔒 ${label} Full access disabled — ${label} starts a fresh session in ${now} mode.`
             : `${label} permission mode changed to ${now} — ${label} starts a fresh session so it applies cleanly.`;
         appendEntry(room, { kind: "system", author: "system", text });
       }
-      // Full access plus lurking is the most expensive combination a seat can
-      // be in: every overheard exchange runs isolated and discards the session,
-      // so the next ordinary turn re-briefs from scratch. Parley now coalesces
-      // those lurks into catch-ups, but the user should still know what the
-      // combo costs — once, when it comes into being, not on every save.
+      // Keep the existing coalesced-listener policy. Only a transition between
+      // work and protected context now requires a new native session.
       for (const id of seatIds(room)) {
         const full = capsOf(room, id).fullAccessScope;
         if (!full || !capsOf(room, id).isolateProtectedTurn) continue;
@@ -7605,7 +7627,7 @@ const server = http.createServer(async (req, res) => {
         if (comboNow && !comboBefore) {
           appendEntry(room, {
             kind: "system", author: "system",
-            text: `ℹ️ ${titleCase(id)} is lurking with Full access. Protected listener turns run isolated from its session, so its overheard reactions arrive as coalesced catch-ups rather than live interjections, and each one re-briefs from room history. Disable lurk or Full access on this seat if that cost isn't worth it.`,
+            text: `ℹ️ ${titleCase(id)} is lurking with Full access. Listener reactions arrive as coalesced catch-ups in Plan mode. Consecutive protected turns reuse that session; switching between protected turns and full-access work starts a fresh session with room history.`,
           });
         }
       }

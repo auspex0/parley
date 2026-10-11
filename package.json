@@ -18,10 +18,11 @@
     "test:unit": "node --test test/unit.mjs",
     "test:retry": "node test/retry.mjs",
     "test:automatic": "node test/automatic.mjs",
+    "test:claude-sessions": "node test/claude-sessions.mjs",
     "test:provenance": "node test/provenance.mjs",
     "test:sequences": "node test/scheduler-sequences.mjs",
     "bench": "node test/benchmark.mjs",
-    "test:integration": "npm run test:retry && npm run test:provenance && npm run test:sequences && npm run test:automatic",
+    "test:integration": "npm run test:retry && npm run test:provenance && npm run test:sequences && npm run test:automatic && npm run test:claude-sessions",
     "test:all": "npm run test:unit && npm run test:integration && npm run test:smoke && npm run test:browser && npm run test:package",
     "test:package": "node test/package.mjs"
   },
