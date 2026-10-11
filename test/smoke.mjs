@@ -6531,8 +6531,9 @@ async function main() {
     !protectedArgv.includes("--resume"), JSON.stringify(protectedArgv));
   ok("the isolated @both turn is briefed with prior room history",
     argValue(protectedArgv, "--append-system-prompt").includes("FULLACCESS_ORIGIN"));
-  ok("the bypass-enabled native session is discarded after a protected turn",
-    d.room.agents.claude.linked === false);
+  ok("the protected Plan session is retained for subsequent discussion turns",
+    d.room.agents.claude.linked === true &&
+    JSON.parse(fs.readFileSync(path.join(ROOT, "claudefull", "state.json"), "utf8")).agents.claude.permissionScope === "plan");
 
   await say("claudefull", "@claude ARGJSON");
   d = await idle("claudefull");
@@ -6567,8 +6568,9 @@ async function main() {
     !protectedArgv.includes("--resume"), JSON.stringify(protectedArgv));
   ok("the isolated listener receives prior room history",
     argValue(protectedArgv, "--append-system-prompt").includes("LISTENER_ORIGIN"));
-  ok("listener isolation discards the ordinary Full-access session",
-    d.room.agents.claude.linked === false);
+  ok("listener transition retains a restricted Plan session",
+    d.room.agents.claude.linked === true &&
+    JSON.parse(fs.readFileSync(path.join(ROOT, "claudefull", "state.json"), "utf8")).agents.claude.permissionScope === "plan");
   await cfg("claudefull", { agents: { claude: { lurk: false } } });
 
   await say("claudefull", "@claude ARGJSON");
@@ -6589,8 +6591,9 @@ async function main() {
     !protectedArgv.includes("--resume"), JSON.stringify(protectedArgv));
   ok("the isolated reviewer receives prior room history",
     argValue(protectedArgv, "--append-system-prompt").includes("REVIEW_ORIGIN"));
-  ok("reviewer isolation discards the ordinary Full-access session",
-    d.room.agents.claude.linked === false);
+  ok("reviewer transition retains a restricted Plan session",
+    d.room.agents.claude.linked === true &&
+    JSON.parse(fs.readFileSync(path.join(ROOT, "claudefull", "state.json"), "utf8")).agents.claude.permissionScope === "plan");
   await say("claudefull", "/pair end");
 
   const beforeWorker = d.entries.length;

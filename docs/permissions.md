@@ -37,9 +37,11 @@ Full access bypasses Claude's ordinary permission prompts and checks, and the pr
 
 A non-bypass `--permission-mode` in Extra CLI args still overrides the dropdown; confirmation follows the *effective* mode, so removing a Plan override cannot silently activate Full access.
 
-Ordinary Claude turns use the selected mode, including explicit agent handoffs and pair-worker turns. For protected discussion, reviewer and listener turns, Parley strips per-room permission overrides and requests Plan; when Parley's Full-access setting is configured, it also starts those turns outside the bypass-enabled native session and re-briefs the next ordinary turn from room history.
+Ordinary Claude turns use the selected mode, including explicit agent handoffs and pair-worker turns. For protected discussion, reviewer and listener turns, Parley strips per-room permission overrides and requests Plan.
 
-Parley records the permission provenance of each saved Claude session and discards a mismatched or legacy session on load rather than resuming it under a different permission setting.
+What Plan runs in depends on the seat. For a seat **without** Full access, Plan is only a flag on the same native session: a discussion turn resumes the work session under `--permission-mode plan`, and the next work turn resumes it again, so alternating discussion and work never resets context. For a seat **with** Full access, Plan runs in its own session, because Claude documents that Plan's write blocks do not hold once bypass is available in a session. Consecutive protected turns resume that Plan session; a protected turn never resumes the full-access session, and returning from Plan to full-access work starts fresh with a bounded room-history briefing. Changing the effective mode itself (a Settings change, or a Talk/Work flip while the seat is on Auto) always starts a fresh session.
+
+Parley records both the effective session permissions and the configuration under which it was created. A retained Plan session survives reload when the configuration is unchanged. Mismatched or legacy sessions fail closed; the next invocation checks its effective permissions before resuming. Saving unrelated settings does not overwrite a live session's permission provenance.
 
 ## When a settings change takes effect
 

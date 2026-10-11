@@ -71,7 +71,7 @@ Parley assigns provenance rather than trusting message text to look like a heade
 
 When you message an agent, it receives everything that happened in the room since its own last turn — your messages to the other agent, and the other agent's replies — inside a `[Room activity]` block, then your message. Its own private context lives in its native CLI session, so history is never resent wholesale.
 
-**Token frugality is the default:** tagging one agent costs *nothing* for the other when the addressed agent's reply does not call it — a single-seat, untagged reply does not wake an unrelated peer. The peer catches up from its cursor the next time it has a real delivery. The deliberate exceptions are `@both` sibling attention, a live lurker's right of reply, and causal answers owed to the caller of an agent request.
+**Token frugality is the default:** tagging one agent costs *nothing* for the other when the addressed agent's reply does not call it — a single-seat, untagged reply does not wake an unrelated peer. The peer catches up from its cursor the next time it has a real delivery. The deliberate exceptions are `@both` sibling attention, a live lurker's right of reply, and causal answers owed to the caller of an agent request. Under Automatic turns each of those counts against the message's allowance like any other automatic start; only legacy Extra exchanges rooms treat them as free.
 
 ### Receipt dots (who was listening)
 
@@ -101,7 +101,7 @@ If the listener is occupied — either running a turn or already owing user-addr
 
 The obligation survives a restart and is attempted once. A successful spoken response or `[pass]` advances the cursor and writes the ordinary receipt. A spoken catch-up earns the other seat one bounded, read-only right of reply; if that seat speaks, its answer is delivered once back to the original lurker as a read-only **causal closure**. The closure may answer or `[pass]`, but it is terminal: tags in it schedule nothing and there is no fourth leg. Before launch, putting the seat to sleep or turning lurk off cancels the obligation and records why; if the catch-up is already running, Sleep's ordinary future-launch rule lets that turn finish unless you Stop it. Provider failure or Stop ends the attempt without advancing the cursor and leaves a durable outcome for the receipt dot. There is no automatic retry loop, though a later deliberate delivery can still catch the seat up from the unchanged cursor. **Archive & start fresh** clears the obligation with the rest of the old conversation.
 
-A seat with **Full access** that also lurks is a special case: its protected listener turns must run isolated from its native session, so live lurking would discard the session on every overheard exchange and force a full re-brief on every turn of that seat. Those lurks therefore ride the catch-up machinery instead — several overheard exchanges coalesce into one delayed reaction — and a room notice says so when the combination is enabled. Separately, stopping a seat's response now also stops the other seat's lurk on that exchange: there is no answer left to react to, and the extra call would land exactly when quota is the concern.
+A seat with **Full access** that also lurks uses coalesced catch-ups — several overheard exchanges can share one delayed reaction. Claude's protected listener turns use Plan sessions: switching between full-access work and Plan starts fresh with room history, but consecutive protected turns resume the same Plan session. A room notice explains this when the combination is enabled. Separately, stopping a seat's response also stops the other seat's lurk on that exchange: there is no answer left to react to, and the extra call would land exactly when quota is the concern.
 
 Whether a lurker speaks is its own model's judgment — there is no mechanical trigger — so Settings gives each agent a dial (`lurkStyle`):
 
@@ -187,7 +187,7 @@ The previous new-room default was **3** extra exchanges. One charged continuatio
 - **`0`** — launch no charged requests; structural requests and answers already owed still run.
 - **positive integer** — launch at most that many charged requests. Settings accepts any safe whole number; the compact composer control offers quick values through `8`.
 
-The composer calls this policy **Continuations**. Its shortcut remains selected for this room
+The composer labels this policy **Automatic turns** (or **Extra exchanges** in a room still on legacy accounting). Its shortcut remains selected for this room
 and browser session, including reloads; a visible “override” label identifies a message override.
 Changing the room default or shortcut affects newly accepted messages. Retry/Wake keep the
 original message's budget and use, and a limit reached on an old message is not reopened by a
@@ -226,7 +226,7 @@ At the cap, Parley does not launch the next charged request. Its text is already
 
 The composer control is a sticky shortcut: **Room default**, **Solo**, **Until settled**, or `0`–`8`. Its choice remains selected across sends and page reloads for that room during the current browser session; switching rooms restores that room's own shortcut. Every accepted user message still receives its own immutable policy snapshot. **Solo** requires one ordinary addressee, suppresses both lurk and agent-to-agent handoffs for that message, and is rejected with `@both` or a Pair turn. It controls reaction, not later visibility: the other seat can still read that transcript entry in a future delta.
 
-The live status belongs to the original message already running. **Continuations 3/4 · safety** means three continuations launched under a server safety ceiling of four. Its tooltip identifies the original policy source. Selecting a new shortcut while it runs affects later accepted messages and cannot change that message's policy.
+The live status belongs to the original message already running. **Automatic turns 3/4 · safety** means three automatic turns launched under a server safety ceiling of four; a legacy room shows **Extra exchanges 3/4** and counts charged launches only. Its tooltip identifies the original policy source. Selecting a new shortcut while it runs affects later accepted messages and cannot change that message's policy.
 
 A busy request target waits for its lane instead of losing the call, but never interrupts a provider turn already in progress. Successful initial `@both` replies are each structural requests to their sibling at that safe boundary, even with `hopBudget: 0`; this is how the slower-looking transcript order is reconciled with what each atomic prompt actually contained.
 
