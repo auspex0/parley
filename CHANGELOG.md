@@ -2,6 +2,13 @@
 
 Notable changes per published version. Dates are release dates on npm.
 
+## 1.2.1 — 2026-10-11
+
+Two Claude Code fixes.
+
+- **No false "not logged in" on first run.** When Claude Code keeps its login somewhere other than the credentials file Parley looks for, the setup check now asks `claude` for its login status instead of reporting a signed-in seat as signed out. (#7)
+- **Claude keeps its session across discussion and work.** A Claude seat with Full access used to throw away its session whenever a protected turn ran (an `@both` discussion in a work room, a pair review, lurking), so the next ordinary turn started blank and re-read the room from history. Protected turns now use a separate Plan session that consecutive protected turns resume, and only crossing between the two starts fresh. In every other permission mode, one session serves both. Fewer re-briefs, fewer tokens. (#8)
+
 ## 1.2.0 — 2026-09-18
 
 Durability, the settled interaction fixes, a third provider, and the first pass
